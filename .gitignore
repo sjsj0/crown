@@ -39,3 +39,28 @@
 
 # debug information files
 *.dwo
+
+# CMake and build directories
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+Makefile
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+
+# Common logs and runtime artifacts
+*.log
+*.pid
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# CRAQ generated runtime files
+craq/configs/cluster.runtime.conf
+craq/scripts/*.tmp
