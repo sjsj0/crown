@@ -8,8 +8,8 @@ run_as_root() {
     "$@"
     return
   fi
-  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-    sudo -n "$@"
+  if command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
     return
   fi
   return 1
@@ -17,18 +17,25 @@ run_as_root() {
 
 echo "Installing system packages..."
 
-if command -v dnf >/dev/null 2>&1; then
-  if ! run_as_root dnf install -y git cmake make gcc-c++ rsync openssh-clients wget vim; then
-    echo "ERROR: cannot run dnf install as root."
-    exit 1
+# Prefer apt-get on Debian/Ubuntu; fallback to dnf on Fedora/RHEL.
+if command -v apt-get >/dev/null 2>&1; then
+  if command -v sudo >/dev/null 2>&1 && [[ "$(id -u)" -ne 0 ]]; then
+    sudo -v
   fi
-elif command -v apt-get >/dev/null 2>&1; then
   if ! run_as_root apt-get update -y; then
     echo "ERROR: cannot run apt-get update as root."
     exit 1
   fi
   if ! run_as_root apt-get install -y git cmake make g++ rsync openssh-client wget vim; then
     echo "ERROR: cannot run apt-get install as root."
+    exit 1
+  fi
+elif command -v dnf >/dev/null 2>&1; then
+  if command -v sudo >/dev/null 2>&1 && [[ "$(id -u)" -ne 0 ]]; then
+    sudo -v
+  fi
+  if ! run_as_root dnf install -y git cmake make gcc-c++ rsync openssh-clients wget vim; then
+    echo "ERROR: cannot run dnf install as root."
     exit 1
   fi
 else
