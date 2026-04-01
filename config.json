@@ -1,0 +1,32 @@
+{
+  "mode": "chain",
+  "nodes": [
+    {
+      "id":          0,
+      "host":        "127.0.0.1",
+      "port":        50051,
+      "is_head":     true,
+      "is_tail":     false,
+      "predecessor": null,
+      "successor":   "127.0.0.1:50052"
+    },
+    {
+      "id":          1,
+      "host":        "127.0.0.1",
+      "port":        50052,
+      "is_head":     false,
+      "is_tail":     false,
+      "predecessor": "127.0.0.1:50051",
+      "successor":   "127.0.0.1:50053"
+    },
+    {
+      "id":          2,
+      "host":        "127.0.0.1",
+      "port":        50053,
+      "is_head":     false,
+      "is_tail":     true,
+      "predecessor": "127.0.0.1:50052",
+      "successor":   null
+    }
+  ]
+}

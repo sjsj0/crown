@@ -42,27 +42,20 @@ cheatsheet.txt
 # debug information files
 *.dwo
 
-# CMake and build directories
+# Build directory
 build/
-cmake-build-*/
-CMakeFiles/
-CMakeCache.txt
+
+# Compile commands (symlinked from build/)
 compile_commands.json
-Makefile
-cmake_install.cmake
-CTestTestfile.cmake
-Testing/
 
-# Common logs and runtime artifacts
-*.log
-*.pid
-
-# OS/editor junk
+# macOS
 .DS_Store
-Thumbs.db
+
+# Editor / IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# CRAQ generated runtime files
-craq/configs/cluster.runtime.conf
-craq/scripts/*.tmp
+# cache
+.cache/
