@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 MAP_FILE="$ROOT_DIR/configs/vm_hosts.sample.csv"
-REMOTE_DIR="~/craq"
+REMOTE_DIR="/home/sagarj2/crown/craq"
 BIND_HOST="0.0.0.0"
 REMOTE_BUILD_TYPE="Release"
 SSH_EXTRA_OPTS=""
@@ -28,7 +28,7 @@ Usage:
 
 Options:
   --map <path>           VM mapping CSV file
-  --remote-dir <path>    Remote CRAQ directory (default: ~/craq)
+  --remote-dir <path>    Remote CRAQ directory (default: /home/sagarj2/crown/craq)
   --bind-host <host>     Host craq_node binds to on VM (default: 0.0.0.0)
   --build-type <type>    CMake build type on VM (default: Release)
   --ssh-opt <opt>        Extra SSH option (can be repeated)
