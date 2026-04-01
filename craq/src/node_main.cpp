@@ -16,6 +16,9 @@ void signal_handler(int) {
 } // namespace
 
 int main(int argc, char** argv) {
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
+
     std::string host = "0.0.0.0";
     int port = 5001;
 

@@ -1,7 +1,11 @@
 #include "node_server.hpp"
 
+#include <chrono>
+#include <ctime>
+#include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
 
 #include "net.hpp"
 #include "protocol.hpp"
@@ -32,9 +36,31 @@ std::string node_name(const Cfg& cfg) {
     return cfg.node_id.empty() ? "unconfigured" : cfg.node_id;
 }
 
+std::string now_ts() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t tt = std::chrono::system_clock::to_time_t(now);
+
+    std::tm tmv{};
+#ifdef _WIN32
+    localtime_s(&tmv, &tt);
+#else
+    localtime_r(&tt, &tmv);
+#endif
+
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now.time_since_epoch())
+                        .count() % 1000;
+
+    std::ostringstream oss;
+    oss << std::put_time(&tmv, "%Y-%m-%d %H:%M:%S") << "." << std::setw(3)
+        << std::setfill('0') << ms;
+    return oss.str();
+}
+
 template <typename Cfg>
 void log_cfg_line(const Cfg& cfg, const std::string& msg) {
-    std::cout << "[node " << node_name(cfg) << "] " << msg << "\n\n";
+    std::cout << "[" << now_ts() << "] [node " << node_name(cfg) << "] " << msg
+              << "\n\n";
 }
 
 std::string make_ok(const std::string& msg = "ok") {

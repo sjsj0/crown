@@ -1,6 +1,9 @@
 #include <chrono>
+#include <ctime>
 #include <future>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,12 +31,33 @@ std::string endpoint(const std::string& host, int port) {
     return host + ":" + std::to_string(port);
 }
 
+std::string now_ts() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t tt = std::chrono::system_clock::to_time_t(now);
+
+    std::tm tmv{};
+#ifdef _WIN32
+    localtime_s(&tmv, &tt);
+#else
+    localtime_r(&tt, &tmv);
+#endif
+
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now.time_since_epoch())
+                        .count() % 1000;
+
+    std::ostringstream oss;
+    oss << std::put_time(&tmv, "%Y-%m-%d %H:%M:%S") << "." << std::setw(3)
+        << std::setfill('0') << ms;
+    return oss.str();
+}
+
 void print_step(const std::string& msg) {
-    std::cout << "[leader] " << msg << "\n\n";
+    std::cout << "[" << now_ts() << "] [leader] " << msg << "\n\n";
 }
 
 void print_error_step(const std::string& msg) {
-    std::cerr << "[leader] " << msg << "\n\n";
+    std::cerr << "[" << now_ts() << "] [leader] " << msg << "\n\n";
 }
 
 bool send_and_expect_ok(const std::string& host, int port, const Message& request,
