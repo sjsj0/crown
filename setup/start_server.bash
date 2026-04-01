@@ -56,6 +56,11 @@ if ! command -v g++ >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "ERROR: tmux is not installed on this VM. Run: ./vm_setup.bash setup"
+  exit 1
+fi
+
 # ---------------------------
 # 3) Configure + build
 # ---------------------------
@@ -85,7 +90,7 @@ if [[ -z "$NODE_BIN" ]]; then
 fi
 
 # ---------------------------
-# 4) Run node
+# 4) Run node in tmux
 # ---------------------------
 NODE_HOST="${NODE_HOST:-0.0.0.0}"
 NODE_PORT="${NODE_PORT:-5001}"
@@ -93,6 +98,13 @@ RUN_DIR="$CRAQ_DIR/run"
 mkdir -p "$RUN_DIR"
 PID_FILE="$RUN_DIR/craq_node.pid"
 LOG_FILE="$RUN_DIR/craq_node.log"
+SESSION_NAME="${TMUX_SESSION_NAME:-craq_node_${NODE_PORT}}"
+
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  echo "Stopping existing tmux session: $SESSION_NAME"
+  tmux kill-session -t "$SESSION_NAME" || true
+  sleep 1
+fi
 
 if [[ -f "$PID_FILE" ]]; then
   OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
@@ -106,13 +118,17 @@ fi
 pkill -f "craq_node --host .* --port $NODE_PORT" >/dev/null 2>&1 || true
 
 echo "Starting $NODE_BIN --host $NODE_HOST --port $NODE_PORT"
-nohup "$NODE_BIN" --host "$NODE_HOST" --port "$NODE_PORT" >"$LOG_FILE" 2>&1 &
-NEW_PID=$!
+tmux new-session -d -s "$SESSION_NAME" "cd '$CRAQ_DIR' && exec '$NODE_BIN' --host '$NODE_HOST' --port '$NODE_PORT'"
+tmux pipe-pane -o -t "$SESSION_NAME:0.0" "cat >> '$LOG_FILE'"
+
+NEW_PID="$(tmux display-message -p -t "$SESSION_NAME:0.0" "#{pane_pid}")"
 echo "$NEW_PID" > "$PID_FILE"
 
-echo "CRAQ node started: pid=$NEW_PID"
+echo "CRAQ node started in tmux session: $SESSION_NAME"
+echo "CRAQ node pane pid: $NEW_PID"
 echo "log: $LOG_FILE"
 echo "pid: $PID_FILE"
+echo "attach: tmux attach -t $SESSION_NAME"
 
 ## Legacy (old project) behavior retained as comment:
 ## - clone old hydfs-g33 repo

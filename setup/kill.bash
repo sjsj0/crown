@@ -3,6 +3,14 @@ set -euo pipefail
 
 echo "=== CRAQ stop on $(hostname -f 2>/dev/null || hostname) ==="
 
+# Stop CRAQ tmux sessions if running.
+if command -v tmux >/dev/null 2>&1; then
+  while IFS= read -r session_name; do
+    [[ -n "$session_name" ]] || continue
+    tmux kill-session -t "$session_name" >/dev/null 2>&1 || true
+  done < <(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep '^craq_node_' || true)
+fi
+
 # Stop CRAQ node if running.
 pkill -f "craq_node" >/dev/null 2>&1 || true
 
