@@ -27,11 +27,13 @@ const char* bool_to_yes_no(bool v) {
     return v ? "yes" : "no";
 }
 
-std::string node_name(const RuntimeConfig& cfg) {
+template <typename Cfg>
+std::string node_name(const Cfg& cfg) {
     return cfg.node_id.empty() ? "unconfigured" : cfg.node_id;
 }
 
-void log_cfg_line(const RuntimeConfig& cfg, const std::string& msg) {
+template <typename Cfg>
+void log_cfg_line(const Cfg& cfg, const std::string& msg) {
     std::cout << "[node " << node_name(cfg) << "] " << msg << "\n\n";
 }
 
