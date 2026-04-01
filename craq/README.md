@@ -32,13 +32,13 @@ Standalone CRAQ implementation in C++ for local and multi-VM testing.
 ```bash
 cd crown/craq
 cmake -S . -B build
-cmake --build build -j
+cmake --build build --config Debug
 ```
 
 Binaries:
 
-- `build/craq_node`
-- `build/craq_leader`
+- Windows (Visual Studio generator): `build/Debug/craq_node.exe`, `build/Debug/craq_leader.exe`
+- Linux/macOS (single-config generators): `build/craq_node`, `build/craq_leader`
 
 ## Config File Format
 
@@ -61,31 +61,31 @@ Meaning:
 Terminal 1:
 
 ```bash
-./build/craq_node --host 0.0.0.0 --port 5001
+./build/Debug/craq_node.exe --host 0.0.0.0 --port 5001
 ```
 
 Terminal 2:
 
 ```bash
-./build/craq_node --host 0.0.0.0 --port 5002
+./build/Debug/craq_node.exe --host 0.0.0.0 --port 5002
 ```
 
 Terminal 3:
 
 ```bash
-./build/craq_node --host 0.0.0.0 --port 5003
+./build/Debug/craq_node.exe --host 0.0.0.0 --port 5003
 ```
 
 Configure cluster from another terminal:
 
 ```bash
-./build/craq_leader configure --config configs/cluster.sample.conf
+./build/Debug/craq_leader.exe configure --config configs/cluster.sample.conf
 ```
 
 Write via head and wait for tail ACK:
 
 ```bash
-./build/craq_leader write \
+./build/Debug/craq_leader.exe write \
   --head 127.0.0.1:5001 \
   --key k1 \
   --value hello \
@@ -97,16 +97,19 @@ Write via head and wait for tail ACK:
 Read from any node:
 
 ```bash
-./build/craq_leader read --node 127.0.0.1:5002 --key k1
+./build/Debug/craq_leader.exe read --node 127.0.0.1:5002 --key k1
 ```
 
 Dump state:
 
 ```bash
-./build/craq_leader dump --node 127.0.0.1:5001
-./build/craq_leader dump --node 127.0.0.1:5002
-./build/craq_leader dump --node 127.0.0.1:5003
+./build/Debug/craq_leader.exe dump --node 127.0.0.1:5001
+./build/Debug/craq_leader.exe dump --node 127.0.0.1:5002
+./build/Debug/craq_leader.exe dump --node 127.0.0.1:5003
 ```
+
+If you build on Linux/macOS, replace `./build/Debug/craq_node.exe` with `./build/craq_node` and
+`./build/Debug/craq_leader.exe` with `./build/craq_leader`.
 
 ## Protocol Summary
 
@@ -149,10 +152,12 @@ Copy and edit `configs/vm_hosts.sample.csv`:
 
 ```txt
 node_id,ssh_user,ssh_host,ssh_port,node_host,node_port
-n1,ubuntu,10.0.0.11,22,10.0.0.11,5001
-n2,ubuntu,10.0.0.12,22,10.0.0.12,5002
-n3,ubuntu,10.0.0.13,22,10.0.0.13,5003
+n1,sagarj2,sp26-cs525-1201.cs.illinois.edu,22,sp26-cs525-1201.cs.illinois.edu,5001
+n2,sagarj2,sp26-cs525-1202.cs.illinois.edu,22,sp26-cs525-1202.cs.illinois.edu,5001
+n3,sagarj2,sp26-cs525-1203.cs.illinois.edu,22,sp26-cs525-1203.cs.illinois.edu,5001
 ```
+
+You can extend this pattern through `sp26-cs525-1220.cs.illinois.edu`.
 
 Field meanings:
 
