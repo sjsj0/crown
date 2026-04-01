@@ -1,6 +1,6 @@
 # CRAQ Standalone (C++)
 
-Standalone CRAQ implementation in C++ only. No Python and no dependency on code outside this folder.
+Standalone CRAQ implementation in C++ for local and multi-VM testing.
 
 ## What Is Implemented
 
