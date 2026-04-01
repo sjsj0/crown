@@ -142,73 +142,120 @@ Key message types:
 - Use VM-private IPs in config and command args.
 - Start all nodes before running `configure`.
 
-## One-Click Multi-VM Cluster (3+ Nodes)
+## Run on VMs (Setup + Deploy + Test)
 
-Use `scripts/vm_cluster.sh` for remote orchestration with host mapping.
+This section is for the VM workflow used in this project.
+Keep using the local section above for local-only runs.
 
-### 1) Prepare mapping
+### 1) One-time dependency install on all target VMs
 
-Copy and edit `configs/vm_hosts.sample.csv`:
-
-```txt
-node_id,ssh_user,ssh_host,ssh_port,node_host,node_port
-n1,sagarj2,sp26-cs525-1201.cs.illinois.edu,22,sp26-cs525-1201.cs.illinois.edu,5001
-n2,sagarj2,sp26-cs525-1202.cs.illinois.edu,22,sp26-cs525-1202.cs.illinois.edu,5001
-n3,sagarj2,sp26-cs525-1203.cs.illinois.edu,22,sp26-cs525-1203.cs.illinois.edu,5001
-```
-
-You can extend this pattern through `sp26-cs525-1220.cs.illinois.edu`.
-
-Field meanings:
-
-- `node_id`: CRAQ node id.
-- `ssh_user`, `ssh_host`, `ssh_port`: SSH login endpoint for that VM.
-- `node_host`, `node_port`: address other CRAQ nodes should use for replication.
-
-### 2) Bring cluster up (one command)
+Run from `crown/setup`:
 
 ```bash
-./scripts/vm_cluster.sh up --map ./configs/vm_hosts.sample.csv
+./vm_setup.bash setup
 ```
 
-What `up` does:
+This installs system tools needed by CRAQ (`git`, `cmake`, `g++`, `make`, `rsync`, `tmux`).
 
-- Syncs `CMakeLists.txt`, `include/`, `src/`, and `configs/` to each VM.
-- Builds CRAQ on each VM.
-- Starts each node with `nohup` and PID files under `<remote-dir>/run/`.
-- Generates a runtime chain config from the mapping order.
-- Configures the cluster using `craq_leader` on the first mapped VM.
-- Prints node dumps for quick validation.
+### 2) Pull latest code, rebuild, and start CRAQ node on all target VMs
 
-### 3) Check status
+Run from `crown/setup`:
 
 ```bash
-./scripts/vm_cluster.sh status --map ./configs/vm_hosts.sample.csv
+./vm_setup.bash deploy
 ```
 
-### 4) Reconfigure only
+Notes:
+
+- `deploy` copies and runs `setup/start_server.bash` on each listed VM.
+- `start_server.bash` does: clone/pull repo -> cmake configure/build -> restart node in tmux.
+- Node process runs inside tmux session `craq_node_<port>`.
+- Current `vm_setup.bash` host list controls which VMs are targeted.
+
+### 3) Check that node processes are running (tmux)
+
+On a VM:
 
 ```bash
-./scripts/vm_cluster.sh configure --map ./configs/vm_hosts.sample.csv
+tmux ls
+tmux attach -t craq_node_5001
 ```
 
-### 5) Stop cluster
+Detach from tmux without killing process: `Ctrl+b`, then `d`.
+
+### 4) Configure chain roles/order after nodes are up
+
+Run from `crown/craq` (do not use `sudo`):
 
 ```bash
-./scripts/vm_cluster.sh down --map ./configs/vm_hosts.sample.csv
+bash ./scripts/vm_cluster.sh configure --map ./configs/vm_hosts.sample.csv
 ```
 
-### Optional flags
-
-- `--remote-dir <path>`: remote CRAQ directory (default `~/craq`).
-- `--bind-host <host>`: bind host for remote `craq_node` (default `0.0.0.0`).
-- `--build-type <type>`: CMake build type on VMs (default `Release`).
-- `--ssh-opt <opt>`: pass extra SSH option; repeat as needed.
-
-Example with identity file:
+### 5) Check cluster status
 
 ```bash
-./scripts/vm_cluster.sh up \
+bash ./scripts/vm_cluster.sh status --map ./configs/vm_hosts.sample.csv
+```
+
+If your remote code path differs, pass it explicitly:
+
+```bash
+bash ./scripts/vm_cluster.sh status \
   --map ./configs/vm_hosts.sample.csv \
-  --ssh-opt "-i ~/.ssh/my_vm_key"
+  --remote-dir /home/sagarj2/crown/craq
 ```
+
+### 6) Write test (head write + tail ACK)
+
+Run from a controller machine where `craq_leader` exists:
+
+```bash
+./build/craq_leader write \
+  --head sp26-cs525-1201.cs.illinois.edu:5001 \
+  --key k1 --value v1 \
+  --leader-host <CONTROLLER_VM_IP> \
+  --ack-port 7000
+```
+
+Get controller IP:
+
+```bash
+hostname -I | awk '{print $1}'
+```
+
+Important:
+
+- Use `--leader-host` (not `--client-host`).
+- Use a reachable IP for `--leader-host` so tail can connect back for ACK.
+
+### 7) Read test from a non-tail node
+
+```bash
+./build/craq_leader read --node sp26-cs525-1203.cs.illinois.edu:5001 --key k1
+```
+
+### 8) Dump node state
+
+```bash
+./build/craq_leader dump --node sp26-cs525-1203.cs.illinois.edu:5001
+```
+
+### 9) Stop nodes
+
+From `crown/setup`:
+
+```bash
+./vm_setup.bash kill
+```
+
+Or from `crown/craq`:
+
+```bash
+bash ./scripts/vm_cluster.sh down --map ./configs/vm_hosts.sample.csv
+```
+
+### Common gotchas
+
+- Do not run `vm_cluster.sh` with `sudo`.
+- Ensure mapping file contains only nodes that are actually running, or reads may fail at tail lookup.
+- If multiline commands use `\`, keep `\` as the last character on the line (no trailing spaces).
