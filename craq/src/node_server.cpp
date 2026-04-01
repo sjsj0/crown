@@ -19,6 +19,22 @@ bool parse_int(const std::string& s, int& out) {
     }
 }
 
+std::string endpoint(const std::string& host, int port) {
+    return host + ":" + std::to_string(port);
+}
+
+const char* bool_to_yes_no(bool v) {
+    return v ? "yes" : "no";
+}
+
+std::string node_name(const RuntimeConfig& cfg) {
+    return cfg.node_id.empty() ? "unconfigured" : cfg.node_id;
+}
+
+void log_cfg_line(const RuntimeConfig& cfg, const std::string& msg) {
+    std::cout << "[node " << node_name(cfg) << "] " << msg << "\n\n";
+}
+
 std::string make_ok(const std::string& msg = "ok") {
     Message m;
     m.type = "OK";
@@ -125,6 +141,14 @@ std::string CraqNodeServer::handle_config(const std::string& line) {
         cfg_ = next_cfg;
     }
 
+    log_cfg_line(next_cfg, "CONFIG applied"
+                             " | mode=" + next_cfg.mode +
+                             " | is_head=" + bool_to_yes_no(next_cfg.is_head) +
+                             " | is_tail=" + bool_to_yes_no(next_cfg.is_tail) +
+                             " | prev=" + endpoint(next_cfg.prev_host, next_cfg.prev_port) +
+                             " | next=" + endpoint(next_cfg.next_host, next_cfg.next_port) +
+                             " | tail=" + endpoint(next_cfg.tail_host, next_cfg.tail_port));
+
     return make_ok("configured");
 }
 
@@ -161,8 +185,17 @@ std::string CraqNodeServer::handle_client_write(const std::string& line) {
         return make_err("invalid CLIENT_WRITE payload");
     }
 
+    log_cfg_line(cfg, "CLIENT_WRITE received"
+                         " | request_id=" + request_id +
+                         " | key=" + key +
+                         " | from_client_ack_listener=" + endpoint(client_host, client_port));
+
     const int version = store_.next_version(key);
     store_.apply_dirty(key, version, value);
+
+    log_cfg_line(cfg, "Assigned version and marked DIRTY"
+                         " | key=" + key +
+                         " | version=" + std::to_string(version));
 
     Message repl;
     repl.type = "REPL_WRITE";
@@ -174,11 +207,22 @@ std::string CraqNodeServer::handle_client_write(const std::string& line) {
     repl.fields["request_id"] = request_id;
 
     if (cfg.is_tail) {
+        log_cfg_line(cfg, "Single-node chain path: this head is also tail");
         store_.mark_clean(key, version);
+        log_cfg_line(cfg, "Marked CLEAN at tail"
+                             " | key=" + key +
+                             " | version=" + std::to_string(version));
         std::string err;
+        log_cfg_line(cfg, "Sending CLIENT_ACK"
+                             " | request_id=" + request_id +
+                             " | to=" + endpoint(client_host, client_port));
         if (!send_client_ack(key, version, request_id, client_host, client_port, err)) {
             return make_err("tail ack to client failed: " + err);
         }
+        log_cfg_line(cfg, "CLIENT_ACK delivered"
+                             " | request_id=" + request_id +
+                             " | key=" + key +
+                             " | version=" + std::to_string(version));
         return make_ok("write committed on single-node chain");
     }
 
@@ -187,9 +231,19 @@ std::string CraqNodeServer::handle_client_write(const std::string& line) {
     }
 
     std::string forward_err;
+    log_cfg_line(cfg, "Forwarding REPL_WRITE"
+                         " | request_id=" + request_id +
+                         " | key=" + key +
+                         " | version=" + std::to_string(version) +
+                         " | route=" + endpoint(host_, port_) + " -> " + endpoint(cfg.next_host, cfg.next_port));
     if (!forward_to_next(serialize_message(repl), forward_err)) {
         return make_err("forward to next failed: " + forward_err);
     }
+
+    log_cfg_line(cfg, "Forward acknowledged by next hop"
+                         " | request_id=" + request_id +
+                         " | key=" + key +
+                         " | version=" + std::to_string(version));
 
     Message ok;
     ok.type = "OK";
@@ -230,32 +284,69 @@ std::string CraqNodeServer::handle_repl_write(const std::string& line) {
         return make_err("invalid REPL_WRITE payload");
     }
 
+    log_cfg_line(cfg, "REPL_WRITE received"
+                         " | request_id=" + request_id +
+                         " | key=" + key +
+                         " | version=" + std::to_string(version));
+
     store_.apply_dirty(key, version, value);
+
+    log_cfg_line(cfg, "Marked DIRTY"
+                         " | key=" + key +
+                         " | version=" + std::to_string(version));
 
     if (!cfg.is_tail) {
         if (cfg.next_host.empty() || cfg.next_port == 0) {
             return make_err("intermediate node missing next config");
         }
         std::string forward_err;
+        log_cfg_line(cfg, "Forwarding REPL_WRITE to next"
+                             " | request_id=" + request_id +
+                             " | key=" + key +
+                             " | version=" + std::to_string(version) +
+                             " | route=" + endpoint(host_, port_) + " -> " + endpoint(cfg.next_host, cfg.next_port));
         if (!forward_to_next(line, forward_err)) {
             return make_err("forward to next failed: " + forward_err);
         }
+        log_cfg_line(cfg, "Next hop accepted REPL_WRITE"
+                             " | request_id=" + request_id +
+                             " | key=" + key +
+                             " | version=" + std::to_string(version));
         return make_ok("repl forwarded");
     }
 
     store_.mark_clean(key, version);
+    log_cfg_line(cfg, "TAIL committed version"
+                         " | request_id=" + request_id +
+                         " | key=" + key +
+                         " | version=" + std::to_string(version));
 
     std::string up_err;
     if (!cfg.is_head) {
+        log_cfg_line(cfg, "Starting ACK back-propagation"
+                             " | key=" + key +
+                             " | version=" + std::to_string(version) +
+                             " | route=" + endpoint(host_, port_) + " -> " + endpoint(cfg.prev_host, cfg.prev_port));
         if (!forward_ack_upstream(key, version, up_err)) {
             return make_err("upstream ACK failed: " + up_err);
         }
+        log_cfg_line(cfg, "Upstream ACK accepted"
+                             " | key=" + key +
+                             " | version=" + std::to_string(version));
     }
 
     std::string client_ack_err;
+    log_cfg_line(cfg, "Sending CLIENT_ACK from tail"
+                         " | request_id=" + request_id +
+                         " | to=" + endpoint(client_host, client_port));
     if (!send_client_ack(key, version, request_id, client_host, client_port, client_ack_err)) {
         return make_err("client ACK failed: " + client_ack_err);
     }
+
+    log_cfg_line(cfg, "CLIENT_ACK delivered"
+                         " | request_id=" + request_id +
+                         " | key=" + key +
+                         " | version=" + std::to_string(version));
 
     return make_ok("tail committed and acked");
 }
@@ -283,13 +374,28 @@ std::string CraqNodeServer::handle_ack(const std::string& line) {
         return make_err("invalid ACK payload");
     }
 
+    log_cfg_line(cfg, "ACK received from downstream"
+                         " | key=" + key +
+                         " | version=" + std::to_string(version));
+
     store_.mark_clean(key, version);
+
+    log_cfg_line(cfg, "Marked CLEAN after ACK"
+                         " | key=" + key +
+                         " | version=" + std::to_string(version));
 
     if (!cfg.is_head) {
         std::string up_err;
+        log_cfg_line(cfg, "Forwarding ACK upstream"
+                             " | key=" + key +
+                             " | version=" + std::to_string(version) +
+                             " | route=" + endpoint(host_, port_) + " -> " + endpoint(cfg.prev_host, cfg.prev_port));
         if (!forward_ack_upstream(key, version, up_err)) {
             return make_err("upstream ACK failed: " + up_err);
         }
+        log_cfg_line(cfg, "Upstream ACK accepted"
+                             " | key=" + key +
+                             " | version=" + std::to_string(version));
     }
 
     return make_ok("ack applied");
@@ -320,11 +426,18 @@ std::string CraqNodeServer::handle_client_read(const std::string& line) {
         return make_err("missing key");
     }
 
+    log_cfg_line(cfg, "CLIENT_READ received"
+                         " | key=" + key +
+                         " | node_role=" + std::string(cfg.is_tail ? "tail" : (cfg.is_head ? "head" : "middle")));
+
     if (cfg.is_tail) {
         CleanValue cv = store_.get_clean(key);
         if (!cv.exists) {
             return make_err("key not found");
         }
+        log_cfg_line(cfg, "Serving READ locally from tail"
+                             " | key=" + key +
+                             " | version=" + std::to_string(cv.version));
         Message out;
         out.type = "READ_OK";
         out.fields["key"] = key;
@@ -337,10 +450,17 @@ std::string CraqNodeServer::handle_client_read(const std::string& line) {
     tail_req.type = "TAIL_READ";
     tail_req.fields["key"] = key;
 
+    log_cfg_line(cfg, "Forwarding read-consistency check to tail"
+                         " | key=" + key +
+                         " | route=" + endpoint(host_, port_) + " -> " + endpoint(cfg.tail_host, cfg.tail_port));
+
     std::string resp;
     if (!send_request(cfg.tail_host, cfg.tail_port, serialize_message(tail_req), 2000, resp, error)) {
         return make_err("tail query failed: " + error);
     }
+
+    log_cfg_line(cfg, "Tail returned latest clean version"
+                         " | key=" + key);
     return resp;
 }
 
@@ -365,6 +485,10 @@ std::string CraqNodeServer::handle_tail_read(const std::string& line) {
     if (key.empty()) {
         return make_err("missing key");
     }
+
+    log_cfg_line(cfg, "TAIL_READ received"
+                         " | key=" + key +
+                         " | serving from tail clean state");
 
     CleanValue cv = store_.get_clean(key);
     if (!cv.exists) {
@@ -405,6 +529,13 @@ bool CraqNodeServer::forward_to_next(const std::string& line, std::string& error
     }
 
     std::string resp;
+    Message in;
+    std::string parse_err;
+    if (parse_message(line, in, parse_err)) {
+        log_cfg_line(cfg, "Outgoing message to next"
+                             " | type=" + in.type +
+                             " | route=" + endpoint(host_, port_) + " -> " + endpoint(cfg.next_host, cfg.next_port));
+    }
     if (!send_request(cfg.next_host, cfg.next_port, line, 2000, resp, error)) {
         return false;
     }
@@ -418,6 +549,8 @@ bool CraqNodeServer::forward_to_next(const std::string& line, std::string& error
         error = get_field_or(m, "message", "unknown error");
         return false;
     }
+    log_cfg_line(cfg, "Next hop responded OK"
+                         " | route=" + endpoint(cfg.next_host, cfg.next_port) + " -> " + endpoint(host_, port_));
     return true;
 }
 
@@ -439,6 +572,10 @@ bool CraqNodeServer::forward_ack_upstream(const std::string& key, int version, s
     ack.fields["version"] = std::to_string(version);
 
     std::string resp;
+    log_cfg_line(cfg, "Sending ACK upstream"
+                         " | key=" + key +
+                         " | version=" + std::to_string(version) +
+                         " | route=" + endpoint(host_, port_) + " -> " + endpoint(cfg.prev_host, cfg.prev_port));
     if (!send_request(cfg.prev_host, cfg.prev_port, serialize_message(ack), 2000, resp, error)) {
         return false;
     }
@@ -452,6 +589,9 @@ bool CraqNodeServer::forward_ack_upstream(const std::string& key, int version, s
         error = get_field_or(m, "message", "upstream ACK rejected");
         return false;
     }
+    log_cfg_line(cfg, "Upstream node accepted ACK"
+                         " | key=" + key +
+                         " | version=" + std::to_string(version));
     return true;
 }
 
@@ -465,6 +605,14 @@ bool CraqNodeServer::send_client_ack(const std::string& key, int version, const 
     ack.fields["request_id"] = request_id;
 
     std::string resp;
+    RuntimeConfig cfg;
+    {
+        std::lock_guard<std::mutex> lock(cfg_mu_);
+        cfg = cfg_;
+    }
+    log_cfg_line(cfg, "Sending CLIENT_ACK callback"
+                         " | request_id=" + request_id +
+                         " | route=" + endpoint(host_, port_) + " -> " + endpoint(client_host, client_port));
     if (!send_request(client_host, client_port, serialize_message(ack), 2000, resp, error)) {
         return false;
     }
@@ -478,6 +626,11 @@ bool CraqNodeServer::send_client_ack(const std::string& key, int version, const 
         error = get_field_or(m, "message", "client did not accept ACK");
         return false;
     }
+
+    log_cfg_line(cfg, "Client accepted ACK"
+                         " | request_id=" + request_id +
+                         " | key=" + key +
+                         " | version=" + std::to_string(version));
 
     return true;
 }

@@ -259,3 +259,67 @@ bash ./scripts/vm_cluster.sh down --map ./configs/vm_hosts.sample.csv
 - Do not run `vm_cluster.sh` with `sudo`.
 - Ensure mapping file contains only nodes that are actually running, or reads may fail at tail lookup.
 - If multiline commands use `\`, keep `\` as the last character on the line (no trailing spaces).
+
+## Cases
+
+### Case: Change head and tail (example: 1203 as head, 1201 as tail)
+
+Head and tail are decided by row order in `configs/vm_hosts.sample.csv`.
+
+To make `1203` head and `1201` tail:
+
+1. Open `configs/vm_hosts.sample.csv`.
+2. Move the row for `1203` to the top (first node row after header).
+3. Move the row for `1201` to the bottom (last node row).
+4. Keep all other rows in any middle order you want.
+5. Re-run configure (no rebuild needed):
+
+```bash
+bash ./scripts/vm_cluster.sh configure --map ./configs/vm_hosts.sample.csv
+```
+
+6. Verify chain status:
+
+```bash
+bash ./scripts/vm_cluster.sh status --map ./configs/vm_hosts.sample.csv
+```
+
+Example first/last rows:
+
+```csv
+n3,sagarj2,sp26-cs525-1203.cs.illinois.edu,22,sp26-cs525-1203.cs.illinois.edu,5001
+n1,sagarj2,sp26-cs525-1201.cs.illinois.edu,22,sp26-cs525-1201.cs.illinois.edu,5001
+```
+
+That is all you need: reorder map rows and run configure again.
+
+### Case: `write --head` must match configured head
+
+After `configure`, the first row in `configs/vm_hosts.sample.csv` is the configured head.
+When running write, `--head` should point to that same node.
+
+If `--head` points to a different node than the configured head, writes may fail or be rejected.
+
+Checklist:
+
+1. Run status to confirm current chain:
+
+```bash
+bash ./scripts/vm_cluster.sh status --map ./configs/vm_hosts.sample.csv
+```
+
+2. Use the reported/configured head in write command:
+
+```bash
+./build/craq_leader write \
+  --head sp26-cs525-1203.cs.illinois.edu:5001 \
+  --key k1 --value v1 \
+  --leader-host <CONTROLLER_VM_IP> \
+  --ack-port 7000
+```
+
+3. If you changed row order, re-run configure before writing:
+
+```bash
+bash ./scripts/vm_cluster.sh configure --map ./configs/vm_hosts.sample.csv
+```

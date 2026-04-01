@@ -41,7 +41,7 @@ EOF
 }
 
 log() {
-  printf '[vm_cluster] %s\n' "$*"
+  printf '[vm_cluster] %s\n\n' "$*"
 }
 
 declare -a NODE_IDS=()
@@ -147,7 +147,7 @@ generate_runtime_config() {
 
 sync_source_and_build_remote() {
   local i="$1"
-  log "sync+build on ${NODE_IDS[$i]} (${SSH_HOSTS[$i]})"
+  log "sync+build | node=${NODE_IDS[$i]} | ssh=${SSH_USERS[$i]}@${SSH_HOSTS[$i]}:${SSH_PORTS[$i]} | node_endpoint=${NODE_HOSTS[$i]}:${NODE_PORTS[$i]}"
 
   ssh_cmd "$i" "mkdir -p '$REMOTE_DIR'"
 
@@ -163,7 +163,7 @@ start_remote_node() {
   local node_id="${NODE_IDS[$i]}"
   local node_port="${NODE_PORTS[$i]}"
 
-  log "start node $node_id on ${SSH_HOSTS[$i]}:$node_port"
+  log "start node | node=$node_id | route=controller -> ${SSH_USERS[$i]}@${SSH_HOSTS[$i]}:${SSH_PORTS[$i]} | bind=${BIND_HOST}:$node_port"
 
   ssh_cmd "$i" "mkdir -p '$REMOTE_DIR/run' '$REMOTE_DIR/logs'"
   ssh_cmd "$i" "if [[ -f '$REMOTE_DIR/run/${node_id}.pid' ]]; then kill \"\$(cat '$REMOTE_DIR/run/${node_id}.pid')\" >/dev/null 2>&1 || true; rm -f '$REMOTE_DIR/run/${node_id}.pid'; fi"
@@ -177,7 +177,7 @@ configure_cluster() {
   tmp_cfg="$(mktemp)"
   generate_runtime_config "$tmp_cfg"
 
-  log "configure cluster from controller ${NODE_IDS[$controller]} (${SSH_HOSTS[$controller]})"
+  log "configure cluster | controller=${NODE_IDS[$controller]} (${SSH_HOSTS[$controller]}) | map=$MAP_FILE"
 
   scp_to "$controller" "$tmp_cfg" "$REMOTE_DIR/configs/cluster.runtime.conf"
   rm -f "$tmp_cfg"
@@ -188,12 +188,14 @@ configure_cluster() {
 status_cluster() {
   local controller=0
   local i
-  log "cluster status via controller ${NODE_IDS[$controller]} (${SSH_HOSTS[$controller]})"
+  log "cluster status | controller=${NODE_IDS[$controller]} (${SSH_HOSTS[$controller]})"
 
   for ((i=0; i<${#NODE_IDS[@]}; ++i)); do
     local endpoint="${NODE_HOSTS[$i]}:${NODE_PORTS[$i]}"
     echo "----- ${NODE_IDS[$i]} ($endpoint) -----"
+    echo
     ssh_cmd "$controller" "'$REMOTE_DIR/build/craq_leader' dump --node '$endpoint'" || true
+    echo
   done
 }
 
@@ -202,7 +204,7 @@ stop_remote_node() {
   local node_id="${NODE_IDS[$i]}"
   local node_port="${NODE_PORTS[$i]}"
 
-  log "stop node $node_id on ${SSH_HOSTS[$i]}"
+  log "stop node | node=$node_id | route=controller -> ${SSH_USERS[$i]}@${SSH_HOSTS[$i]}:${SSH_PORTS[$i]} | bind=${BIND_HOST}:$node_port"
 
   ssh_cmd "$i" "if [[ -f '$REMOTE_DIR/run/${node_id}.pid' ]]; then kill \"\$(cat '$REMOTE_DIR/run/${node_id}.pid')\" >/dev/null 2>&1 || true; rm -f '$REMOTE_DIR/run/${node_id}.pid'; fi"
   ssh_cmd "$i" "pkill -f 'craq_node --host $BIND_HOST --port $node_port' >/dev/null 2>&1 || true"

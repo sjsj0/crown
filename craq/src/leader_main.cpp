@@ -24,11 +24,24 @@ bool parse_message_or_print(const std::string& line, Message& out) {
     return true;
 }
 
+std::string endpoint(const std::string& host, int port) {
+    return host + ":" + std::to_string(port);
+}
+
+void print_step(const std::string& msg) {
+    std::cout << "[leader] " << msg << "\n\n";
+}
+
+void print_error_step(const std::string& msg) {
+    std::cerr << "[leader] " << msg << "\n\n";
+}
+
 bool send_and_expect_ok(const std::string& host, int port, const Message& request,
                         int timeout_ms, std::string& response_text) {
+    print_step("Sending " + request.type + " | route=leader -> " + endpoint(host, port));
     std::string err;
     if (!craq::send_request(host, port, craq::serialize_message(request), timeout_ms, response_text, err)) {
-        std::cerr << "request to " << host << ":" << port << " failed: " << err << "\n";
+        print_error_step("Request failed | route=leader -> " + endpoint(host, port) + " | error=" + err);
         return false;
     }
 
@@ -37,10 +50,11 @@ bool send_and_expect_ok(const std::string& host, int port, const Message& reques
         return false;
     }
     if (resp.type != "OK") {
-        std::cerr << "request to " << host << ":" << port << " rejected: "
-                  << craq::get_field_or(resp, "message", "unknown") << "\n";
+        print_error_step("Request rejected by " + endpoint(host, port) + " | reason=" +
+                         craq::get_field_or(resp, "message", "unknown"));
         return false;
     }
+    print_step("Received OK | route=" + endpoint(host, port) + " -> leader");
     return true;
 }
 
@@ -48,16 +62,21 @@ bool configure_cluster(const std::string& config_path) {
     ClusterConfig cfg;
     std::string err;
     if (!craq::parse_cluster_config(config_path, cfg, err)) {
-        std::cerr << "config parse failed: " << err << "\n";
+        print_error_step("Config parse failed: " + err);
         return false;
     }
 
     if (cfg.mode != "CRAQ") {
-        std::cerr << "This binary only configures CRAQ mode. Found mode=" << cfg.mode << "\n";
+        print_error_step("This binary only configures CRAQ mode. Found mode=" + cfg.mode);
         return false;
     }
 
     const NodeInfo& tail = cfg.nodes.back();
+
+    print_step("Starting cluster CONFIG push"
+               " | nodes=" + std::to_string(cfg.nodes.size()) +
+               " | head=" + endpoint(cfg.nodes.front().host, cfg.nodes.front().port) +
+               " | tail=" + endpoint(tail.host, tail.port));
 
     for (size_t i = 0; i < cfg.nodes.size(); ++i) {
         const NodeInfo& node = cfg.nodes[i];
@@ -90,10 +109,16 @@ bool configure_cluster(const std::string& config_path) {
         if (!send_and_expect_ok(node.host, node.port, m, 3000, response)) {
             return false;
         }
-        std::cout << "configured node " << node.id << " at " << node.host << ":" << node.port << "\n";
+        print_step("Configured node"
+                   " | node_id=" + node.id +
+                   " | endpoint=" + endpoint(node.host, node.port) +
+                   " | is_head=" + m.fields["is_head"] +
+                   " | is_tail=" + m.fields["is_tail"] +
+                   " | prev=" + endpoint(m.fields["prev_host"], std::stoi(m.fields["prev_port"])) +
+                   " | next=" + endpoint(m.fields["next_host"], std::stoi(m.fields["next_port"])));
     }
 
-    std::cout << "CRAQ cluster configured successfully.\n";
+    print_step("CRAQ cluster configured successfully");
     return true;
 }
 
@@ -126,6 +151,10 @@ bool wait_for_tail_ack(const std::string& bind_host, int ack_port, const std::st
         ack_server.start(err);
     });
 
+    print_step("ACK listener started"
+               " | request_id=" + request_id +
+               " | listen_on=" + endpoint(bind_host, ack_port));
+
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     const auto status = fut.wait_for(std::chrono::milliseconds(timeout_ms));
@@ -133,11 +162,15 @@ bool wait_for_tail_ack(const std::string& bind_host, int ack_port, const std::st
     server_thread.join();
 
     if (status != std::future_status::ready) {
-        std::cerr << "timeout waiting for tail ack request_id=" << request_id << "\n";
+        print_error_step("Timeout waiting for tail ACK | request_id=" + request_id);
         return false;
     }
 
     ack_out = fut.get();
+    print_step("Tail ACK received"
+               " | request_id=" + request_id +
+               " | key=" + craq::get_field_or(ack_out, "key", "") +
+               " | version=" + craq::get_field_or(ack_out, "version", ""));
     return true;
 }
 
@@ -146,7 +179,7 @@ bool write_key(const std::string& head, const std::string& key, const std::strin
     std::string head_host;
     int head_port = 0;
     if (!craq::split_host_port(head, head_host, head_port)) {
-        std::cerr << "invalid --head host:port\n";
+        print_error_step("invalid --head host:port");
         return false;
     }
 
@@ -168,6 +201,12 @@ bool write_key(const std::string& head, const std::string& key, const std::strin
         wait_for_tail_ack(leader_host, ack_port, request_id, timeout_ms, tail_ack);
     });
 
+    print_step("Dispatching CLIENT_WRITE"
+               " | request_id=" + request_id +
+               " | key=" + key +
+               " | route=leader -> " + endpoint(head_host, head_port) +
+               " | ack_callback=" + endpoint(leader_host, ack_port));
+
     std::string response;
     bool ok = send_and_expect_ok(head_host, head_port, req, timeout_ms, response);
     if (!ok) {
@@ -178,12 +217,14 @@ bool write_key(const std::string& head, const std::string& key, const std::strin
     waiter.join();
 
     if (tail_ack.type != "CLIENT_ACK") {
-        std::cerr << "tail ACK was not received\n";
+        print_error_step("Tail ACK was not received");
         return false;
     }
 
-    std::cout << "Write committed key=" << craq::get_field_or(tail_ack, "key", "")
-              << " version=" << craq::get_field_or(tail_ack, "version", "") << "\n";
+    print_step("Write committed"
+               " | key=" + craq::get_field_or(tail_ack, "key", "") +
+               " | version=" + craq::get_field_or(tail_ack, "version", "") +
+               " | request_id=" + request_id);
     return true;
 }
 
@@ -191,7 +232,7 @@ bool read_key(const std::string& node, const std::string& key) {
     std::string host;
     int port = 0;
     if (!craq::split_host_port(node, host, port)) {
-        std::cerr << "invalid --node host:port\n";
+        print_error_step("invalid --node host:port");
         return false;
     }
 
@@ -201,8 +242,11 @@ bool read_key(const std::string& node, const std::string& key) {
 
     std::string err;
     std::string response;
+    print_step("Sending CLIENT_READ"
+               " | key=" + key +
+               " | route=leader -> " + endpoint(host, port));
     if (!craq::send_request(host, port, craq::serialize_message(req), 3000, response, err)) {
-        std::cerr << "read request failed: " << err << "\n";
+        print_error_step("Read request failed | route=leader -> " + endpoint(host, port) + " | error=" + err);
         return false;
     }
 
@@ -212,12 +256,15 @@ bool read_key(const std::string& node, const std::string& key) {
     }
 
     if (resp.type != "READ_OK") {
-        std::cerr << "read failed: " << craq::get_field_or(resp, "message", "unknown") << "\n";
+        print_error_step("Read failed | reason=" + craq::get_field_or(resp, "message", "unknown"));
         return false;
     }
 
-    std::cout << "key=" << key << " value=" << craq::get_field_or(resp, "value", "")
-              << " version=" << craq::get_field_or(resp, "version", "") << "\n";
+    print_step("Read result"
+               " | key=" + key +
+               " | value=" + craq::get_field_or(resp, "value", "") +
+               " | version=" + craq::get_field_or(resp, "version", "") +
+               " | route=" + endpoint(host, port) + " -> leader");
     return true;
 }
 
@@ -225,7 +272,7 @@ bool dump_node(const std::string& node) {
     std::string host;
     int port = 0;
     if (!craq::split_host_port(node, host, port)) {
-        std::cerr << "invalid --node host:port\n";
+        print_error_step("invalid --node host:port");
         return false;
     }
 
@@ -234,8 +281,10 @@ bool dump_node(const std::string& node) {
 
     std::string err;
     std::string response;
+    print_step("Sending DUMP"
+               " | route=leader -> " + endpoint(host, port));
     if (!craq::send_request(host, port, craq::serialize_message(req), 3000, response, err)) {
-        std::cerr << "dump request failed: " << err << "\n";
+        print_error_step("Dump request failed | route=leader -> " + endpoint(host, port) + " | error=" + err);
         return false;
     }
 
@@ -245,14 +294,16 @@ bool dump_node(const std::string& node) {
     }
 
     if (resp.type != "DUMP_OK") {
-        std::cerr << "dump failed: " << craq::get_field_or(resp, "message", "unknown") << "\n";
+        print_error_step("Dump failed | reason=" + craq::get_field_or(resp, "message", "unknown"));
         return false;
     }
 
-    std::cout << "node_id=" << craq::get_field_or(resp, "node_id", "") << " "
-              << "is_head=" << craq::get_field_or(resp, "is_head", "") << " "
-              << "is_tail=" << craq::get_field_or(resp, "is_tail", "") << "\n";
-    std::cout << "state=" << craq::get_field_or(resp, "state", "") << "\n";
+    print_step("Dump response"
+               " | route=" + endpoint(host, port) + " -> leader" +
+               " | node_id=" + craq::get_field_or(resp, "node_id", "") +
+               " | is_head=" + craq::get_field_or(resp, "is_head", "") +
+               " | is_tail=" + craq::get_field_or(resp, "is_tail", ""));
+    std::cout << "state=" << craq::get_field_or(resp, "state", "") << "\n\n";
     return true;
 }
 
