@@ -20,7 +20,6 @@ REPO_BRANCH="${REPO_BRANCH:-main}"
 REMOTE_BASE_DIR="${REMOTE_BASE_DIR:-$HOME}"
 REPO_NAME="${REPO_NAME:-$(basename "${REPO_URL%.git}")}"
 PROJECT_SUBDIR="${PROJECT_SUBDIR:-crown/craq}"
-INSTALL_PACKAGES="${INSTALL_PACKAGES:-0}"
 
 # Optional: local key used just to reach the VMs. If you've already run
 # `ssh-copy-id` or have an agent, you can omit this in .env.
@@ -52,21 +51,21 @@ hosts=(
  "sp26-cs525-1203.cs.illinois.edu"
  "sp26-cs525-1204.cs.illinois.edu"
  "sp26-cs525-1205.cs.illinois.edu"
- "sp26-cs525-1206.cs.illinois.edu"
- "sp26-cs525-1207.cs.illinois.edu"
- "sp26-cs525-1208.cs.illinois.edu"
- "sp26-cs525-1209.cs.illinois.edu"
- "sp26-cs525-1210.cs.illinois.edu"
- "sp26-cs525-1211.cs.illinois.edu"
- "sp26-cs525-1212.cs.illinois.edu"
- "sp26-cs525-1213.cs.illinois.edu"
- "sp26-cs525-1214.cs.illinois.edu"
- "sp26-cs525-1215.cs.illinois.edu"
- "sp26-cs525-1216.cs.illinois.edu"
- "sp26-cs525-1217.cs.illinois.edu"
- "sp26-cs525-1218.cs.illinois.edu"
- "sp26-cs525-1219.cs.illinois.edu"
- "sp26-cs525-1220.cs.illinois.edu"
+#  "sp26-cs525-1206.cs.illinois.edu"
+#  "sp26-cs525-1207.cs.illinois.edu"
+#  "sp26-cs525-1208.cs.illinois.edu"
+#  "sp26-cs525-1209.cs.illinois.edu"
+#  "sp26-cs525-1210.cs.illinois.edu"
+#  "sp26-cs525-1211.cs.illinois.edu"
+#  "sp26-cs525-1212.cs.illinois.edu"
+#  "sp26-cs525-1213.cs.illinois.edu"
+#  "sp26-cs525-1214.cs.illinois.edu"
+#  "sp26-cs525-1215.cs.illinois.edu"
+#  "sp26-cs525-1216.cs.illinois.edu"
+#  "sp26-cs525-1217.cs.illinois.edu"
+#  "sp26-cs525-1218.cs.illinois.edu"
+#  "sp26-cs525-1219.cs.illinois.edu"
+#  "sp26-cs525-1220.cs.illinois.edu"
 )
 
 # --- loop over servers ---
@@ -80,6 +79,6 @@ for host in "${hosts[@]}"; do
 
   echo "   -> running $REMOTE_SCRIPT"
   ssh -t "${SSH_OPTS[@]}" "$server" \
-    "REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REMOTE_BASE_DIR='$REMOTE_BASE_DIR' REPO_NAME='$REPO_NAME' PROJECT_SUBDIR='$PROJECT_SUBDIR' INSTALL_PACKAGES='$INSTALL_PACKAGES' bash '$REMOTE_SCRIPT'"
+    "REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REMOTE_BASE_DIR='$REMOTE_BASE_DIR' REPO_NAME='$REPO_NAME' PROJECT_SUBDIR='$PROJECT_SUBDIR' bash '$REMOTE_SCRIPT'"
 done
 

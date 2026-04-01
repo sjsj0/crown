@@ -3,8 +3,6 @@ set -euo pipefail
 
 echo "=== VM dependency setup (CRAQ mode) ==="
 
-INSTALL_PACKAGES="${INSTALL_PACKAGES:-0}"
-
 run_as_root() {
   if [[ "$(id -u)" -eq 0 ]]; then
     "$@"
@@ -17,11 +15,7 @@ run_as_root() {
   return 1
 }
 
-echo "Installing system packages (INSTALL_PACKAGES=$INSTALL_PACKAGES)..."
-if [[ "$INSTALL_PACKAGES" != "1" ]]; then
-  echo "Skipping package install (set INSTALL_PACKAGES=1 in .env for one-time setup)."
-  exit 0
-fi
+echo "Installing system packages..."
 
 if command -v dnf >/dev/null 2>&1; then
   if ! run_as_root dnf install -y git cmake make gcc-c++ rsync openssh-clients wget vim; then
