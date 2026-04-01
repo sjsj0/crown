@@ -30,7 +30,7 @@ fi
 
 # Which local script to send and run remotely
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <setup|build|kill>"
+  echo "Usage: $0 <setup|build|deploy|kill>"
   exit 1
 fi
 
@@ -38,11 +38,13 @@ ACTION="$1"
 case "$ACTION" in
   setup) LOCAL_SCRIPT="$SCRIPT_DIR/setup.bash" ;;
   build) LOCAL_SCRIPT="$SCRIPT_DIR/start_server.bash" ;;
+  deploy) LOCAL_SCRIPT="$SCRIPT_DIR/start_server.bash" ;;
   kill)  LOCAL_SCRIPT="$SCRIPT_DIR/kill.bash" ;;
-  *) echo "Invalid action: $ACTION"; echo "Usage: $0 <setup|build|kill>"; exit 1 ;;
+  *) echo "Invalid action: $ACTION"; echo "Usage: $0 <setup|build|deploy|kill>"; exit 1 ;;
 esac
 [[ -f "$LOCAL_SCRIPT" ]] || { echo "Error: $LOCAL_SCRIPT not found"; exit 1; }
 REMOTE_SCRIPT="/home/${SSH_USER}/$(basename "$LOCAL_SCRIPT")"
+REMOTE_SETUP_SCRIPT="/home/${SSH_USER}/setup.bash"
 
 # Hosts (without usernames)
 hosts=(
@@ -73,8 +75,18 @@ for host in "${hosts[@]}"; do
   server="${SSH_USER}@${host}"
   echo "==> $server"
 
+  if [[ "$ACTION" == "build" || "$ACTION" == "deploy" ]]; then
+    # Build now bootstraps itself by ensuring repo + deps are present first.
+    echo "   -> copying setup.bash"
+    scp "${SSH_OPTS[@]}" "$SCRIPT_DIR/setup.bash" "$server:$REMOTE_SETUP_SCRIPT"
+
+    echo "   -> running bootstrap setup.bash"
+    ssh -t "${SSH_OPTS[@]}" "$server" \
+      "REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REMOTE_BASE_DIR='$REMOTE_BASE_DIR' REPO_NAME='$REPO_NAME' PROJECT_SUBDIR='$PROJECT_SUBDIR' bash '$REMOTE_SETUP_SCRIPT'"
+  fi
+
   # Copy and run the requested script
-  echo "   -> copying $(basename "$LOCAL_SCRIPT")"
+  echo "   -> copying $(basename \"$LOCAL_SCRIPT\")"
   scp "${SSH_OPTS[@]}" "$LOCAL_SCRIPT" "$server:$REMOTE_SCRIPT"
 
   echo "   -> running $REMOTE_SCRIPT"
