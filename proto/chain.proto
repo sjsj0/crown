@@ -1,0 +1,118 @@
+syntax = "proto3";
+import "google/protobuf/empty.proto";
+
+package chain;
+
+// ============================================================
+// Enums
+// ============================================================
+
+enum ReplicationMode {
+    CHAIN = 0;
+    CRAQ  = 1;
+    CROWN = 2;
+}
+
+// ============================================================
+// Shared sub-messages
+// ============================================================
+
+message NodeAddress {
+    string host = 1;
+    int32  port = 2;
+}
+
+message KeyRange {
+    string start_key = 1;
+    string end_key   = 2;
+}
+
+// ============================================================
+// Config — pushed by client.cpp to each server on startup
+// ============================================================
+
+message NodeConfig {
+    int32           node_id     = 1;
+    NodeAddress     self_addr   = 2;
+    ReplicationMode mode        = 3;
+    bool            is_head     = 4;
+    bool            is_tail     = 5;
+
+    optional NodeAddress predecessor = 6;  // absent = no predecessor (head)
+    optional NodeAddress successor   = 7;  // absent = no successor (tail)
+
+    repeated KeyRange head_ranges = 8; // crown mode only
+    repeated KeyRange tail_ranges = 9; // crown mode only
+}
+
+// ============================================================
+// Client <-> Node RPCs
+// ============================================================
+
+message WriteRequest {
+    string   key     = 1;
+    string   value   = 2;
+    uint64   version = 3; // client can leave 0; head assigns the real version
+}
+
+message WriteResponse {
+    bool   success = 1;
+    uint64 version = 2; // the version the head assigned
+}
+
+message ReadRequest {
+    string key = 1;
+}
+
+message ReadResponse {
+    string key     = 1;
+    string value   = 2;
+    uint64 version = 3;
+}
+
+// ============================================================
+// Node <-> Node RPCs (inter-node propagation)
+// ============================================================
+
+message PropagateRequest {
+    string key       = 1;
+    string value     = 2;
+    uint64 version   = 3;
+    string origin_id = 4; // node_id of the head that originated the write
+}
+
+message AckRequest {
+    string key     = 1;
+    uint64 version = 2;
+}
+
+// ============================================================
+// CRAQ only — version query from non-tail to tail
+// ============================================================
+
+message VersionQueryRequest {
+    string key = 1;
+}
+
+message VersionQueryResponse {
+    string key             = 1;
+    uint64 latest_version  = 2; // latest committed (clean) version at the tail
+}
+
+// ============================================================
+// Service
+// ============================================================
+
+service ChainNode {
+    // Client -> Node
+    rpc Configure    (NodeConfig)          returns (google.protobuf.Empty);
+    rpc Write        (WriteRequest)        returns (WriteResponse);
+    rpc Read         (ReadRequest)         returns (ReadResponse);
+
+    // Node -> Node (inter-node, but same service since every node runs it)
+    rpc Propagate    (PropagateRequest)    returns (google.protobuf.Empty);
+    rpc Ack          (AckRequest)         returns (google.protobuf.Empty);
+
+    // CRAQ only
+    rpc VersionQuery (VersionQueryRequest) returns (VersionQueryResponse);
+}
