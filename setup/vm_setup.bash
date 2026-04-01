@@ -43,6 +43,7 @@ case "$ACTION" in
 esac
 [[ -f "$LOCAL_SCRIPT" ]] || { echo "Error: $LOCAL_SCRIPT not found"; exit 1; }
 REMOTE_SCRIPT="/home/${SSH_USER}/$(basename "$LOCAL_SCRIPT")"
+LOCAL_SCRIPT_NAME="$(basename "$LOCAL_SCRIPT")"
 
 # Hosts (without usernames)
 hosts=(
@@ -74,7 +75,7 @@ for host in "${hosts[@]}"; do
   echo "==> $server"
 
   # Copy and run the requested script
-  echo "   -> copying $(basename \"$LOCAL_SCRIPT\")"
+  echo "   -> copying $LOCAL_SCRIPT_NAME"
   scp "${SSH_OPTS[@]}" "$LOCAL_SCRIPT" "$server:$REMOTE_SCRIPT"
 
   echo "   -> running $REMOTE_SCRIPT"

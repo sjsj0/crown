@@ -39,6 +39,24 @@ echo "CRAQ source: $CRAQ_DIR"
 cd "$CRAQ_DIR"
 
 # ---------------------------
+# 2.5) Preflight tool checks
+# ---------------------------
+if ! command -v git >/dev/null 2>&1; then
+  echo "ERROR: git is not installed on this VM. Run: ./vm_setup.bash setup"
+  exit 1
+fi
+
+if ! command -v cmake >/dev/null 2>&1; then
+  echo "ERROR: cmake is not installed on this VM. Run: ./vm_setup.bash setup"
+  exit 1
+fi
+
+if ! command -v g++ >/dev/null 2>&1; then
+  echo "ERROR: g++ is not installed on this VM. Run: ./vm_setup.bash setup"
+  exit 1
+fi
+
+# ---------------------------
 # 3) Configure + build
 # ---------------------------
 BUILD_TYPE="${BUILD_TYPE:-Release}"
