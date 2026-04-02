@@ -1,5 +1,6 @@
 #pragma once
 #include "../replication_strategy.h"
+#include "../common/chain_style_replication_support.h"
 
 class CROWNReplication : public ReplicationStrategy {
 public:
@@ -10,4 +11,9 @@ public:
     void handle_propagate(const chain::PropagateRequest& req, Node& node) override;
 
     void handle_ack(const chain::AckRequest& req, Node& node) override;
+
+    void on_config_change(Node& node) override;
+
+private:
+    ChainStyleReplicationSupport support_;
 };

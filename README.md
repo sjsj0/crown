@@ -3,7 +3,7 @@
 A C++ implementation of three chain replication variants:
 - **Chain Replication** — classic head/tail linear chain
 - **CRAQ** (Chain Replication with Apportioned Queries) — reads from any node with version consistency
-- **CROWN** — circular topology where each node acts as head/tail based on key partitioning
+- **CROWN** — circular topology where each node acts as head/tail based on hashed key-token partitioning
 
 Inter-node communication uses gRPC and Protocol Buffers. Topology config is pushed to nodes at runtime by a client — nodes themselves are config-agnostic at startup.
 
@@ -45,8 +45,8 @@ cmake --build build
 
 This will:
 1. Run `protoc` to generate `chain.pb.h/cc` and `chain.grpc.pb.h/cc` from `proto/chain.proto`
-2. Compile `server.cpp` and `client.cpp`
-3. Output binaries at `build/server` and `build/client`
+2. Compile `server.cpp`, `client.cpp`, and `kv_client.cpp`
+3. Output binaries at `build/server`, `build/client`, and `build/kv_client`
 
 To symlink `compile_commands.json` for clangd/IDE support:
 ```bash
@@ -76,6 +76,77 @@ Write a `config.json` describing the chain (see format below), then run the clie
 ```
 
 The client loops through every node in the config file and sends each one its `NodeConfig` via the `Configure` RPC.
+
+### Generate a CROWN ring config automatically
+
+Use the helper script to generate a valid closed CROWN ring config with evenly partitioned token ranges:
+
+```bash
+python3 setup/generate_crown_config.py <node_count> <base_port> --output config.crown.sample.json
+```
+
+Example (3 nodes, ports 50051-50053):
+
+```bash
+python3 setup/generate_crown_config.py 3 50051 --output config.crown.sample.json
+```
+
+A checked-in 3-node sample is provided at `config.crown.sample.json`.
+
+### 3. Run key/value workload client
+
+`kv_client` uses the same `config.json` for routing and then sends actual `Write` / `Read` RPCs.
+
+Write:
+
+```bash
+./build/kv_client write config.json user:1 hello
+```
+
+Read:
+
+```bash
+./build/kv_client read config.json user:1
+```
+
+Routing rules used by `kv_client`:
+
+- CHAIN: writes -> global head, reads -> global tail.
+- CROWN: writes -> node whose `head_ranges` owns `hash(key)`, reads -> node whose `tail_ranges` owns `hash(key)`.
+- CRAQ: currently writes -> head, reads -> tail (temporary baseline).
+
+The client prints the contacted node endpoint and returned version.
+
+### 4. Run practical CROWN smoke test
+
+Use the smoke-test harness to validate a local 3-node CROWN ring end-to-end:
+
+```bash
+bash setup/crown_smoke_test.sh
+```
+
+What it checks:
+
+- launches 3 local servers and pushes a generated CROWN config
+- writes keys mapped to different heads and reads from corresponding tails
+- same key always routes to the same head/tail
+- different keys distribute across different heads/tails
+- wrong-node write/read requests fail with clear errors
+- ring wrap-around path works
+- concurrent writes to the same key produce strictly increasing contiguous versions
+- cleans up server processes on exit
+
+### Chain mode semantics in this repo
+
+- Only the configured head accepts client `Write` RPCs.
+- Head assigns a monotonic per-key version.
+- The write is propagated successor-by-successor using `Propagate` RPC.
+- Tail marks the version committed and initiates upstream `Ack` RPC toward the head.
+- Head blocks waiting for that commit acknowledgment, then returns `WriteResponse { success=true, version=... }`.
+- Only the configured tail serves client `Read` RPCs.
+- Reads return the latest committed value/version.
+- Client writes sent to non-head nodes fail with a clear error.
+- Client reads sent to non-tail nodes fail with a clear error.
 
 ---
 
@@ -118,10 +189,74 @@ The client loops through every node in the config file and sends each one its `N
 
 `mode` can be `"chain"`, `"craq"`, or `"crown"`.
 
-For crown mode, each node entry also accepts `head_ranges` and `tail_ranges`:
+For crown mode, each node entry also accepts `head_ranges` and `tail_ranges`.
+These are token ranges on a deterministic 64-bit key-hash ring (not literal key strings):
 ```json
-"head_ranges": [{ "start": "a", "end": "m" }],
-"tail_ranges": [{ "start": "n", "end": "z" }]
+"head_ranges": [{ "start": "0", "end": "6148914691236517205" }],
+"tail_ranges": [{ "start": "12297829382473034411", "end": "18446744073709551615" }]
+```
+
+Range bounds are inclusive. Wrapped ranges are allowed by setting `start > end`
+(for example, `{"start":"17000000000000000000","end":"1000000000000000000"}`).
+
+CROWN mapping in this repo:
+
+- `head(key)` = node whose `head_ranges` owns `hash(key)`.
+- `tail(key)` = predecessor(`head(key)`).
+
+Valid CROWN sample (`config.crown.sample.json`):
+
+```json
+{
+  "mode": "crown",
+  "nodes": [
+    {
+      "id": 0,
+      "host": "127.0.0.1",
+      "port": 50051,
+      "is_head": false,
+      "is_tail": false,
+      "predecessor": "127.0.0.1:50053",
+      "successor": "127.0.0.1:50052",
+      "head_ranges": [
+        { "start": "0", "end": "6148914691236517205" }
+      ],
+      "tail_ranges": [
+        { "start": "6148914691236517206", "end": "12297829382473034410" }
+      ]
+    },
+    {
+      "id": 1,
+      "host": "127.0.0.1",
+      "port": 50052,
+      "is_head": false,
+      "is_tail": false,
+      "predecessor": "127.0.0.1:50051",
+      "successor": "127.0.0.1:50053",
+      "head_ranges": [
+        { "start": "6148914691236517206", "end": "12297829382473034410" }
+      ],
+      "tail_ranges": [
+        { "start": "12297829382473034411", "end": "18446744073709551615" }
+      ]
+    },
+    {
+      "id": 2,
+      "host": "127.0.0.1",
+      "port": 50053,
+      "is_head": false,
+      "is_tail": false,
+      "predecessor": "127.0.0.1:50052",
+      "successor": "127.0.0.1:50051",
+      "head_ranges": [
+        { "start": "12297829382473034411", "end": "18446744073709551615" }
+      ],
+      "tail_ranges": [
+        { "start": "0", "end": "6148914691236517205" }
+      ]
+    }
+  ]
+}
 ```
 
 ---

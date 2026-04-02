@@ -13,17 +13,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(gRPC REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
-# Convenient aliases
-set(PROTOC      $<TARGET_FILE:protobuf::protoc>)
+# Convenient alias
 set(GRPC_PLUGIN $<TARGET_FILE:gRPC::grpc_cpp_plugin>)
 
 # ============================================================
 # Proto code generation
 # ============================================================
 
-set(PROTO_DIR     "${CMAKE_SOURCE_DIR}/proto")
+set(PROTO_DIR     "${CMAKE_CURRENT_SOURCE_DIR}/proto")
 set(PROTO_FILE    "${PROTO_DIR}/chain.proto")
-set(PROTO_GEN_DIR "${CMAKE_BINARY_DIR}/proto_gen")
+set(PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/proto_gen")
 
 file(MAKE_DIRECTORY ${PROTO_GEN_DIR})
 
@@ -34,14 +33,17 @@ set(GRPC_HDRS  "${PROTO_GEN_DIR}/chain.grpc.pb.h")
 
 add_custom_command(
     OUTPUT  ${PROTO_SRCS} ${PROTO_HDRS} ${GRPC_SRCS} ${GRPC_HDRS}
-    COMMAND ${PROTOC}
-            --proto_path=${PROTO_DIR}
-            --cpp_out=${PROTO_GEN_DIR}
-            --grpc_out=${PROTO_GEN_DIR}
-            --plugin=protoc-gen-grpc=${GRPC_PLUGIN}
-            ${PROTO_FILE}
-    DEPENDS ${PROTO_FILE}
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${PROTO_GEN_DIR}"
+    COMMAND protobuf::protoc
+    ARGS
+        --proto_path "${PROTO_DIR}"
+        --cpp_out "${PROTO_GEN_DIR}"
+        --grpc_out "${PROTO_GEN_DIR}"
+        --plugin=protoc-gen-grpc=${GRPC_PLUGIN}
+        "${PROTO_FILE}"
+    DEPENDS ${PROTO_FILE} protobuf::protoc gRPC::grpc_cpp_plugin
     COMMENT "Generating protobuf and gRPC sources from chain.proto"
+    VERBATIM
 )
 
 add_library(chain_proto STATIC
@@ -58,7 +60,9 @@ target_link_libraries(chain_proto PUBLIC
 # Chain replication executable
 # ============================================================
 add_library(replication STATIC
+    src/node/node.cpp
     src/replication/replication_strategy.cpp
+    src/replication/common/chain_style_replication_support.cpp
     src/replication/chain/chain_replication.cpp
     src/replication/craq/craq_replication.cpp
     src/replication/crown/crown_replication.cpp
@@ -101,6 +105,18 @@ target_include_directories(client PRIVATE
     ${PROTO_GEN_DIR}
 )
 target_link_libraries(client PRIVATE
+    chain_proto
+    nlohmann_json::nlohmann_json
+)
+
+add_executable(kv_client
+    src/client/kv_client.cpp
+)
+target_include_directories(kv_client PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${PROTO_GEN_DIR}
+)
+target_link_libraries(kv_client PRIVATE
     chain_proto
     nlohmann_json::nlohmann_json
 )

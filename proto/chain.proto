@@ -23,6 +23,8 @@ message NodeAddress {
 }
 
 message KeyRange {
+    // For CROWN mode these are token bounds (uint64 encoded as text), not
+    // raw lexicographic key bounds.
     string start_key = 1;
     string end_key   = 2;
 }
@@ -41,8 +43,9 @@ message NodeConfig {
     optional NodeAddress predecessor = 6;  // absent = no predecessor (head)
     optional NodeAddress successor   = 7;  // absent = no successor (tail)
 
-    repeated KeyRange head_ranges = 8; // crown mode only
-    repeated KeyRange tail_ranges = 9; // crown mode only
+    // CROWN mode only: token/hash ring ranges owned as head/tail.
+    repeated KeyRange head_ranges = 8;
+    repeated KeyRange tail_ranges = 9;
 }
 
 // ============================================================

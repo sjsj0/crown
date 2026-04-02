@@ -12,7 +12,7 @@
 #include <grpcpp/grpcpp.h>
 #include "chain.grpc.pb.h"
 
-#include "node/node.cpp"
+#include "node/node.h"
 #include "replication/replication_strategy.h"
 #include "replication/chain/chain_replication.h"
 #include "replication/craq/craq_replication.h"
