@@ -1,37 +1,21 @@
-// client.cpp — reads a JSON config file describing the chain topology and
-// pushes a NodeConfig to each server node via the Configure RPC.
+// client.cpp — configures all nodes then enters an interactive read/write loop.
 //
-// Config file format (JSON):
+// Write flow (non-blocking):
+//   1. Client assigns a unique request_id, adds it to pending map, fires
+//      Write RPC to head and returns immediately to the prompt.
+//   2. Head propagates down the chain to tail.
+//   3. Tail commits and sends Ack RPC directly to the client's Ack server.
+//   4. Ack listener thread removes the request_id from the pending map and
+//      prints a confirmation. No retry logic yet.
 //
-// {
-//   "mode": "craq",            // "chain" | "craq" | "crown"
-//   "nodes": [
-//     {
-//       "id":          0,
-//       "host":        "127.0.0.1",
-//       "port":        50051,
-//       "is_head":     true,
-//       "is_tail":     false,
-//       "predecessor": null,
-//       "successor":   "127.0.0.1:50052"
-//     },
-//     {
-//       "id":          1,
-//       "host":        "127.0.0.1",
-//       "port":        50052,
-//       "is_head":     false,
-//       "is_tail":     true,
-//       "predecessor": "127.0.0.1:50051",
-//       "successor":   null
-//     }
-//   ]
-// }
+// Read flow:
+//   Client sends Read RPC directly to tail and prints the response.
 //
-// CROWN mode additionally supports "head_ranges" / "tail_ranges" arrays per node:
-//   "head_ranges": [{"start": "0", "end": "6148914691236517205"}]
-//
-// Dependencies: nlohmann/json (header-only), grpc++, protobuf.
-// Install json: https://github.com/nlohmann/json (or `vcpkg install nlohmann-json`)
+// Commands:
+//   write <key> <value>
+//   read  <key>
+//   quit / exit
+//   help
 
 #include <iostream>
 #include <fstream>
@@ -42,6 +26,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 #include <grpcpp/grpcpp.h>
 #include <nlohmann/json.hpp>
@@ -51,17 +38,92 @@ using namespace std;
 using json = nlohmann::json;
 
 // ============================================================
+// Pending write map — keyed by request_id
+// ============================================================
+// Written by the main thread when a write is issued.
+// Cleared by the Ack listener thread when the tail confirms.
+
+struct PendingWrite {
+    uint64_t request_id = 0;
+    string   key;
+    string   value;
+};
+
+static mutex                              g_pending_mtx;
+static unordered_map<uint64_t, PendingWrite> g_pending;  // request_id -> PendingWrite
+
+// Monotonically increasing request ID generator.
+static atomic<uint64_t> g_next_request_id{1};
+
+static uint64_t add_pending(const string& key, const string& value) {
+    uint64_t id = g_next_request_id.fetch_add(1, memory_order_relaxed);
+    lock_guard<mutex> lk(g_pending_mtx);
+    g_pending[id] = { id, key, value };
+    return id;
+}
+
+// Called by the Ack listener thread. Removes from map and prints confirmation.
+static void ack_pending(uint64_t request_id, uint64_t version) {
+    lock_guard<mutex> lk(g_pending_mtx);
+    auto it = g_pending.find(request_id);
+    if (it == g_pending.end()) {
+        // Already removed or unknown — ignore.
+        cout << "\n[Ack] Received ack for unknown request_id=" << request_id << "\n> " << flush;
+        return;
+    }
+    cout << "\n[Ack] Write committed: request_id=" << request_id
+         << " key='" << it->second.key << "'"
+         << " version=" << version << "\n> " << flush;
+    g_pending.erase(it);
+}
+
+// ============================================================
+// Client-side Ack service — the tail calls this
+// ============================================================
+
+class ClientAckServiceImpl final : public chain::ChainNode::Service {
+public:
+    grpc::Status Ack(grpc::ServerContext*     /*ctx*/,
+                     const chain::AckRequest* req,
+                     google::protobuf::Empty* /*resp*/) override {
+        ack_pending(req->request_id(), req->version());
+        return grpc::Status::OK;
+    }
+
+    // Unused by the client-side service.
+    grpc::Status Configure(grpc::ServerContext*, const chain::NodeConfig*,
+                           google::protobuf::Empty*) override {
+        return grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    grpc::Status Write(grpc::ServerContext*, const chain::WriteRequest*,
+                       chain::WriteResponse*) override {
+        return grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    grpc::Status Read(grpc::ServerContext*, const chain::ReadRequest*,
+                      chain::ReadResponse*) override {
+        return grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    grpc::Status Propagate(grpc::ServerContext*, const chain::PropagateRequest*,
+                           google::protobuf::Empty*) override {
+        return grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+    grpc::Status VersionQuery(grpc::ServerContext*, const chain::VersionQueryRequest*,
+                              chain::VersionQueryResponse*) override {
+        return grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "");
+    }
+};
+
+// ============================================================
 // Helpers — build proto messages from JSON
 // ============================================================
 
 static chain::ReplicationMode parse_mode(const string& s) {
     if (s == "chain") return chain::ReplicationMode::CHAIN;
     if (s == "craq")  return chain::ReplicationMode::CRAQ;
-    if (s == "crown")  return chain::ReplicationMode::CROWN;
+    if (s == "crown") return chain::ReplicationMode::CROWN;
     throw invalid_argument("Unknown mode in config: " + s);
 }
 
-// Parse "host:port" string into a NodeAddress proto.
 static chain::NodeAddress parse_addr(const string& s) {
     auto colon = s.rfind(':');
     if (colon == string::npos)
@@ -72,7 +134,6 @@ static chain::NodeAddress parse_addr(const string& s) {
     return a;
 }
 
-// Build a NodeConfig proto from a single JSON node entry + the global mode.
 static chain::NodeConfig build_node_config(const json& node_json,
                                             chain::ReplicationMode mode) {
     chain::NodeConfig cfg;
@@ -81,7 +142,6 @@ static chain::NodeConfig build_node_config(const json& node_json,
     cfg.set_is_head(node_json.value("is_head", false));
     cfg.set_is_tail(node_json.value("is_tail", false));
 
-    // self address
     string host = node_json.at("host").get<string>();
     int    port = node_json.at("port").get<int>();
     chain::NodeAddress self_addr;
@@ -89,397 +149,314 @@ static chain::NodeConfig build_node_config(const json& node_json,
     self_addr.set_port(port);
     *cfg.mutable_self_addr() = self_addr;
 
-    // optional predecessor / successor
     if (!node_json["predecessor"].is_null())
         *cfg.mutable_predecessor() = parse_addr(node_json["predecessor"].get<string>());
     if (!node_json["successor"].is_null())
-        *cfg.mutable_successor() = parse_addr(node_json["successor"].get<string>());
+        *cfg.mutable_successor()   = parse_addr(node_json["successor"].get<string>());
 
-    // crown-mode key ranges (ignored for chain / craq)
-    if (node_json.contains("head_ranges")) {
+    if (node_json.contains("head_ranges"))
         for (const auto& r : node_json["head_ranges"]) {
             auto* kr = cfg.add_head_ranges();
             kr->set_start_key(r.at("start").get<string>());
             kr->set_end_key(r.at("end").get<string>());
         }
-    }
-    if (node_json.contains("tail_ranges")) {
+    if (node_json.contains("tail_ranges"))
         for (const auto& r : node_json["tail_ranges"]) {
             auto* kr = cfg.add_tail_ranges();
             kr->set_start_key(r.at("start").get<string>());
             kr->set_end_key(r.at("end").get<string>());
         }
-    }
-
     return cfg;
 }
 
+// ============================================================
+// Validation
+// ============================================================
+
 struct TokenRange {
-    uint64_t start = 0;
-    uint64_t end = 0;
-    string start_text;
-    string end_text;
+    uint64_t start = 0, end = 0;
+    string start_text, end_text;
 };
 
 struct CrownNodeView {
     int id = 0;
-    string endpoint;
-    string predecessor;
-    string successor;
-    vector<TokenRange> head_ranges;
-    vector<TokenRange> tail_ranges;
+    string endpoint, predecessor, successor;
+    vector<TokenRange> head_ranges, tail_ranges;
 };
-
-static string addr_to_string(const chain::NodeAddress& addr) {
-    return addr.host() + ":" + to_string(addr.port());
-}
 
 static bool parse_token_text(const string& text, uint64_t& out) {
     if (text.empty()) return false;
     try {
         size_t consumed = 0;
-        int base = 10;
-        if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
-            base = 16;
-        }
-        const auto parsed = stoull(text, &consumed, base);
-        if (consumed != text.size()) return false;
-        out = static_cast<uint64_t>(parsed);
-        return true;
-    } catch (...) {
-        return false;
-    }
+        int base = (text.size() > 2 && text[0] == '0' && (text[1]=='x'||text[1]=='X')) ? 16 : 10;
+        out = static_cast<uint64_t>(stoull(text, &consumed, base));
+        return consumed == text.size();
+    } catch (...) { return false; }
 }
 
-static string range_key(const TokenRange& r) {
-    return to_string(r.start) + ":" + to_string(r.end);
-}
+static string range_key(const TokenRange& r) { return to_string(r.start) + ":" + to_string(r.end); }
+static string range_text(const TokenRange& r) { return "[" + r.start_text + "," + r.end_text + "]"; }
 
-static string range_text(const TokenRange& r) {
-    return "[" + r.start_text + "," + r.end_text + "]";
-}
-
-static vector<pair<uint64_t, uint64_t>> to_non_wrapped_segments(const TokenRange& r) {
+static vector<pair<uint64_t,uint64_t>> to_non_wrapped_segments(const TokenRange& r) {
     if (r.start <= r.end) return {{r.start, r.end}};
     return {{0, r.end}, {r.start, numeric_limits<uint64_t>::max()}};
 }
 
 static bool ranges_overlap(const TokenRange& a, const TokenRange& b) {
-    const auto a_segments = to_non_wrapped_segments(a);
-    const auto b_segments = to_non_wrapped_segments(b);
-    for (const auto& as : a_segments) {
-        for (const auto& bs : b_segments) {
-            if (as.first <= bs.second && bs.first <= as.second) {
-                return true;
-            }
-        }
-    }
+    for (const auto& as : to_non_wrapped_segments(a))
+        for (const auto& bs : to_non_wrapped_segments(b))
+            if (as.first <= bs.second && bs.first <= as.second) return true;
     return false;
 }
 
-static bool parse_token_range(const json& range_json,
-                              const string& where,
-                              TokenRange& out,
-                              string& error) {
-    if (!range_json.contains("start") || !range_json.contains("end")) {
-        error = where + " must contain 'start' and 'end'";
-        return false;
-    }
-
-    string start_text;
-    string end_text;
+static bool parse_token_range(const json& j, const string& where, TokenRange& out, string& err) {
+    if (!j.contains("start") || !j.contains("end")) { err = where + " needs start/end"; return false; }
     try {
-        start_text = range_json.at("start").get<string>();
-        end_text = range_json.at("end").get<string>();
-    } catch (const exception& ex) {
-        error = where + " has invalid start/end values: " + ex.what();
-        return false;
-    }
-
-    uint64_t start = 0;
-    uint64_t end = 0;
-    if (!parse_token_text(start_text, start)) {
-        error = where + " has invalid start token: '" + start_text + "'";
-        return false;
-    }
-    if (!parse_token_text(end_text, end)) {
-        error = where + " has invalid end token: '" + end_text + "'";
-        return false;
-    }
-
-    out.start = start;
-    out.end = end;
-    out.start_text = start_text;
-    out.end_text = end_text;
+        out.start_text = j.at("start").get<string>();
+        out.end_text   = j.at("end").get<string>();
+    } catch (const exception& ex) { err = where + ": " + ex.what(); return false; }
+    if (!parse_token_text(out.start_text, out.start)) { err = where + " bad start"; return false; }
+    if (!parse_token_text(out.end_text,   out.end))   { err = where + " bad end";   return false; }
     return true;
 }
 
 static bool validate_minimal_config(const json& nodes, string& error) {
-    if (!nodes.is_array() || nodes.empty()) {
-        error = "'nodes' must be a non-empty array";
-        return false;
-    }
-
+    if (!nodes.is_array() || nodes.empty()) { error = "'nodes' must be a non-empty array"; return false; }
     for (size_t i = 0; i < nodes.size(); ++i) {
         const auto& n = nodes[i];
         try {
             (void)n.at("id").get<int>();
             (void)n.at("host").get<string>();
             (void)n.at("port").get<int>();
-
-            if (n.contains("predecessor") && !n.at("predecessor").is_null()) {
+            if (n.contains("predecessor") && !n.at("predecessor").is_null())
                 (void)parse_addr(n.at("predecessor").get<string>());
-            }
-            if (n.contains("successor") && !n.at("successor").is_null()) {
+            if (n.contains("successor") && !n.at("successor").is_null())
                 (void)parse_addr(n.at("successor").get<string>());
-            }
         } catch (const exception& ex) {
             error = "invalid node at index " + to_string(i) + ": " + ex.what();
             return false;
         }
     }
-
     return true;
 }
 
 static bool validate_crown_topology(const json& nodes, string& error) {
-    if (!nodes.is_array() || nodes.empty()) {
-        error = "CROWN requires 'nodes' to be a non-empty array";
-        return false;
-    }
-
     vector<CrownNodeView> parsed;
-    parsed.reserve(nodes.size());
-
     unordered_map<string, size_t> by_endpoint;
-    unordered_set<int> seen_ids;
 
     for (size_t i = 0; i < nodes.size(); ++i) {
         const auto& n = nodes[i];
         CrownNodeView v;
-
-        try {
-            v.id = n.at("id").get<int>();
-            const string host = n.at("host").get<string>();
-            const int port = n.at("port").get<int>();
-            v.endpoint = host + ":" + to_string(port);
-        } catch (const exception& ex) {
-            error = "CROWN node index " + to_string(i) + " has invalid id/host/port: " + ex.what();
+        v.id       = n.at("id").get<int>();
+        v.endpoint = n.at("host").get<string>() + ":" + to_string(n.at("port").get<int>());
+        if (n["predecessor"].is_null() || n["successor"].is_null()) {
+            error = "CROWN node " + v.endpoint + " must have both predecessor and successor";
             return false;
         }
-
-        if (!seen_ids.insert(v.id).second) {
-            error = "CROWN duplicate node id: " + to_string(v.id);
-            return false;
-        }
-
-        if (by_endpoint.count(v.endpoint) > 0) {
-            error = "CROWN duplicate node endpoint: " + v.endpoint;
-            return false;
-        }
-
-        if (!n.contains("predecessor") || n.at("predecessor").is_null()) {
-            error = "CROWN node " + v.endpoint + " must define non-null predecessor";
-            return false;
-        }
-        if (!n.contains("successor") || n.at("successor").is_null()) {
-            error = "CROWN node " + v.endpoint + " must define non-null successor";
-            return false;
-        }
-
-        try {
-            v.predecessor = addr_to_string(parse_addr(n.at("predecessor").get<string>()));
-            v.successor = addr_to_string(parse_addr(n.at("successor").get<string>()));
-        } catch (const exception& ex) {
-            error = "CROWN node " + v.endpoint + " has invalid predecessor/successor: " + ex.what();
-            return false;
-        }
-
-        if (!n.contains("head_ranges") || !n.at("head_ranges").is_array()) {
-            error = "CROWN node " + v.endpoint + " must have array 'head_ranges'";
-            return false;
-        }
-        if (!n.contains("tail_ranges") || !n.at("tail_ranges").is_array()) {
-            error = "CROWN node " + v.endpoint + " must have array 'tail_ranges'";
-            return false;
-        }
-
-        for (size_t r = 0; r < n.at("head_ranges").size(); ++r) {
+        v.predecessor = n.at("predecessor").get<string>();
+        v.successor   = n.at("successor").get<string>();
+        for (size_t r = 0; r < n.value("head_ranges", json::array()).size(); ++r) {
             TokenRange tr;
-            if (!parse_token_range(n.at("head_ranges")[r],
-                                   "head_ranges[" + to_string(r) + "] on node " + v.endpoint,
-                                   tr,
-                                   error)) {
-                return false;
-            }
+            if (!parse_token_range(n.at("head_ranges")[r], "head_ranges[" + to_string(r) + "]", tr, error)) return false;
             v.head_ranges.push_back(tr);
         }
-
-        for (size_t r = 0; r < n.at("tail_ranges").size(); ++r) {
+        for (size_t r = 0; r < n.value("tail_ranges", json::array()).size(); ++r) {
             TokenRange tr;
-            if (!parse_token_range(n.at("tail_ranges")[r],
-                                   "tail_ranges[" + to_string(r) + "] on node " + v.endpoint,
-                                   tr,
-                                   error)) {
-                return false;
-            }
+            if (!parse_token_range(n.at("tail_ranges")[r], "tail_ranges[" + to_string(r) + "]", tr, error)) return false;
             v.tail_ranges.push_back(tr);
         }
-
         by_endpoint[v.endpoint] = parsed.size();
         parsed.push_back(std::move(v));
     }
 
-    // Ring predecessor/successor consistency checks.
     for (const auto& n : parsed) {
-        if (by_endpoint.count(n.predecessor) == 0) {
-            error = "CROWN node " + n.endpoint + " predecessor " + n.predecessor + " not found in node list";
-            return false;
-        }
-        if (by_endpoint.count(n.successor) == 0) {
-            error = "CROWN node " + n.endpoint + " successor " + n.successor + " not found in node list";
-            return false;
-        }
-
-        const auto& pred = parsed[by_endpoint[n.predecessor]];
-        const auto& succ = parsed[by_endpoint[n.successor]];
-        if (pred.successor != n.endpoint) {
-            error = "CROWN ring inconsistency: predecessor " + pred.endpoint + " does not point back to " + n.endpoint;
-            return false;
-        }
-        if (succ.predecessor != n.endpoint) {
-            error = "CROWN ring inconsistency: successor " + succ.endpoint + " does not point back to " + n.endpoint;
-            return false;
+        if (!by_endpoint.count(n.predecessor)) { error = "predecessor " + n.predecessor + " not found"; return false; }
+        if (!by_endpoint.count(n.successor))   { error = "successor "   + n.successor   + " not found"; return false; }
+        if (parsed[by_endpoint[n.predecessor]].successor != n.endpoint ||
+            parsed[by_endpoint[n.successor]].predecessor != n.endpoint) {
+            error = "ring inconsistency at " + n.endpoint; return false;
         }
     }
 
-    // Ensure one closed cycle across all nodes.
     unordered_set<string> visited;
     string current = parsed.front().endpoint;
     for (size_t step = 0; step < parsed.size(); ++step) {
-        if (visited.count(current) > 0) {
-            error = "CROWN ring has a cycle before covering all nodes, revisited " + current;
-            return false;
-        }
+        if (visited.count(current)) { error = "ring cycle before covering all nodes"; return false; }
         visited.insert(current);
         current = parsed[by_endpoint[current]].successor;
     }
-    if (current != parsed.front().endpoint) {
-        error = "CROWN ring does not close back to the starting node";
-        return false;
-    }
-    if (visited.size() != parsed.size()) {
-        error = "CROWN ring is disconnected; not all nodes are in one cycle";
-        return false;
+    if (current != parsed.front().endpoint || visited.size() != parsed.size()) {
+        error = "ring does not close or is disconnected"; return false;
     }
 
-    struct OwnedRange {
-        TokenRange range;
-        string owner;
-    };
-
-    vector<OwnedRange> all_heads;
-    vector<OwnedRange> all_tails;
+    struct OwnedRange { TokenRange range; string owner; };
+    vector<OwnedRange> all_heads, all_tails;
     for (const auto& n : parsed) {
         for (const auto& r : n.head_ranges) all_heads.push_back({r, n.endpoint});
         for (const auto& r : n.tail_ranges) all_tails.push_back({r, n.endpoint});
     }
+    if (all_heads.empty()) { error = "CROWN needs at least one head range"; return false; }
+    if (all_tails.empty()) { error = "CROWN needs at least one tail range"; return false; }
 
-    if (all_heads.empty()) {
-        error = "CROWN requires at least one head token range";
-        return false;
-    }
-    if (all_tails.empty()) {
-        error = "CROWN requires at least one tail token range";
-        return false;
-    }
-
-    for (size_t i = 0; i < all_heads.size(); ++i) {
-        for (size_t j = i + 1; j < all_heads.size(); ++j) {
+    for (size_t i = 0; i < all_heads.size(); ++i)
+        for (size_t j = i+1; j < all_heads.size(); ++j)
             if (ranges_overlap(all_heads[i].range, all_heads[j].range)) {
-                error = "CROWN head range overlap between " + all_heads[i].owner + " " + range_text(all_heads[i].range)
-                        + " and " + all_heads[j].owner + " " + range_text(all_heads[j].range);
-                return false;
+                error = "head range overlap: " + all_heads[i].owner + " and " + all_heads[j].owner; return false;
             }
-        }
-    }
-
-    for (size_t i = 0; i < all_tails.size(); ++i) {
-        for (size_t j = i + 1; j < all_tails.size(); ++j) {
+    for (size_t i = 0; i < all_tails.size(); ++i)
+        for (size_t j = i+1; j < all_tails.size(); ++j)
             if (ranges_overlap(all_tails[i].range, all_tails[j].range)) {
-                error = "CROWN tail range overlap between " + all_tails[i].owner + " " + range_text(all_tails[i].range)
-                        + " and " + all_tails[j].owner + " " + range_text(all_tails[j].range);
-                return false;
+                error = "tail range overlap: " + all_tails[i].owner + " and " + all_tails[j].owner; return false;
             }
-        }
-    }
 
-    // Every head range must appear exactly once in predecessor tail ranges.
-    for (const auto& n : parsed) {
-        const auto pred_it = by_endpoint.find(n.predecessor);
-        const auto& pred = parsed[pred_it->second];
-        for (const auto& hr : n.head_ranges) {
-            int matches = 0;
-            for (const auto& tr : pred.tail_ranges) {
-                if (hr.start == tr.start && hr.end == tr.end) {
-                    ++matches;
-                }
-            }
-            if (matches != 1) {
-                error = "CROWN head range " + range_text(hr) + " on " + n.endpoint
-                        + " must appear exactly once in predecessor " + pred.endpoint
-                        + " tail_ranges (found " + to_string(matches) + ")";
-                return false;
-            }
-        }
-    }
-
-    // Each token range must have exactly one head owner and one tail owner.
-    unordered_map<string, int> head_counts;
-    unordered_map<string, int> tail_counts;
+    unordered_map<string,int> hc, tc;
     unordered_set<string> all_keys;
-
-    for (const auto& o : all_heads) {
-        const string key = range_key(o.range);
-        ++head_counts[key];
-        all_keys.insert(key);
-    }
-    for (const auto& o : all_tails) {
-        const string key = range_key(o.range);
-        ++tail_counts[key];
-        all_keys.insert(key);
-    }
-
-    for (const auto& key : all_keys) {
-        const int hc = head_counts.count(key) ? head_counts[key] : 0;
-        const int tc = tail_counts.count(key) ? tail_counts[key] : 0;
-        if (hc != 1 || tc != 1) {
-            error = "CROWN token range " + key + " must have exactly one head owner and one tail owner"
-                    + " (found heads=" + to_string(hc) + ", tails=" + to_string(tc) + ")";
-            return false;
+    for (const auto& o : all_heads) { ++hc[range_key(o.range)]; all_keys.insert(range_key(o.range)); }
+    for (const auto& o : all_tails) { ++tc[range_key(o.range)]; all_keys.insert(range_key(o.range)); }
+    for (const auto& k : all_keys) {
+        if ((hc.count(k) ? hc[k] : 0) != 1 || (tc.count(k) ? tc[k] : 0) != 1) {
+            error = "token range " + k + " must have exactly one head and one tail"; return false;
         }
     }
-
     return true;
 }
 
 static bool validate_config_before_configure(const json& config,
                                              chain::ReplicationMode mode,
                                              string& error) {
-    if (!config.contains("nodes")) {
-        error = "missing required top-level field 'nodes'";
-        return false;
-    }
-
+    if (!config.contains("nodes")) { error = "missing 'nodes'"; return false; }
     const auto& nodes = config.at("nodes");
-    if (!validate_minimal_config(nodes, error)) {
-        return false;
+    if (!validate_minimal_config(nodes, error)) return false;
+    if (mode == chain::ReplicationMode::CROWN) return validate_crown_topology(nodes, error);
+    return true;
+}
+
+// ============================================================
+// Topology
+// ============================================================
+
+struct NodeStub {
+    string                             endpoint;
+    shared_ptr<grpc::Channel>          channel;
+    unique_ptr<chain::ChainNode::Stub> stub;
+};
+
+struct Topology {
+    chain::ReplicationMode mode;
+    NodeStub*              head = nullptr;
+    NodeStub*              tail = nullptr;
+    vector<NodeStub>       nodes;
+};
+
+static Topology build_topology(const json& config, chain::ReplicationMode mode) {
+    Topology topo;
+    topo.mode = mode;
+    const auto& jnodes = config.at("nodes");
+    for (const auto& n : jnodes) {
+        NodeStub ns;
+        ns.endpoint = n.at("host").get<string>() + ":" + to_string(n.at("port").get<int>());
+        ns.channel  = grpc::CreateChannel(ns.endpoint, grpc::InsecureChannelCredentials());
+        ns.stub     = chain::ChainNode::NewStub(ns.channel);
+        topo.nodes.push_back(std::move(ns));
+    }
+    for (size_t i = 0; i < jnodes.size(); ++i) {
+        if (jnodes[i].value("is_head", false)) topo.head = &topo.nodes[i];
+        if (jnodes[i].value("is_tail", false)) topo.tail = &topo.nodes[i];
+    }
+    return topo;
+}
+
+// ============================================================
+// Interactive commands
+// ============================================================
+
+// Non-blocking: adds to pending map, fires RPC, returns immediately.
+static void do_write(Topology& topo, const string& key, const string& value,
+                     const string& client_addr) {
+    if (!topo.head) { cerr << "No head node in topology.\n"; return; }
+
+    uint64_t request_id = add_pending(key, value);
+
+    chain::WriteRequest req;
+    req.set_key(key);
+    req.set_value(value);
+    req.set_version(0);             // head assigns the real version
+    req.set_client_addr(client_addr);
+    req.set_request_id(request_id);
+
+    // Fire and forget — response from head is ignored.
+    // The ack comes asynchronously from the tail via the Ack server.
+    chain::WriteResponse ignored;
+    grpc::ClientContext  ctx;
+    topo.head->stub->Write(&ctx, req, &ignored);
+
+    cout << "[Write] Sent request_id=" << request_id
+         << " key='" << key << "' to head (" << topo.head->endpoint << ")\n";
+}
+
+static void do_read(Topology& topo, const string& key) {
+    if (!topo.tail) { cerr << "No tail node in topology.\n"; return; }
+
+    chain::ReadRequest  req;
+    chain::ReadResponse resp;
+    grpc::ClientContext ctx;
+    req.set_key(key);
+
+    grpc::Status status = topo.tail->stub->Read(&ctx, req, &resp);
+    if (!status.ok()) { cerr << "Read failed: " << status.error_message() << "\n"; return; }
+
+    if (resp.value().empty())
+        cout << "[Read] (not found)\n";
+    else
+        cout << "[Read] key='" << resp.key()
+             << "' value='" << resp.value()
+             << "' version=" << resp.version() << "\n";
+}
+
+static void print_help() {
+    cout << "Commands:\n"
+         << "  write <key> <value>  — non-blocking write (ack printed when tail confirms)\n"
+         << "  read  <key>          — read directly from tail\n"
+         << "  quit / exit          — exit\n"
+         << "  help                 — show this message\n";
+}
+
+static void run_interactive_loop(Topology& topo, const string& client_addr) {
+    print_help();
+    cout << "\n";
+
+    string line;
+    while (true) {
+        cout << "> ";
+        if (!getline(cin, line)) break;
+
+        istringstream iss(line);
+        string cmd;
+        iss >> cmd;
+
+        if (cmd.empty())                    continue;
+        if (cmd == "quit" || cmd == "exit") break;
+        if (cmd == "help")                { print_help(); continue; }
+
+        if (cmd == "write") {
+            string key, value;
+            iss >> key;
+            getline(iss >> ws, value);
+            if (key.empty() || value.empty()) { cerr << "Usage: write <key> <value>\n"; continue; }
+            do_write(topo, key, value, client_addr);
+
+        } else if (cmd == "read") {
+            string key;
+            iss >> key;
+            if (key.empty()) { cerr << "Usage: read <key>\n"; continue; }
+            do_read(topo, key);
+
+        } else {
+            cerr << "Unknown command '" << cmd << "'. Type 'help'.\n";
+        }
     }
 
-    if (mode == chain::ReplicationMode::CROWN) {
-        return validate_crown_topology(nodes, error);
-    }
-    return true;
+    cout << "[Client] Goodbye.\n";
 }
 
 // ============================================================
@@ -488,24 +465,34 @@ static bool validate_config_before_configure(const json& config,
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        cerr << "Usage: " << argv[0] << " <config.json>\n";
+        cerr << "Usage: " << argv[0] << " <config.json> [ack_port]\n";
         return 1;
     }
 
-    // --- Load config file --------------------------------------
-    ifstream file(argv[1]);
-    if (!file.is_open()) {
-        cerr << "Cannot open config file: " << argv[1] << "\n";
+    const int    ack_port    = (argc >= 3) ? stoi(argv[2]) : 60000;
+    const string client_addr = "127.0.0.1:" + to_string(ack_port);
+
+    // --- Start Ack server in background thread -----------------
+    ClientAckServiceImpl ack_service;
+    grpc::ServerBuilder  builder;
+    builder.AddListeningPort("0.0.0.0:" + to_string(ack_port),
+                             grpc::InsecureServerCredentials());
+    builder.RegisterService(&ack_service);
+    unique_ptr<grpc::Server> ack_server = builder.BuildAndStart();
+    if (!ack_server) {
+        cerr << "Failed to start Ack server on port " << ack_port << "\n";
         return 1;
     }
+    cout << "[Client] Ack server listening on " << client_addr << "\n";
+    thread ack_thread([&] { ack_server->Wait(); });
+
+    // --- Load and validate config ------------------------------
+    ifstream file(argv[1]);
+    if (!file.is_open()) { cerr << "Cannot open config file: " << argv[1] << "\n"; return 1; }
 
     json config;
-    try {
-        file >> config;
-    } catch (const json::exception& ex) {
-        cerr << "JSON parse error: " << ex.what() << "\n";
-        return 1;
-    }
+    try { file >> config; }
+    catch (const json::exception& ex) { cerr << "JSON parse error: " << ex.what() << "\n"; return 1; }
 
     chain::ReplicationMode mode = parse_mode(config.at("mode").get<string>());
 
@@ -515,41 +502,42 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const auto& nodes = config.at("nodes");
-
-    // --- Send Configure RPC to every node ----------------------
+    // --- Configure all nodes -----------------------------------
     int failures = 0;
-    for (const auto& node_json : nodes) {
-        string host = node_json.at("host").get<string>();
-        int    port = node_json.at("port").get<int>();
-        string target = host + ":" + to_string(port);
-
+    for (const auto& node_json : config.at("nodes")) {
+        string target = node_json.at("host").get<string>() + ":"
+                      + to_string(node_json.at("port").get<int>());
         chain::NodeConfig cfg = build_node_config(node_json, mode);
-
-        auto channel = grpc::CreateChannel(target,
-                                           grpc::InsecureChannelCredentials());
+        auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
         auto stub    = chain::ChainNode::NewStub(channel);
 
         google::protobuf::Empty resp;
-        grpc::ClientContext ctx;
-
+        grpc::ClientContext     ctx;
         grpc::Status status = stub->Configure(&ctx, cfg, &resp);
-        if (status.ok()) {
-            cout << "[Client] Configured " << cfg.node_id()
-                 << " at " << target << "\n";
-        } else {
-            cerr << "[Client] Failed to configure " << cfg.node_id()
-                 << " at " << target << ": "
-                 << status.error_message() << "\n";
+        if (status.ok())
+            cout << "[Client] Configured node " << cfg.node_id() << " at " << target << "\n";
+        else {
+            cerr << "[Client] Failed to configure node " << cfg.node_id()
+                 << " at " << target << ": " << status.error_message() << "\n";
             ++failures;
         }
     }
 
     if (failures > 0) {
         cerr << "[Client] " << failures << " node(s) failed to configure.\n";
+        ack_server->Shutdown();
+        ack_thread.join();
         return 1;
     }
 
-    cout << "[Client] All nodes configured successfully.\n";
+    cout << "[Client] All nodes configured successfully.\n\n";
+
+    // --- Interactive loop --------------------------------------
+    Topology topo = build_topology(config, mode);
+    run_interactive_loop(topo, client_addr);
+
+    // --- Shutdown ----------------------------------------------
+    ack_server->Shutdown();
+    ack_thread.join();
     return 0;
 }
