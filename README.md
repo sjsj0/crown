@@ -7,6 +7,10 @@ A C++ implementation of three chain replication variants:
 
 Inter-node communication uses gRPC and Protocol Buffers. Topology config is pushed to nodes at runtime by a client — nodes themselves are config-agnostic at startup.
 
+For CHAIN and CROWN in this version, `WriteResponse` means the head accepted the write (assigned a version), not that the write is already committed. Commit happens later when `Ack` returns from the tail.
+
+This prototype intentionally avoids mutexes/condition variables in replication helpers and assumes serialized writes from a single active client.
+
 ---
 
 ## Prerequisites
@@ -77,6 +81,8 @@ Write a `config.json` describing the chain (see format below), then run the clie
 
 The client loops through every node in the config file and sends each one its `NodeConfig` via the `Configure` RPC.
 
+`src/client/client.cpp` is intentionally limited to topology/config push and was not changed for replication write/commit behavior.
+
 ### Generate a CROWN ring config automatically
 
 Use the helper script to generate a valid closed CROWN ring config with evenly partitioned token ranges:
@@ -117,6 +123,8 @@ Routing rules used by `kv_client`:
 
 The client prints the contacted node endpoint and returned version.
 
+For `write`, `WriteResponse.version` is the head-assigned version number for the accepted write. It is not by itself proof of commit.
+
 ### 4. Run practical CROWN smoke test
 
 Use the smoke-test harness to validate a local 3-node CROWN ring end-to-end:
@@ -136,15 +144,16 @@ What it checks:
 - concurrent writes to the same key produce strictly increasing contiguous versions
 - cleans up server processes on exit
 
-### Chain mode semantics in this repo
+### CHAIN/CROWN write and commit semantics in this repo
 
-- Only the configured head accepts client `Write` RPCs.
-- Head assigns a monotonic per-key version.
-- The write is propagated successor-by-successor using `Propagate` RPC.
-- Tail marks the version committed and initiates upstream `Ack` RPC toward the head.
-- Head blocks waiting for that commit acknowledgment, then returns `WriteResponse { success=true, version=... }`.
-- Only the configured tail serves client `Read` RPCs.
-- Reads return the latest committed value/version.
+- Only the write head for a key accepts client `Write` RPCs.
+- The head assigns a monotonic per-key version and records that version as dirty.
+- The head immediately returns `WriteResponse { success=true, version=... }` to indicate accepted-by-head.
+- Dirty versions propagate node-by-node using `Propagate` (CHAIN: successor along the chain, CROWN: clockwise toward the key tail).
+- The key tail marks the version clean/committed and initiates upstream `Ack`.
+- Upstream nodes mark clean on `Ack`; the key head logs final commit when `Ack` arrives.
+- Only the read tail for a key serves client `Read` RPCs (CHAIN: configured tail, CROWN: key tail).
+- Reads return the latest clean/committed value/version only.
 - Client writes sent to non-head nodes fail with a clear error.
 - Client reads sent to non-tail nodes fail with a clear error.
 

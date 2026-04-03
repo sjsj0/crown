@@ -62,7 +62,7 @@ message WriteRequest {
 
 message WriteResponse {
     bool   success = 1;
-    uint64 version = 2; // the version the head assigned
+    uint64 version = 2; // success=true means head accepted; version is head-assigned and does NOT imply committed
 }
 
 message ReadRequest {
@@ -84,12 +84,15 @@ message PropagateRequest {
     string value     = 2;
     uint64 version   = 3;
     string origin_id = 4; // node_id of the head that originated the write
+    string client_addr = 5; // forwarded client identity/address for commit correlation
+    uint64 request_id  = 6; // forwarded request correlation id
 }
 
 message AckRequest {
     string key     = 1;
     uint64 version = 2;
-    uint64 request_id = 3;
+    string client_addr = 3; // client identity/address for async commit correlation
+    uint64 request_id  = 4; // request correlation id from original write
 }
 
 // ============================================================

@@ -1,10 +1,8 @@
 #pragma once
 
-#include <condition_variable>
 #include <cstdint>
+#include <map>
 #include <memory>
-#include <mutex>
-#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -19,24 +17,20 @@ struct LatestReplicaValue {
     uint64_t version = 0;
 };
 
-// Shared helper for plain chain-style replication semantics.
-// This is intentionally not CRAQ-style clean/dirty tracking.
+// Shared helper for chain-style replication with explicit clean/dirty state.
+// This helper is intentionally not concurrency-safe in this serialized prototype.
 class ChainStyleReplicationSupport {
 public:
     uint64_t assign_next_version(const std::string& key);
 
-    void apply_replica_write(const std::string& key,
-                             const std::string& value,
-                             uint64_t version);
+    void record_local_write(const std::string& key,
+                            const std::string& value,
+                            uint64_t version);
 
-    // Returns the latest committed value/version for plain chain-style reads.
-    LatestReplicaValue read_latest(const std::string& key) const;
+    void mark_version_clean(const std::string& key, uint64_t version);
 
-    void mark_write_committed(const std::string& key, uint64_t version);
-
-    void wait_for_commit(const std::string& key, uint64_t version);
-
-    void notify_commit(const std::string& key, uint64_t version);
+    // Returns the latest committed (clean) value/version.
+    LatestReplicaValue read_clean(const std::string& key) const;
 
     // Rebuild predecessor/successor channels and stubs for new topology.
     void on_config_change(const Node& node);
@@ -47,17 +41,15 @@ public:
 private:
     struct KeyState {
         uint64_t next_version = 0;
-        uint64_t latest_version = 0;
-        std::string latest_value;
+        uint64_t latest_seen_version = 0;
+        std::string latest_seen_value;
 
-        uint64_t committed_version = 0;
-        std::string committed_value;
+        uint64_t clean_version = 0;
+        std::string clean_value;
 
-        std::unordered_map<uint64_t, std::string> inflight;
+        std::map<uint64_t, std::string> dirty_versions;
     };
 
-    mutable std::mutex mu_;
-    std::condition_variable cv_;
     std::unordered_map<std::string, KeyState> by_key_;
 
     std::shared_ptr<grpc::Channel> predecessor_channel_;

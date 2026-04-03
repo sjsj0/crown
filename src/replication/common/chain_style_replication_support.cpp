@@ -5,85 +5,64 @@
 using namespace std;
 
 uint64_t ChainStyleReplicationSupport::assign_next_version(const std::string& key) {
-    lock_guard<mutex> lock(mu_);
     KeyState& state = by_key_[key];
     state.next_version += 1;
     return state.next_version;
 }
 
-void ChainStyleReplicationSupport::apply_replica_write(const std::string& key,
-                                                       const std::string& value,
-                                                       uint64_t version) {
-    lock_guard<mutex> lock(mu_);
+void ChainStyleReplicationSupport::record_local_write(const std::string& key,
+                                                      const std::string& value,
+                                                      uint64_t version) {
     KeyState& state = by_key_[key];
 
     state.next_version = max(state.next_version, version);
-    state.inflight[version] = value;
+    state.dirty_versions[version] = value;
 
-    if (version >= state.latest_version) {
-        state.latest_version = version;
-        state.latest_value = value;
+    if (version >= state.latest_seen_version) {
+        state.latest_seen_version = version;
+        state.latest_seen_value = value;
     }
 }
 
-LatestReplicaValue ChainStyleReplicationSupport::read_latest(const std::string& key) const {
-    lock_guard<mutex> lock(mu_);
+LatestReplicaValue ChainStyleReplicationSupport::read_clean(const std::string& key) const {
     LatestReplicaValue out;
 
     const auto it = by_key_.find(key);
-    if (it == by_key_.end() || it->second.committed_version == 0) {
+    if (it == by_key_.end() || it->second.clean_version == 0) {
         return out;
     }
 
     out.found = true;
-    out.value = it->second.committed_value;
-    out.version = it->second.committed_version;
+    out.value = it->second.clean_value;
+    out.version = it->second.clean_version;
     return out;
 }
 
-void ChainStyleReplicationSupport::mark_write_committed(const std::string& key, uint64_t version) {
-    lock_guard<mutex> lock(mu_);
+void ChainStyleReplicationSupport::mark_version_clean(const std::string& key, uint64_t version) {
     KeyState& state = by_key_[key];
 
     state.next_version = max(state.next_version, version);
 
-    if (version > state.committed_version) {
-        state.committed_version = version;
-
-        const auto committed_it = state.inflight.find(version);
-        if (committed_it != state.inflight.end()) {
-            state.committed_value = committed_it->second;
-        } else if (version == state.latest_version) {
-            state.committed_value = state.latest_value;
-        }
+    const auto clean_it = state.dirty_versions.find(version);
+    if (clean_it != state.dirty_versions.end() && version >= state.clean_version) {
+        state.clean_version = version;
+        state.clean_value = clean_it->second;
     }
 
-    for (auto it = state.inflight.begin(); it != state.inflight.end();) {
-        if (it->first <= state.committed_version) {
-            it = state.inflight.erase(it);
+    if (state.clean_version == 0) {
+        return;
+    }
+
+    for (auto it = state.dirty_versions.begin(); it != state.dirty_versions.end();) {
+        if (it->first <= state.clean_version) {
+            it = state.dirty_versions.erase(it);
         } else {
             ++it;
         }
     }
 }
 
-void ChainStyleReplicationSupport::wait_for_commit(const std::string& key, uint64_t version) {
-    unique_lock<mutex> lock(mu_);
-    cv_.wait(lock, [&]() {
-        const auto it = by_key_.find(key);
-        return it != by_key_.end() && it->second.committed_version >= version;
-    });
-}
-
-void ChainStyleReplicationSupport::notify_commit(const std::string& key, uint64_t version) {
-    (void)key;
-    (void)version;
-    cv_.notify_all();
-}
-
 void ChainStyleReplicationSupport::on_config_change(const Node& node) {
-    lock_guard<mutex> lock(mu_);
-
     predecessor_channel_.reset();
     successor_channel_.reset();
     predecessor_stub_.reset();
@@ -107,11 +86,9 @@ void ChainStyleReplicationSupport::on_config_change(const Node& node) {
 }
 
 std::shared_ptr<chain::ChainNode::Stub> ChainStyleReplicationSupport::predecessor_stub() const {
-    lock_guard<mutex> lock(mu_);
     return predecessor_stub_;
 }
 
 std::shared_ptr<chain::ChainNode::Stub> ChainStyleReplicationSupport::successor_stub() const {
-    lock_guard<mutex> lock(mu_);
     return successor_stub_;
 }
