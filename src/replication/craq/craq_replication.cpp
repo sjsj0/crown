@@ -67,6 +67,30 @@ void forward_ack_async(std::shared_ptr<chain::ChainNode::Stub> predecessor,
     }).detach();
 }
 
+void notify_client_ack_async(chain::AckRequest req,
+                             const std::string& from_node) {
+    std::thread([req = std::move(req), from_node]() mutable {
+        if (req.client_addr().empty()) {
+            cerr << "[CRAQ] Client ACK skipped from " << from_node
+                 << ": empty client_addr\n";
+            return;
+        }
+
+        auto channel = grpc::CreateChannel(req.client_addr(), grpc::InsecureChannelCredentials());
+        auto client_stub = chain::ChainNode::NewStub(channel);
+
+        google::protobuf::Empty ignored;
+        grpc::ClientContext ctx;
+        grpc::Status status = client_stub->Ack(&ctx, req, &ignored);
+        if (!status.ok()) {
+            cerr << "[CRAQ] Client ACK failed from " << from_node
+                 << " request_id=" << req.request_id()
+                 << " client_addr='" << req.client_addr()
+                 << "': " << status.error_message() << "\n";
+        }
+    }).detach();
+}
+
 chain::ReadResponse build_read_response(const std::string& key,
                                         const std::string& value,
                                         uint64_t version) {
@@ -99,6 +123,14 @@ chain::WriteResponse CRAQReplication::handle_write(const chain::WriteRequest& re
         support_.mark_version_clean(req.key(), version);
         cout << "[CRAQ] Single-node chain committed immediately key='" << req.key()
              << "' version=" << version << "\n";
+
+        chain::AckRequest ack;
+        ack.set_key(req.key());
+        ack.set_version(version);
+        ack.set_client_addr(req.client_addr());
+        ack.set_request_id(req.request_id());
+        notify_client_ack_async(std::move(ack), craq_node_label(node));
+
         return resp;
     }
 
@@ -215,6 +247,10 @@ void CRAQReplication::handle_ack(const chain::AckRequest& req, Node& node) {
         cout << "[CRAQ] Head finalized commit request_id=" << req.request_id()
              << " key='" << req.key() << "' version=" << req.version()
              << " client_addr='" << req.client_addr() << "'\n";
+
+        chain::AckRequest client_ack = req;
+        notify_client_ack_async(std::move(client_ack), craq_node_label(node));
+
         return;
     }
 

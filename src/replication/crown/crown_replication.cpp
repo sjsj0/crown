@@ -82,6 +82,30 @@ void forward_ack_counter_clockwise_async(std::shared_ptr<chain::ChainNode::Stub>
     }).detach();
 }
 
+void notify_client_ack_async(chain::AckRequest req,
+                             const std::string& from_node) {
+    std::thread([req = std::move(req), from_node]() mutable {
+        if (req.client_addr().empty()) {
+            cerr << "[CROWN] Client ACK skipped from " << from_node
+                 << ": empty client_addr\n";
+            return;
+        }
+
+        auto channel = grpc::CreateChannel(req.client_addr(), grpc::InsecureChannelCredentials());
+        auto client_stub = chain::ChainNode::NewStub(channel);
+
+        google::protobuf::Empty ignored;
+        grpc::ClientContext ctx;
+        grpc::Status status = client_stub->Ack(&ctx, req, &ignored);
+        if (!status.ok()) {
+            cerr << "[CROWN] Client ACK failed from " << from_node
+                 << " request_id=" << req.request_id()
+                 << " client_addr='" << req.client_addr()
+                 << "': " << status.error_message() << "\n";
+        }
+    }).detach();
+}
+
 } // namespace
 
 chain::WriteResponse CROWNReplication::handle_write(const chain::WriteRequest& req, Node& node) {
@@ -107,6 +131,14 @@ chain::WriteResponse CROWNReplication::handle_write(const chain::WriteRequest& r
 
         cout << "[CROWN] Single-node ownership committed key='" << req.key()
              << "' version=" << version << "\n";
+
+        chain::AckRequest ack;
+        ack.set_key(req.key());
+        ack.set_version(version);
+        ack.set_client_addr(req.client_addr());
+        ack.set_request_id(req.request_id());
+        notify_client_ack_async(std::move(ack), crown_node_label(node));
+
         return resp;
     }
 
@@ -199,6 +231,10 @@ void CROWNReplication::handle_ack(const chain::AckRequest& req, Node& node) {
         cout << "[CROWN] Key-head finalized commit request_id=" << req.request_id()
              << " key='" << req.key() << "' version=" << req.version()
              << " client_addr='" << req.client_addr() << "'\n";
+
+        chain::AckRequest client_ack = req;
+        notify_client_ack_async(std::move(client_ack), crown_node_label(node));
+
         return;
     }
 

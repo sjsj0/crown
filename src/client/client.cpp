@@ -29,6 +29,10 @@
 #include <mutex>
 #include <atomic>
 #include <random>
+#include <chrono>
+#include <iomanip>
+#include <limits>
+#include <memory>
 
 #include <grpcpp/grpcpp.h>
 #include <nlohmann/json.hpp>
@@ -55,6 +59,393 @@ static unordered_map<uint64_t, PendingWrite> g_pending;  // request_id -> Pendin
 // Monotonically increasing request ID generator.
 static atomic<uint64_t> g_next_request_id{1};
 
+// ============================================================
+// Benchmark helpers
+// ============================================================
+
+using SteadyClock = chrono::steady_clock;
+
+struct ThroughputMetricsSummary {
+    double duration_sec = 0.0;
+    uint64_t writes_sent = 0;
+    uint64_t acks_received = 0;
+    uint64_t reads_sent = 0;
+    uint64_t reads_ok = 0;
+    uint64_t read_failures = 0;
+    uint64_t write_rpc_failures = 0;
+    double ack_writes_per_sec = 0.0;
+    double read_requests_per_sec = 0.0;
+    double read_responses_per_sec = 0.0;
+    double avg_ack_latency_ms = 0.0;
+};
+
+struct ThroughputMetricsState {
+    atomic<bool> enabled{false};
+    SteadyClock::time_point window_start = SteadyClock::now();
+
+    atomic<uint64_t> writes_sent{0};
+    atomic<uint64_t> acks_received{0};
+    atomic<uint64_t> reads_sent{0};
+    atomic<uint64_t> reads_ok{0};
+    atomic<uint64_t> read_failures{0};
+    atomic<uint64_t> write_rpc_failures{0};
+
+    atomic<uint64_t> ack_latency_samples{0};
+    atomic<uint64_t> ack_latency_total_us{0};
+
+    mutex pending_write_times_mtx;
+    unordered_map<uint64_t, SteadyClock::time_point> pending_write_times;
+};
+
+static mutex g_metrics_state_mtx;
+static shared_ptr<ThroughputMetricsState> g_metrics_state;
+
+[[maybe_unused]] static void benchmark_attach_metrics_state(const shared_ptr<ThroughputMetricsState>& state) {
+    lock_guard<mutex> lk(g_metrics_state_mtx);
+    g_metrics_state = state;
+}
+
+[[maybe_unused]] static void benchmark_detach_metrics_state() {
+    lock_guard<mutex> lk(g_metrics_state_mtx);
+    g_metrics_state.reset();
+}
+
+static shared_ptr<ThroughputMetricsState> benchmark_current_metrics_state() {
+    lock_guard<mutex> lk(g_metrics_state_mtx);
+    return g_metrics_state;
+}
+
+[[maybe_unused]] static void benchmark_start_metrics_window(
+    ThroughputMetricsState& state,
+    SteadyClock::time_point start_time = SteadyClock::now()) {
+    state.window_start = start_time;
+
+    state.writes_sent.store(0, memory_order_relaxed);
+    state.acks_received.store(0, memory_order_relaxed);
+    state.reads_sent.store(0, memory_order_relaxed);
+    state.reads_ok.store(0, memory_order_relaxed);
+    state.read_failures.store(0, memory_order_relaxed);
+    state.write_rpc_failures.store(0, memory_order_relaxed);
+    state.ack_latency_samples.store(0, memory_order_relaxed);
+    state.ack_latency_total_us.store(0, memory_order_relaxed);
+
+    {
+        lock_guard<mutex> lk(state.pending_write_times_mtx);
+        state.pending_write_times.clear();
+    }
+
+    state.enabled.store(true, memory_order_release);
+}
+
+[[maybe_unused]] static void benchmark_stop_metrics_window(ThroughputMetricsState& state) {
+    state.enabled.store(false, memory_order_release);
+}
+
+[[maybe_unused]] static double benchmark_per_client_rate(double total_rate_per_sec, int num_clients) {
+    if (total_rate_per_sec <= 0.0 || num_clients <= 0) return 0.0;
+    return total_rate_per_sec / static_cast<double>(num_clients);
+}
+
+[[maybe_unused]] static SteadyClock::time_point benchmark_next_send_time(
+    SteadyClock::time_point window_start,
+    uint64_t send_count,
+    double rate_per_sec) {
+    if (rate_per_sec <= 0.0) return window_start;
+
+    const long double nanos =
+        (static_cast<long double>(send_count) * 1000000000.0L) / static_cast<long double>(rate_per_sec);
+    return window_start + chrono::nanoseconds(static_cast<int64_t>(nanos));
+}
+
+[[maybe_unused]] static string benchmark_key_for_index(const string& prefix, uint64_t index) {
+    return prefix + to_string(index);
+}
+
+[[maybe_unused]] static vector<string> benchmark_build_keyset(const string& prefix, size_t key_count) {
+    vector<string> keys;
+    keys.reserve(key_count);
+    for (size_t i = 0; i < key_count; ++i)
+        keys.push_back(benchmark_key_for_index(prefix, i));
+    return keys;
+}
+
+[[maybe_unused]] static const string& benchmark_select_key_round_robin(
+    const vector<string>& keys,
+    uint64_t operation_index) {
+    if (keys.empty()) throw invalid_argument("benchmark keyset cannot be empty");
+    return keys[static_cast<size_t>(operation_index % keys.size())];
+}
+
+static void benchmark_note_write_issued(uint64_t request_id) {
+    auto state = benchmark_current_metrics_state();
+    if (!state || !state->enabled.load(memory_order_relaxed)) return;
+
+    state->writes_sent.fetch_add(1, memory_order_relaxed);
+    const auto now = SteadyClock::now();
+
+    lock_guard<mutex> lk(state->pending_write_times_mtx);
+    state->pending_write_times[request_id] = now;
+}
+
+static void benchmark_note_write_ack(uint64_t request_id) {
+    auto state = benchmark_current_metrics_state();
+    if (!state || !state->enabled.load(memory_order_relaxed)) return;
+
+    state->acks_received.fetch_add(1, memory_order_relaxed);
+
+    SteadyClock::time_point issued_at{};
+    bool found = false;
+    {
+        lock_guard<mutex> lk(state->pending_write_times_mtx);
+        auto it = state->pending_write_times.find(request_id);
+        if (it != state->pending_write_times.end()) {
+            issued_at = it->second;
+            state->pending_write_times.erase(it);
+            found = true;
+        }
+    }
+
+    if (!found) return;
+
+    const auto latency_us = chrono::duration_cast<chrono::microseconds>(SteadyClock::now() - issued_at).count();
+    state->ack_latency_total_us.fetch_add(static_cast<uint64_t>(max<int64_t>(0, latency_us)), memory_order_relaxed);
+    state->ack_latency_samples.fetch_add(1, memory_order_relaxed);
+}
+
+[[maybe_unused]] static void benchmark_note_write_rpc_failure() {
+    auto state = benchmark_current_metrics_state();
+    if (!state || !state->enabled.load(memory_order_relaxed)) return;
+    state->write_rpc_failures.fetch_add(1, memory_order_relaxed);
+}
+
+static void benchmark_note_read_sent() {
+    auto state = benchmark_current_metrics_state();
+    if (!state || !state->enabled.load(memory_order_relaxed)) return;
+    state->reads_sent.fetch_add(1, memory_order_relaxed);
+}
+
+static void benchmark_note_read_success() {
+    auto state = benchmark_current_metrics_state();
+    if (!state || !state->enabled.load(memory_order_relaxed)) return;
+    state->reads_ok.fetch_add(1, memory_order_relaxed);
+}
+
+static void benchmark_note_read_failure() {
+    auto state = benchmark_current_metrics_state();
+    if (!state || !state->enabled.load(memory_order_relaxed)) return;
+    state->read_failures.fetch_add(1, memory_order_relaxed);
+}
+
+[[maybe_unused]] static ThroughputMetricsSummary benchmark_build_summary(
+    const ThroughputMetricsState& state,
+    SteadyClock::time_point end_time = SteadyClock::now()) {
+    ThroughputMetricsSummary summary;
+
+    summary.duration_sec = chrono::duration<double>(end_time - state.window_start).count();
+    if (summary.duration_sec <= 0.0) summary.duration_sec = 1e-9;
+
+    summary.writes_sent = state.writes_sent.load(memory_order_relaxed);
+    summary.acks_received = state.acks_received.load(memory_order_relaxed);
+    summary.reads_sent = state.reads_sent.load(memory_order_relaxed);
+    summary.reads_ok = state.reads_ok.load(memory_order_relaxed);
+    summary.read_failures = state.read_failures.load(memory_order_relaxed);
+    summary.write_rpc_failures = state.write_rpc_failures.load(memory_order_relaxed);
+
+    const uint64_t ack_latency_samples = state.ack_latency_samples.load(memory_order_relaxed);
+    const uint64_t ack_latency_total_us = state.ack_latency_total_us.load(memory_order_relaxed);
+
+    summary.ack_writes_per_sec = static_cast<double>(summary.acks_received) / summary.duration_sec;
+    summary.read_requests_per_sec = static_cast<double>(summary.reads_sent) / summary.duration_sec;
+    summary.read_responses_per_sec = static_cast<double>(summary.reads_ok) / summary.duration_sec;
+
+    if (ack_latency_samples > 0) {
+        summary.avg_ack_latency_ms =
+            (static_cast<double>(ack_latency_total_us) / static_cast<double>(ack_latency_samples)) / 1000.0;
+    }
+    return summary;
+}
+
+[[maybe_unused]] static string benchmark_summary_line(const ThroughputMetricsSummary& summary,
+                                                       const string& tag) {
+    ostringstream out;
+    out << fixed << setprecision(3)
+        << "BENCH_SUMMARY"
+        << " tag=" << tag
+        << " duration_s=" << summary.duration_sec
+        << " writes_sent=" << summary.writes_sent
+        << " acks_received=" << summary.acks_received
+        << " reads_sent=" << summary.reads_sent
+        << " reads_ok=" << summary.reads_ok
+        << " read_failures=" << summary.read_failures
+        << " write_rpc_failures=" << summary.write_rpc_failures
+        << " ack_wps=" << summary.ack_writes_per_sec
+        << " read_req_rps=" << summary.read_requests_per_sec
+        << " read_resp_rps=" << summary.read_responses_per_sec
+        << " avg_ack_latency_ms=" << summary.avg_ack_latency_ms;
+    return out.str();
+}
+
+enum class ClientRunMode {
+    INTERACTIVE,
+    BENCH_WRITE,
+    BENCH_READ,
+};
+
+struct BenchmarkRunConfig {
+    double duration_sec = 0.0;
+    double total_rate_rps = 0.0;
+    int key_count = 0;
+    int client_index = 0;
+    int num_clients = 1;
+    int craq_node_id = -1;
+    string key_prefix = "bench-key-";
+    string value_prefix = "bench-value-";
+};
+
+static bool parse_int_text(const string& s, int& out) {
+    if (s.empty()) return false;
+    try {
+        size_t consumed = 0;
+        const long long parsed = stoll(s, &consumed, 10);
+        if (consumed != s.size()) return false;
+        if (parsed < numeric_limits<int>::min() || parsed > numeric_limits<int>::max()) return false;
+        out = static_cast<int>(parsed);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool parse_double_text(const string& s, double& out) {
+    if (s.empty()) return false;
+    try {
+        size_t consumed = 0;
+        out = stod(s, &consumed);
+        return consumed == s.size();
+    } catch (...) {
+        return false;
+    }
+}
+
+static string mode_name(chain::ReplicationMode mode) {
+    switch (mode) {
+        case chain::ReplicationMode::CHAIN: return "chain";
+        case chain::ReplicationMode::CRAQ: return "craq";
+        case chain::ReplicationMode::CROWN: return "crown";
+        default: return "unknown";
+    }
+}
+
+static size_t pending_write_count() {
+    lock_guard<mutex> lk(g_pending_mtx);
+    return g_pending.size();
+}
+
+static bool remove_pending_request(uint64_t request_id) {
+    lock_guard<mutex> lk(g_pending_mtx);
+    return g_pending.erase(request_id) > 0;
+}
+
+static bool benchmark_wait_for_pending_acks(chrono::milliseconds timeout) {
+    const auto deadline = SteadyClock::now() + timeout;
+    while (SteadyClock::now() < deadline) {
+        if (pending_write_count() == 0) return true;
+        this_thread::sleep_for(chrono::milliseconds(5));
+    }
+    return pending_write_count() == 0;
+}
+
+static void print_usage(const char* bin) {
+    cerr << "Usage:\n"
+         << "  " << bin << " <config.json> <true/false> [ack_port]\n"
+         << "  " << bin << " <config.json> <true/false> [ack_port] bench-write <duration_sec> <total_rate_rps> <key_count> <client_index> <num_clients> [key_prefix] [value_prefix]\n"
+         << "  " << bin << " <config.json> <true/false> [ack_port] bench-read  <duration_sec> <total_rate_rps> <key_count> <client_index> <num_clients> [craq_node_id] [key_prefix]\n";
+}
+
+static bool parse_run_mode_args(int argc,
+                                char** argv,
+                                int& ack_port,
+                                ClientRunMode& run_mode,
+                                BenchmarkRunConfig& bench_cfg,
+                                string& err) {
+    ack_port = 60000;
+    run_mode = ClientRunMode::INTERACTIVE;
+
+    int argi = 3;
+    int maybe_ack_port = 0;
+    if (argi < argc && parse_int_text(argv[argi], maybe_ack_port)) {
+        ack_port = maybe_ack_port;
+        ++argi;
+    }
+
+    if (ack_port < 1 || ack_port > 65535) {
+        err = "ack_port must be in [1, 65535]";
+        return false;
+    }
+
+    if (argi >= argc) return true;
+
+    const string mode_arg = argv[argi++];
+    const bool is_write = (mode_arg == "bench-write");
+    const bool is_read = (mode_arg == "bench-read");
+    if (!is_write && !is_read) {
+        err = "unknown mode '" + mode_arg + "'";
+        return false;
+    }
+
+    run_mode = is_write ? ClientRunMode::BENCH_WRITE : ClientRunMode::BENCH_READ;
+
+    if (argc - argi < 5) {
+        err = "benchmark mode requires: <duration_sec> <total_rate_rps> <key_count> <client_index> <num_clients>";
+        return false;
+    }
+
+    if (!parse_double_text(argv[argi++], bench_cfg.duration_sec) || bench_cfg.duration_sec <= 0.0) {
+        err = "duration_sec must be > 0";
+        return false;
+    }
+    if (!parse_double_text(argv[argi++], bench_cfg.total_rate_rps) || bench_cfg.total_rate_rps <= 0.0) {
+        err = "total_rate_rps must be > 0";
+        return false;
+    }
+    if (!parse_int_text(argv[argi++], bench_cfg.key_count) || bench_cfg.key_count <= 0) {
+        err = "key_count must be > 0";
+        return false;
+    }
+    if (!parse_int_text(argv[argi++], bench_cfg.client_index) || bench_cfg.client_index < 0) {
+        err = "client_index must be >= 0";
+        return false;
+    }
+    if (!parse_int_text(argv[argi++], bench_cfg.num_clients) || bench_cfg.num_clients <= 0) {
+        err = "num_clients must be > 0";
+        return false;
+    }
+    if (bench_cfg.client_index >= bench_cfg.num_clients) {
+        err = "client_index must be < num_clients";
+        return false;
+    }
+
+    if (is_write) {
+        if (argi < argc) bench_cfg.key_prefix = argv[argi++];
+        if (argi < argc) bench_cfg.value_prefix = argv[argi++];
+    } else {
+        if (argi < argc) {
+            int maybe_node_id = -1;
+            if (parse_int_text(argv[argi], maybe_node_id)) {
+                bench_cfg.craq_node_id = maybe_node_id;
+                ++argi;
+            }
+        }
+        if (argi < argc) bench_cfg.key_prefix = argv[argi++];
+    }
+
+    if (argi != argc) {
+        err = "too many arguments for benchmark mode";
+        return false;
+    }
+    return true;
+}
+
 static uint64_t add_pending(const string& key, const string& value) {
     uint64_t id = g_next_request_id.fetch_add(1, memory_order_relaxed);
     lock_guard<mutex> lk(g_pending_mtx);
@@ -71,6 +462,7 @@ static void ack_pending(uint64_t request_id, uint64_t version) {
         cout << "\n[Ack] Received ack for unknown request_id=" << request_id << "\n> " << flush;
         return;
     }
+        benchmark_note_write_ack(request_id);
     cout << "\n[Ack] Write committed: request_id=" << request_id
          << " key='" << it->second.key << "'"
          << " version=" << version << "\n> " << flush;
@@ -315,6 +707,21 @@ struct Topology {
     }
 };
 
+[[maybe_unused]] static int benchmark_select_craq_node_id(const Topology& topo,
+                                                           uint64_t operation_index,
+                                                           int preferred_node_id = -1) {
+    if (topo.mode != chain::ReplicationMode::CRAQ || topo.nodes.empty()) return -1;
+
+    if (preferred_node_id != -1) {
+        for (const auto& node : topo.nodes)
+            if (node.id == preferred_node_id) return preferred_node_id;
+        return -1;
+    }
+
+    const size_t idx = static_cast<size_t>(operation_index % topo.nodes.size());
+    return topo.nodes[idx].id;
+}
+
 static Topology build_topology(const json& config, chain::ReplicationMode mode) {
     Topology topo;
     topo.mode = mode;
@@ -358,8 +765,8 @@ static Topology build_topology(const json& config, chain::ReplicationMode mode) 
 // ============================================================
 
 // Non-blocking: adds to pending map, fires RPC, returns immediately.
-static void do_write(Topology& topo, const string& key, const string& value,
-                     const string& client_addr) {
+static bool do_write(Topology& topo, const string& key, const string& value,
+                     const string& client_addr, bool verbose = true) {
     // Resolve the head node for this key.
     // CHAIN / CRAQ: single static head.
     // CROWN: head index = hash(key) % node_count.
@@ -367,16 +774,22 @@ static void do_write(Topology& topo, const string& key, const string& value,
     if (topo.mode == chain::ReplicationMode::CROWN) {
         target_head = topo.crown_head_for(key);
         if (!target_head) {
-            cerr << "[Write] No CROWN head found for key='" << key << "' "
-                 << "(token=" << Topology::hash_key(key) << ")\n";
-            return;
+            if (verbose) {
+                cerr << "[Write] No CROWN head found for key='" << key << "' "
+                     << "(token=" << Topology::hash_key(key) << ")\n";
+            }
+            return false;
         }
     } else {
         target_head = topo.head;
-        if (!target_head) { cerr << "[Write] No head node in topology.\n"; return; }
+        if (!target_head) {
+            if (verbose) cerr << "[Write] No head node in topology.\n";
+            return false;
+        }
     }
 
     uint64_t request_id = add_pending(key, value);
+    benchmark_note_write_issued(request_id);
 
     chain::WriteRequest req;
     req.set_key(key);
@@ -386,15 +799,31 @@ static void do_write(Topology& topo, const string& key, const string& value,
     req.set_request_id(request_id);
 
     // Fire and forget — ack comes asynchronously from the tail.
-    chain::WriteResponse ignored;
+    chain::WriteResponse resp;
     grpc::ClientContext  ctx;
-    target_head->stub->Write(&ctx, req, &ignored);
+    grpc::Status status = target_head->stub->Write(&ctx, req, &resp);
 
-    cout << "[Write] Sent request_id=" << request_id
-         << " key='" << key << "' to head (" << target_head->endpoint << ")\n";
+    if (!status.ok() || !resp.success()) {
+        benchmark_note_write_rpc_failure();
+        (void)remove_pending_request(request_id);
+        if (verbose) {
+            if (!status.ok()) {
+                cerr << "[Write] Failed: " << status.error_message() << "\n";
+            } else {
+                cerr << "[Write] Failed: head returned success=false\n";
+            }
+        }
+        return false;
+    }
+
+    if (verbose) {
+        cout << "[Write] Sent request_id=" << request_id
+             << " key='" << key << "' to head (" << target_head->endpoint << ")\n";
+    }
+    return true;
 }
 
-static void do_read(Topology& topo, const string& key, int node_id = -1) {
+static bool do_read(Topology& topo, const string& key, int node_id = -1, bool verbose = true) {
     // Resolve the target node for this key.
     // CHAIN: single static tail.
     // CRAQ: specified node_id or random.
@@ -403,9 +832,11 @@ static void do_read(Topology& topo, const string& key, int node_id = -1) {
     if (topo.mode == chain::ReplicationMode::CROWN) {
         target = topo.crown_tail_for(key);
         if (!target) {
-            cerr << "[Read] No CROWN tail found for key='" << key << "' "
-                 << "(token=" << Topology::hash_key(key) << ")\n";
-            return;
+            if (verbose) {
+                cerr << "[Read] No CROWN tail found for key='" << key << "' "
+                     << "(token=" << Topology::hash_key(key) << ")\n";
+            }
+            return false;
         }
     } else if (topo.mode == chain::ReplicationMode::CRAQ) {
         if (node_id != -1) {
@@ -417,12 +848,15 @@ static void do_read(Topology& topo, const string& key, int node_id = -1) {
                 }
             }
             if (!target) {
-                cerr << "[Read] Node with id " << node_id << " not found.\n";
-                return;
+                if (verbose) cerr << "[Read] Node with id " << node_id << " not found.\n";
+                return false;
             }
         } else {
             // Random pick
-            if (topo.nodes.empty()) { cerr << "[Read] No nodes in topology.\n"; return; }
+            if (topo.nodes.empty()) {
+                if (verbose) cerr << "[Read] No nodes in topology.\n";
+                return false;
+            }
             static std::random_device rd;
             static std::mt19937 gen(rd());
             std::uniform_int_distribution<> dis(0, topo.nodes.size() - 1);
@@ -432,7 +866,10 @@ static void do_read(Topology& topo, const string& key, int node_id = -1) {
     } else {
         // CHAIN: use tail
         target = topo.tail;
-        if (!target) { cerr << "[Read] No tail node in topology.\n"; return; }
+        if (!target) {
+            if (verbose) cerr << "[Read] No tail node in topology.\n";
+            return false;
+        }
     }
 
     chain::ReadRequest  req;
@@ -440,16 +877,104 @@ static void do_read(Topology& topo, const string& key, int node_id = -1) {
     grpc::ClientContext ctx;
     req.set_key(key);
 
+    benchmark_note_read_sent();
     grpc::Status status = target->stub->Read(&ctx, req, &resp);
-    if (!status.ok()) { cerr << "[Read] Failed: " << status.error_message() << "\n"; return; }
+    if (!status.ok()) {
+        benchmark_note_read_failure();
+        if (verbose) cerr << "[Read] Failed: " << status.error_message() << "\n";
+        return false;
+    }
+    benchmark_note_read_success();
 
-    if (resp.value().empty())
-        cout << "[Read] (not found)\n";
-    else
-        cout << "[Read] key='" << resp.key()
-             << "' value='" << resp.value()
-             << "' version=" << resp.version()
-             << " (via " << target->endpoint << ")\n";
+    if (verbose) {
+        if (resp.value().empty())
+            cout << "[Read] (not found)\n";
+        else
+            cout << "[Read] key='" << resp.key()
+                 << "' value='" << resp.value()
+                 << "' version=" << resp.version()
+                 << " (via " << target->endpoint << ")\n";
+    }
+    return true;
+}
+
+static ThroughputMetricsSummary run_bench_write(Topology& topo,
+                                                const string& client_addr,
+                                                const BenchmarkRunConfig& cfg) {
+    auto state = make_shared<ThroughputMetricsState>();
+    benchmark_attach_metrics_state(state);
+
+    const vector<string> keys = benchmark_build_keyset(cfg.key_prefix, static_cast<size_t>(cfg.key_count));
+    const double per_client_rps = benchmark_per_client_rate(cfg.total_rate_rps, cfg.num_clients);
+
+    benchmark_start_metrics_window(*state);
+    const auto run_duration = chrono::duration_cast<SteadyClock::duration>(chrono::duration<double>(cfg.duration_sec));
+    const auto end_time = state->window_start + run_duration;
+
+    uint64_t op_index = 0;
+    while (SteadyClock::now() < end_time) {
+        const auto due = benchmark_next_send_time(state->window_start, op_index, per_client_rps);
+        if (due > SteadyClock::now()) this_thread::sleep_until(due);
+        if (SteadyClock::now() >= end_time) break;
+
+        const uint64_t global_op = static_cast<uint64_t>(cfg.client_index)
+            + static_cast<uint64_t>(cfg.num_clients) * op_index;
+        const string& key = benchmark_select_key_round_robin(keys, global_op);
+        const string value = cfg.value_prefix + to_string(cfg.client_index) + "-" + to_string(op_index);
+        (void)do_write(topo, key, value, client_addr, false);
+        ++op_index;
+    }
+
+    (void)benchmark_wait_for_pending_acks(chrono::milliseconds(3000));
+    benchmark_stop_metrics_window(*state);
+    const ThroughputMetricsSummary summary = benchmark_build_summary(*state);
+    benchmark_detach_metrics_state();
+    return summary;
+}
+
+static ThroughputMetricsSummary run_bench_read(Topology& topo,
+                                               const string& client_addr,
+                                               const BenchmarkRunConfig& cfg) {
+    const vector<string> keys = benchmark_build_keyset(cfg.key_prefix, static_cast<size_t>(cfg.key_count));
+
+    // Seed keys before measuring so benchmark reads can hit previously written values.
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const string value = cfg.value_prefix + "seed-" + to_string(cfg.client_index) + "-" + to_string(i);
+        (void)do_write(topo, keys[i], value, client_addr, false);
+    }
+    (void)benchmark_wait_for_pending_acks(chrono::milliseconds(8000));
+
+    auto state = make_shared<ThroughputMetricsState>();
+    benchmark_attach_metrics_state(state);
+
+    const double per_client_rps = benchmark_per_client_rate(cfg.total_rate_rps, cfg.num_clients);
+    benchmark_start_metrics_window(*state);
+
+    const auto run_duration = chrono::duration_cast<SteadyClock::duration>(chrono::duration<double>(cfg.duration_sec));
+    const auto end_time = state->window_start + run_duration;
+
+    uint64_t op_index = 0;
+    while (SteadyClock::now() < end_time) {
+        const auto due = benchmark_next_send_time(state->window_start, op_index, per_client_rps);
+        if (due > SteadyClock::now()) this_thread::sleep_until(due);
+        if (SteadyClock::now() >= end_time) break;
+
+        const uint64_t global_op = static_cast<uint64_t>(cfg.client_index)
+            + static_cast<uint64_t>(cfg.num_clients) * op_index;
+        const string& key = benchmark_select_key_round_robin(keys, global_op);
+
+        int node_id = -1;
+        if (topo.mode == chain::ReplicationMode::CRAQ) {
+            node_id = benchmark_select_craq_node_id(topo, global_op, cfg.craq_node_id);
+        }
+        (void)do_read(topo, key, node_id, false);
+        ++op_index;
+    }
+
+    benchmark_stop_metrics_window(*state);
+    const ThroughputMetricsSummary summary = benchmark_build_summary(*state);
+    benchmark_detach_metrics_state();
+    return summary;
 }
 
 static void print_help() {
@@ -522,11 +1047,28 @@ static void run_interactive_loop(Topology& topo, const string& client_addr) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        cerr << "Usage: " << argv[0] << " <config.json> <true/false> [ack_port]\n";
+        print_usage(argv[0]);
         return 1;
     }
 
-    const int    ack_port    = (argc >= 4) ? stoi(argv[3]) : 60000;
+    const string configure_arg = argv[2];
+    if (configure_arg != "true" && configure_arg != "false") {
+        cerr << "Second argument must be 'true' or 'false'.\n";
+        print_usage(argv[0]);
+        return 1;
+    }
+    const bool should_configure = (configure_arg == "true");
+
+    int ack_port = 60000;
+    ClientRunMode run_mode = ClientRunMode::INTERACTIVE;
+    BenchmarkRunConfig bench_cfg;
+    string cli_error;
+    if (!parse_run_mode_args(argc, argv, ack_port, run_mode, bench_cfg, cli_error)) {
+        cerr << "Argument error: " << cli_error << "\n";
+        print_usage(argv[0]);
+        return 1;
+    }
+
     const string client_addr = "127.0.0.1:" + to_string(ack_port);
 
     // --- Start Ack server in background thread -----------------
@@ -564,16 +1106,16 @@ int main(int argc, char** argv) {
 
     // --- Configure all nodes -----------------------------------
     int failures = 0;
-    for (const auto& node_json : config.at("nodes")) {
-        string target = node_json.at("host").get<string>() + ":"
-                      + to_string(node_json.at("port").get<int>());
-        chain::NodeConfig cfg = build_node_config(node_json, mode, crown_node_count);
-        auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
-        auto stub    = chain::ChainNode::NewStub(channel);
+    if (should_configure) {
+        for (const auto& node_json : config.at("nodes")) {
+            string target = node_json.at("host").get<string>() + ":"
+                        + to_string(node_json.at("port").get<int>());
+            chain::NodeConfig cfg = build_node_config(node_json, mode, crown_node_count);
+            auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
+            auto stub    = chain::ChainNode::NewStub(channel);
 
-        google::protobuf::Empty resp;
-        grpc::ClientContext     ctx;
-        if (strcmp(argv[2], "true") == 0) {
+            google::protobuf::Empty resp;
+            grpc::ClientContext     ctx;
             grpc::Status status = stub->Configure(&ctx, cfg, &resp);
             if (status.ok())
                 cout << "[Client] Configured node " << cfg.node_id() << " at " << target << "\n";
@@ -582,9 +1124,9 @@ int main(int argc, char** argv) {
                     << " at " << target << ": " << status.error_message() << "\n";
                 ++failures;
             }
-        } else {
-            cout << "Not configuring nodes for this run (argv[2] is not 'true').\n";
         }
+    } else {
+        cout << "[Client] Skipping Configure RPCs for this run.\n";
     }
 
     if (failures > 0) {
@@ -596,9 +1138,34 @@ int main(int argc, char** argv) {
 
     cout << "[Client] All nodes configured successfully.\n\n";
 
-    // --- Interactive loop --------------------------------------
+    // --- Run mode ----------------------------------------------
     Topology topo = build_topology(config, mode);
-    run_interactive_loop(topo, client_addr);
+    if (run_mode == ClientRunMode::INTERACTIVE) {
+        run_interactive_loop(topo, client_addr);
+    } else {
+        const bool is_write = (run_mode == ClientRunMode::BENCH_WRITE);
+        cout << "[Client] Running " << (is_write ? "bench-write" : "bench-read")
+             << " mode=" << mode_name(mode)
+             << " duration_s=" << bench_cfg.duration_sec
+             << " total_rate_rps=" << bench_cfg.total_rate_rps
+             << " key_count=" << bench_cfg.key_count
+             << " client_index=" << bench_cfg.client_index
+             << " num_clients=" << bench_cfg.num_clients;
+        if (!is_write && mode == chain::ReplicationMode::CRAQ) {
+            cout << " craq_node_id=" << bench_cfg.craq_node_id;
+        }
+        cout << "\n";
+
+        ThroughputMetricsSummary summary = is_write
+            ? run_bench_write(topo, client_addr, bench_cfg)
+            : run_bench_read(topo, client_addr, bench_cfg);
+
+        const string tag = string(is_write ? "bench-write" : "bench-read")
+            + ":" + mode_name(mode)
+            + ":c" + to_string(bench_cfg.client_index)
+            + "/" + to_string(bench_cfg.num_clients);
+        cout << benchmark_summary_line(summary, tag) << "\n";
+    }
 
     // --- Shutdown ----------------------------------------------
     ack_server->Shutdown();
