@@ -31,7 +31,7 @@ One-time setup of system dependencies on each VM.
   - Communication: `openssh-client`, `wget`
   - Deployment: `rsync`, `tmux`
   - gRPC/protobuf: `libgrpc++-dev`, `libprotobuf-dev`, `protobuf-compiler`, `protobuf-compiler-grpc` on Debian/Ubuntu; `grpc-devel`, `protobuf-devel`, `protobuf-compiler` on Fedora/RHEL
-- ✅ Uses `sudo` when elevated privileges are needed
+- ✅ Requires passwordless `sudo` or running as root on the VM
 
 **Usage:**
 ```bash
@@ -113,7 +113,7 @@ Edit `.env`:
 ```bash
 SSH_USER=your-username              # Default SSH user
 REPO_URL=https://github.com/.../crown.git
-REPO_BRANCH=main
+REPO_BRANCH=master
 PROJECT_SUBDIR=crown                # or crown/craq for standalone
 PROJECT_MODE=crown                  # or craq
 NODE_PORT=5001

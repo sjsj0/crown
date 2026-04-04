@@ -16,13 +16,26 @@ run_as_root() {
   return 1
 }
 
+ensure_passwordless_sudo() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    return
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "ERROR: sudo is not installed on this VM. Run this as root or install sudo first."
+    exit 1
+  fi
+  if ! sudo -n true 2>/dev/null; then
+    echo "ERROR: sudo requires a password on this VM."
+    echo "       Configure passwordless sudo for $DEPLOY_USER, or run this script as root."
+    exit 1
+  fi
+}
+
 echo "Installing system packages..."
 
 # Prefer apt-get on Debian/Ubuntu; fallback to dnf on Fedora/RHEL.
 if command -v apt-get >/dev/null 2>&1; then
-  if command -v sudo >/dev/null 2>&1 && [[ "$(id -u)" -ne 0 ]]; then
-    sudo -v
-  fi
+  ensure_passwordless_sudo
   if ! run_as_root apt-get update -y; then
     echo "ERROR: cannot run apt-get update as root."
     exit 1
@@ -32,9 +45,7 @@ if command -v apt-get >/dev/null 2>&1; then
     exit 1
   fi
 elif command -v dnf >/dev/null 2>&1; then
-  if command -v sudo >/dev/null 2>&1 && [[ "$(id -u)" -ne 0 ]]; then
-    sudo -v
-  fi
+  ensure_passwordless_sudo
   if ! run_as_root dnf install -y git cmake make gcc-c++ rsync openssh-clients wget vim tmux grpc-devel protobuf-devel protobuf-compiler; then
     echo "ERROR: cannot run dnf install as root."
     exit 1
