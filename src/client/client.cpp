@@ -339,30 +339,101 @@ struct NodeStub {
     string                             endpoint;
     shared_ptr<grpc::Channel>          channel;
     unique_ptr<chain::ChainNode::Stub> stub;
+
+    // CROWN only — token ranges this node owns as head / tail.
+    // Empty for chain / craq nodes.
+    vector<TokenRange> head_ranges;
+    vector<TokenRange> tail_ranges;
 };
 
 struct Topology {
     chain::ReplicationMode mode;
-    NodeStub*              head = nullptr;
-    NodeStub*              tail = nullptr;
-    vector<NodeStub>       nodes;
+
+    // Chain / CRAQ: single head and tail pointer.
+    NodeStub* head = nullptr;
+    NodeStub* tail = nullptr;
+
+    // All nodes — owns the memory. Pointers above point into this vector,
+    // so the vector must not be resized after build.
+    vector<NodeStub> nodes;
+
+    // CROWN: hash a key to a uint64 token using FNV-1a, then find the
+    // node whose head_range or tail_range contains that token.
+    static uint64_t hash_key(const string& key) {
+        uint64_t h = 14695981039346656037ULL;
+        for (unsigned char c : key) {
+            h ^= c;
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
+    // Returns true if token falls inside range, supporting wrap-around.
+    static bool token_in_range(uint64_t token, const TokenRange& r) {
+        if (r.start <= r.end)
+            return token >= r.start && token <= r.end;
+        // Wrapped range (e.g. start=0xE000... end=0x1FFF...):
+        return token >= r.start || token <= r.end;
+    }
+
+    // Find the node that owns `key` as head (for writes) in CROWN mode.
+    NodeStub* crown_head_for(const string& key) {
+        uint64_t token = hash_key(key);
+        for (auto& ns : nodes)
+            for (const auto& r : ns.head_ranges)
+                if (token_in_range(token, r)) return &ns;
+        return nullptr;
+    }
+
+    // Find the node that owns `key` as tail (for reads) in CROWN mode.
+    NodeStub* crown_tail_for(const string& key) {
+        uint64_t token = hash_key(key);
+        for (auto& ns : nodes)
+            for (const auto& r : ns.tail_ranges)
+                if (token_in_range(token, r)) return &ns;
+        return nullptr;
+    }
 };
 
 static Topology build_topology(const json& config, chain::ReplicationMode mode) {
     Topology topo;
     topo.mode = mode;
     const auto& jnodes = config.at("nodes");
+
     for (const auto& n : jnodes) {
         NodeStub ns;
         ns.endpoint = n.at("host").get<string>() + ":" + to_string(n.at("port").get<int>());
         ns.channel  = grpc::CreateChannel(ns.endpoint, grpc::InsecureChannelCredentials());
         ns.stub     = chain::ChainNode::NewStub(ns.channel);
+
+        // Parse CROWN token ranges if present.
+        if (n.contains("head_ranges")) {
+            for (const auto& r : n["head_ranges"]) {
+                TokenRange tr;
+                string err;
+                if (parse_token_range(r, "head_ranges", tr, err))
+                    ns.head_ranges.push_back(tr);
+            }
+        }
+        if (n.contains("tail_ranges")) {
+            for (const auto& r : n["tail_ranges"]) {
+                TokenRange tr;
+                string err;
+                if (parse_token_range(r, "tail_ranges", tr, err))
+                    ns.tail_ranges.push_back(tr);
+            }
+        }
+
         topo.nodes.push_back(std::move(ns));
     }
+
+    // Chain / CRAQ: identify the single head and tail by flag.
+    // CROWN: head/tail are resolved per-key at request time via crown_head_for / crown_tail_for.
     for (size_t i = 0; i < jnodes.size(); ++i) {
         if (jnodes[i].value("is_head", false)) topo.head = &topo.nodes[i];
         if (jnodes[i].value("is_tail", false)) topo.tail = &topo.nodes[i];
     }
+
     return topo;
 }
 
@@ -373,44 +444,72 @@ static Topology build_topology(const json& config, chain::ReplicationMode mode) 
 // Non-blocking: adds to pending map, fires RPC, returns immediately.
 static void do_write(Topology& topo, const string& key, const string& value,
                      const string& client_addr) {
-    if (!topo.head) { cerr << "No head node in topology.\n"; return; }
+    // Resolve the head node for this key.
+    // CR / CRAQ: single static head.
+    // CROWN: find the node whose head_range contains hash(key).
+    NodeStub* target_head = nullptr;
+    if (topo.mode == chain::ReplicationMode::CROWN) {
+        target_head = topo.crown_head_for(key);
+        if (!target_head) {
+            cerr << "[Write] No CROWN head found for key='" << key << "' "
+                 << "(token=" << Topology::hash_key(key) << ")\n";
+            return;
+        }
+    } else {
+        target_head = topo.head;
+        if (!target_head) { cerr << "[Write] No head node in topology.\n"; return; }
+    }
 
     uint64_t request_id = add_pending(key, value);
 
     chain::WriteRequest req;
     req.set_key(key);
     req.set_value(value);
-    req.set_version(0);             // head assigns the real version
+    req.set_version(0);              // head assigns the real version
     req.set_client_addr(client_addr);
     req.set_request_id(request_id);
 
-    // Fire and forget — response from head is ignored.
-    // The ack comes asynchronously from the tail via the Ack server.
+    // Fire and forget — ack comes asynchronously from the tail.
     chain::WriteResponse ignored;
     grpc::ClientContext  ctx;
-    topo.head->stub->Write(&ctx, req, &ignored);
+    target_head->stub->Write(&ctx, req, &ignored);
 
     cout << "[Write] Sent request_id=" << request_id
-         << " key='" << key << "' to head (" << topo.head->endpoint << ")\n";
+         << " key='" << key << "' to head (" << target_head->endpoint << ")\n";
 }
 
 static void do_read(Topology& topo, const string& key) {
-    if (!topo.tail) { cerr << "No tail node in topology.\n"; return; }
+    // Resolve the tail node for this key.
+    // CR / CRAQ: single static tail.
+    // CROWN: find the node whose tail_range contains hash(key).
+    NodeStub* target_tail = nullptr;
+    if (topo.mode == chain::ReplicationMode::CROWN) {
+        target_tail = topo.crown_tail_for(key);
+        if (!target_tail) {
+            cerr << "[Read] No CROWN tail found for key='" << key << "' "
+                 << "(token=" << Topology::hash_key(key) << ")\n";
+            return;
+        }
+    } else {
+        target_tail = topo.tail;
+        if (!target_tail) { cerr << "[Read] No tail node in topology.\n"; return; }
+    }
 
     chain::ReadRequest  req;
     chain::ReadResponse resp;
     grpc::ClientContext ctx;
     req.set_key(key);
 
-    grpc::Status status = topo.tail->stub->Read(&ctx, req, &resp);
-    if (!status.ok()) { cerr << "Read failed: " << status.error_message() << "\n"; return; }
+    grpc::Status status = target_tail->stub->Read(&ctx, req, &resp);
+    if (!status.ok()) { cerr << "[Read] Failed: " << status.error_message() << "\n"; return; }
 
     if (resp.value().empty())
         cout << "[Read] (not found)\n";
     else
         cout << "[Read] key='" << resp.key()
              << "' value='" << resp.value()
-             << "' version=" << resp.version() << "\n";
+             << "' version=" << resp.version()
+             << " (via " << target_tail->endpoint << ")\n";
 }
 
 static void print_help() {
