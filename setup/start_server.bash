@@ -9,14 +9,49 @@ echo "=== Server deploy starting (user: $DEPLOY_USER) ==="
 # ---------------------------
 REPO_URL="${REPO_URL:?REPO_URL is required}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
-REMOTE_BASE_DIR="${REMOTE_BASE_DIR:-$HOME}"
+REMOTE_BASE_DIR="${REMOTE_BASE_DIR:-/home}"
 REPO_NAME="${REPO_NAME:-$(basename "${REPO_URL%.git}")}"
 # Support both standalone CRAQ and main crown implementation
-PROJECT_SUBDIR="${PROJECT_SUBDIR:-crown}"
+PROJECT_SUBDIR="${PROJECT_SUBDIR:-.}"
 PROJECT_MODE="${PROJECT_MODE:-crown}"  # 'crown' for main src, 'craq' for standalone
+
+if [[ ! -d "$REMOTE_BASE_DIR" ]]; then
+  if mkdir -p "$REMOTE_BASE_DIR" 2>/dev/null; then
+    :
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    sudo mkdir -p "$REMOTE_BASE_DIR"
+  else
+    echo "ERROR: cannot create $REMOTE_BASE_DIR. Grant write access or configure passwordless sudo."
+    exit 1
+  fi
+fi
 
 mkdir -p "$REMOTE_BASE_DIR"
 cd "$REMOTE_BASE_DIR"
+
+REPO_DIR="$REMOTE_BASE_DIR/$REPO_NAME"
+if [[ ! -e "$REPO_DIR" && ! -w "$REMOTE_BASE_DIR" ]]; then
+  if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    echo "Preparing shared repo path with sudo: $REPO_DIR"
+    sudo mkdir -p "$REPO_DIR"
+    sudo chown -R "$DEPLOY_USER":"$DEPLOY_USER" "$REPO_DIR"
+  else
+    echo "ERROR: $REMOTE_BASE_DIR is not writable for $DEPLOY_USER."
+    echo "       Configure passwordless sudo or choose a writable REMOTE_BASE_DIR."
+    exit 1
+  fi
+fi
+
+if [[ -e "$REPO_DIR" && ! -w "$REPO_DIR" ]]; then
+  if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    echo "Fixing repo ownership with sudo: $REPO_DIR"
+    sudo chown -R "$DEPLOY_USER":"$DEPLOY_USER" "$REPO_DIR"
+  else
+    echo "ERROR: $REPO_DIR is not writable for $DEPLOY_USER."
+    echo "       Configure passwordless sudo or fix ownership manually."
+    exit 1
+  fi
+fi
 
 if [[ -d "$REPO_NAME/.git" ]]; then
   echo "Repo exists; pulling latest branch: $REPO_BRANCH"
@@ -38,7 +73,9 @@ LEGACY_CRAQ_DIR="$REMOTE_BASE_DIR/$REPO_NAME/craq"
 if [[ -f "$PRIMARY_PROJECT_DIR/CMakeLists.txt" ]]; then
   PROJECT_DIR="$PRIMARY_PROJECT_DIR"
 elif [[ -f "$ROOT_PROJECT_DIR/CMakeLists.txt" ]]; then
-  echo "Warning: $PRIMARY_PROJECT_DIR/CMakeLists.txt not found; falling back to repo root."
+  if [[ "$PROJECT_SUBDIR" != "." ]]; then
+    echo "Warning: $PRIMARY_PROJECT_DIR/CMakeLists.txt not found; falling back to repo root."
+  fi
   PROJECT_DIR="$ROOT_PROJECT_DIR"
 elif [[ "$PROJECT_MODE" == "craq" && -f "$LEGACY_CRAQ_DIR/CMakeLists.txt" ]]; then
   echo "Warning: falling back to legacy CRAQ subdirectory at $LEGACY_CRAQ_DIR"
@@ -99,21 +136,28 @@ fi
 # ---------------------------
 NODE_HOST="${NODE_HOST:-0.0.0.0}"
 NODE_PORT="${NODE_PORT:-5001}"
-RUN_DIR="$PROJECT_DIR/run/$DEPLOY_USER"
+RUN_SCOPE="${RUN_SCOPE:-shared}"
+RUN_DIR="$PROJECT_DIR/run/$RUN_SCOPE"
 mkdir -p "$RUN_DIR"
 PID_FILE="$RUN_DIR/server_${NODE_PORT}.pid"
 LOG_FILE="$RUN_DIR/server_${NODE_PORT}.log"
-SESSION_NAME="${TMUX_SESSION_NAME:-${DEPLOY_USER}_node_${NODE_PORT}}"
+SESSION_NAME="${TMUX_SESSION_NAME:-crown_node_${NODE_PORT}}"
+TMUX_SOCKET="${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}"
+TMUX_SOCKET_DIR="$(dirname "$TMUX_SOCKET")"
+mkdir -p "$TMUX_SOCKET_DIR"
+chmod 1777 "$TMUX_SOCKET_DIR" 2>/dev/null || true
+TMUX_CMD=(tmux -S "$TMUX_SOCKET")
 
-echo "User-specific paths:"
+echo "Shared paths:"
 echo "  run_dir: $RUN_DIR"
 echo "  pid_file: $PID_FILE"
 echo "  log_file: $LOG_FILE"
 echo "  session: $SESSION_NAME"
+echo "  tmux_socket: $TMUX_SOCKET"
 
-if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+if "${TMUX_CMD[@]}" has-session -t "$SESSION_NAME" 2>/dev/null; then
   echo "Stopping existing tmux session: $SESSION_NAME"
-  tmux kill-session -t "$SESSION_NAME" || true
+  "${TMUX_CMD[@]}" kill-session -t "$SESSION_NAME" || true
   sleep 1
 fi
 
@@ -130,17 +174,18 @@ fi
 pkill -u "$DEPLOY_USER" -f "server --host .* --port $NODE_PORT" >/dev/null 2>&1 || true
 
 echo "Starting $NODE_BIN --host $NODE_HOST --port $NODE_PORT"
-tmux new-session -d -s "$SESSION_NAME" "cd '$PROJECT_DIR' && exec '$NODE_BIN' --host '$NODE_HOST' --port '$NODE_PORT'"
-tmux pipe-pane -o -t "$SESSION_NAME:0.0" "cat >> '$LOG_FILE'"
+"${TMUX_CMD[@]}" new-session -d -s "$SESSION_NAME" "cd '$PROJECT_DIR' && exec '$NODE_BIN' --host '$NODE_HOST' --port '$NODE_PORT'"
+chmod 666 "$TMUX_SOCKET" 2>/dev/null || true
+"${TMUX_CMD[@]}" pipe-pane -o -t "$SESSION_NAME:0.0" "cat >> '$LOG_FILE'"
 
-NEW_PID="$(tmux display-message -p -t "$SESSION_NAME:0.0" "#{pane_pid}")"
+NEW_PID="$("${TMUX_CMD[@]}" display-message -p -t "$SESSION_NAME:0.0" "#{pane_pid}")"
 echo "$NEW_PID" > "$PID_FILE"
 
 echo "Server started in tmux session: $SESSION_NAME"
 echo "Server pane pid: $NEW_PID"
 echo "log: $LOG_FILE"
 echo "pid: $PID_FILE"
-echo "attach: tmux attach -t $SESSION_NAME"
+echo "attach: tmux -S $TMUX_SOCKET attach -t $SESSION_NAME"
 
 ## Legacy (old project) behavior retained as comment:
 ## - clone old hydfs-g33 repo

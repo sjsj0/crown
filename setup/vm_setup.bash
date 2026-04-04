@@ -19,9 +19,9 @@ echo "Using SSH_USER: $SSH_USER"
 # Repo settings for remote setup/build. These are intentionally configurable from .env.
 : "${REPO_URL:?Missing REPO_URL in .env}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
-REMOTE_BASE_DIR="${REMOTE_BASE_DIR:-$HOME}"
+REMOTE_BASE_DIR="${REMOTE_BASE_DIR:-/home}"
 REPO_NAME="${REPO_NAME:-$(basename "${REPO_URL%.git}")}"
-PROJECT_SUBDIR="${PROJECT_SUBDIR:-crown}"
+PROJECT_SUBDIR="${PROJECT_SUBDIR:-.}"
 
 # Optional: local key used just to reach the VMs. If you've already run
 # `ssh-copy-id` or have an agent, you can omit this in .env.
@@ -83,6 +83,6 @@ for host in "${hosts[@]}"; do
 
   echo "   -> running $REMOTE_SCRIPT"
   ssh -t "${SSH_OPTS[@]}" "$server" \
-    "SSH_USER='$SSH_USER' REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REMOTE_BASE_DIR='$REMOTE_BASE_DIR' REPO_NAME='$REPO_NAME' PROJECT_SUBDIR='$PROJECT_SUBDIR' PROJECT_MODE='${PROJECT_MODE:-crown}' BUILD_TYPE='${BUILD_TYPE:-Release}' NODE_HOST='${NODE_HOST:-0.0.0.0}' NODE_PORT='${NODE_PORT:-5001}' TMUX_SESSION_NAME='${TMUX_SESSION_NAME:-}' bash '$REMOTE_SCRIPT'"
+    "SSH_USER='$SSH_USER' REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REMOTE_BASE_DIR='$REMOTE_BASE_DIR' REPO_NAME='$REPO_NAME' PROJECT_SUBDIR='$PROJECT_SUBDIR' PROJECT_MODE='${PROJECT_MODE:-crown}' BUILD_TYPE='${BUILD_TYPE:-Release}' NODE_HOST='${NODE_HOST:-0.0.0.0}' NODE_PORT='${NODE_PORT:-5001}' TMUX_SESSION_NAME='${TMUX_SESSION_NAME:-}' TMUX_SOCKET='${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}' RUN_SCOPE='${RUN_SCOPE:-shared}' bash '$REMOTE_SCRIPT'"
 done
 

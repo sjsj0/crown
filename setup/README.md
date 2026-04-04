@@ -48,11 +48,12 @@ Clone/pull repo, build project, start node in tmux.
 - ✅ Supports both `crown` (main src) and `craq` (standalone) project modes
 - ✅ Environment variables for customization:
   - `PROJECT_MODE`: `crown` or `craq`
-  - `PROJECT_SUBDIR`: Path within repo (e.g., `crown` or `crown/craq`)
+  - `PROJECT_SUBDIR`: Path within repo (use `.` for repo root)
   - `NODE_HOST`: Bind address (default: `0.0.0.0`)
   - `NODE_PORT`: Server port (default: `5001`)
-- ✅ User-specific session names: `${SSH_USER}_node_${port}`
-- ✅ User-specific log/pid directories: `${PROJECT_DIR}/run/${SSH_USER}/`
+- ✅ Shared session names: `crown_node_${port}` by default
+- ✅ Shared log/pid directories: `${PROJECT_DIR}/run/shared/`
+- ✅ Shared tmux socket: `/tmp/crown-shared/tmux.sock` (others can attach)
 - ✅ Preflight checks: Validates git, cmake, g++, tmux installed
 - ✅ Checks if process already running; saves pid for later cleanup
 - ✅ Pipe logs to file with `tmux pipe-pane`
@@ -75,14 +76,14 @@ NODE_PORT=5002 ./start_server.bash
 ```
 Server started in tmux session: ${SSH_USER}_node_5001
 Server pane pid: 12345
-log: /path/to/crown/run/${SSH_USER}/server_5001.log
-pid: /path/to/crown/run/${SSH_USER}/server_5001.pid
-attach: tmux attach -t ${SSH_USER}_node_5001
+log: /path/to/crown/run/shared/server_5001.log
+pid: /path/to/crown/run/shared/server_5001.pid
+attach: tmux -S /tmp/crown-shared/tmux.sock attach -t crown_node_5001
 ```
 
 **Attach to running server:**
 ```bash
-tmux attach -t ${SSH_USER}_node_5001
+tmux -S /tmp/crown-shared/tmux.sock attach -t crown_node_5001
 ```
 
 ### 4. `kill.bash` (Process Cleanup)
@@ -90,9 +91,9 @@ Stop all nodes for a given user.
 
 **Changes:**
 - ✅ Uses `SSH_USER` from environment (or current user fallback)
-- ✅ Kills user-scoped tmux sessions (matches `${SSH_USER}_node_*` pattern)
-- ✅ Kills user processes matching `server` (and legacy `craq_node` if present)
-- ✅ Cleans up pid files in user-specific `run/` directories
+- ✅ Kills shared tmux sessions (matches `crown_node_*` pattern)
+- ✅ Kills server processes for the deployment user
+- ✅ Cleans up pid files in shared `run/shared/` directories
 - ✅ Safe: Only kills processes owned by the specified user (uses `pkill -u`)
 - ✅ Works across multiple project modes and locations
 
@@ -108,15 +109,18 @@ Stop all nodes for a given user.
 
 Use the existing `.env` file in this directory and customize it:
 
-For this repository, `PROJECT_SUBDIR` should normally be `crown` because the top-level `CMakeLists.txt` lives at the repository root. The launcher will fall back to the root automatically if `PROJECT_SUBDIR` is wrong.
+For this repository, use `PROJECT_SUBDIR=.` because the top-level `CMakeLists.txt` lives at the repository root.
 
 Edit `.env`:
 ```bash
 SSH_USER=your-username              # Default SSH user
 REPO_URL=https://github.com/.../crown.git
 REPO_BRANCH=master
-PROJECT_SUBDIR=crown                # or crown/craq for standalone
+REMOTE_BASE_DIR=/home
+PROJECT_SUBDIR=.                    # repo root
 PROJECT_MODE=crown                  # or craq
+TMUX_SOCKET=/tmp/crown-shared/tmux.sock
+RUN_SCOPE=shared
 NODE_PORT=5001
 ```
 
@@ -133,10 +137,10 @@ NODE_PORT=5001 ./vm_setup.bash start
 NODE_PORT=5002 ./vm_setup.bash start
 
 # Check running nodes for SSH_USER from .env (example: alice):
-tmux list-sessions | grep "$SSH_USER"
+tmux -S /tmp/crown-shared/tmux.sock list-sessions | grep crown_node_
 
 # Attach to first node (example):
-tmux attach -t ${SSH_USER}_node_5001
+tmux -S /tmp/crown-shared/tmux.sock attach -t crown_node_5001
 
 # Stop all nodes:
 ./kill.bash
@@ -151,8 +155,8 @@ $REMOTE_BASE_DIR/
     ├── src/                      (or crown/craq for standalone mode)
     │   ├── replication/
     │   └── ...
-    └── run/                      (user-specific logs/pids)
-      └── ${SSH_USER}/
+    └── run/                      (shared logs/pids)
+      └── shared/
             ├── server_5001.log
             ├── server_5001.pid
             ├── server_5002.log
@@ -189,13 +193,13 @@ tail -f /remote/path/to/crown/run/username/server_5001.log
 ps aux | grep server
 
 # Manually attach tmux:
-tmux attach -t ${SSH_USER}_node_5001
+tmux -S /tmp/crown-shared/tmux.sock attach -t crown_node_5001
 ```
 
 ### Old pid file prevents restart
 ```bash
 # Manually cleanup:
-rm /path/to/crown/run/${SSH_USER}/server_5001.pid
+rm /path/to/crown/run/shared/server_5001.pid
 
 # Or use kill script:
 ./kill.bash
@@ -225,13 +229,15 @@ cd crown/setup
 | Variable | Default | Example | Purpose |
 |----------|---------|---------|---------|
 | REPO_URL | (required) | github.com/org/crown | Git clone URL |
-| REPO_BRANCH | main | develop | Git branch to deploy |
+| REPO_BRANCH | master | develop | Git branch to deploy |
 | REPO_NAME | crown | crown | Directory name after clone |
-| REMOTE_BASE_DIR | $HOME | /opt/research | Where to clone repo on VM |
-| PROJECT_SUBDIR | crown | crown/craq | Subdir within repo to build |
+| REMOTE_BASE_DIR | /home | /home | Shared base directory on VM |
+| PROJECT_SUBDIR | . | . | Subdir within repo to build (repo root) |
 | PROJECT_MODE | crown | craq | crown or craq (affects binary name) |
 | BUILD_TYPE | Release | Debug | CMake build type |
 | NODE_HOST | 0.0.0.0 | 127.0.0.1 | Bind address |
 | NODE_PORT | 5001 | 5002 | Server port |
-| TMUX_SESSION_NAME | (auto) | my_session | Custom tmux session name |
+| TMUX_SESSION_NAME | crown_node_${NODE_PORT} | crown_node_5001 | Shared tmux session name |
+| TMUX_SOCKET | /tmp/crown-shared/tmux.sock | /tmp/crown-shared/tmux.sock | Shared tmux socket path |
+| RUN_SCOPE | shared | shared | Run directory scope under run/ |
 | SSH_USER | (required) | alice | SSH user for all VMs |
