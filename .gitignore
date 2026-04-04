@@ -1,7 +1,7 @@
 # Prerequisites
 *.d
 *.env
-cheatsheet.txt
+cs525_cheatsheet.txt
 
 # Compiled Object files
 *.slo

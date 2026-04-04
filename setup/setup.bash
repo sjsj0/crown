@@ -27,7 +27,7 @@ if command -v apt-get >/dev/null 2>&1; then
     echo "ERROR: cannot run apt-get update as root."
     exit 1
   fi
-  if ! run_as_root apt-get install -y git cmake make g++ rsync openssh-client wget vim tmux; then
+  if ! run_as_root apt-get install -y git cmake make g++ rsync openssh-client wget vim tmux libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc; then
     echo "ERROR: cannot run apt-get install as root."
     exit 1
   fi
@@ -35,7 +35,7 @@ elif command -v dnf >/dev/null 2>&1; then
   if command -v sudo >/dev/null 2>&1 && [[ "$(id -u)" -ne 0 ]]; then
     sudo -v
   fi
-  if ! run_as_root dnf install -y git cmake make gcc-c++ rsync openssh-clients wget vim tmux; then
+  if ! run_as_root dnf install -y git cmake make gcc-c++ rsync openssh-clients wget vim tmux grpc-devel protobuf-devel protobuf-compiler; then
     echo "ERROR: cannot run dnf install as root."
     exit 1
   fi

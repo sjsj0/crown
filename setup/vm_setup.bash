@@ -21,7 +21,7 @@ echo "Using SSH_USER: $SSH_USER"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 REMOTE_BASE_DIR="${REMOTE_BASE_DIR:-$HOME}"
 REPO_NAME="${REPO_NAME:-$(basename "${REPO_URL%.git}")}"
-PROJECT_SUBDIR="${PROJECT_SUBDIR:-crown/craq}"
+PROJECT_SUBDIR="${PROJECT_SUBDIR:-crown}"
 
 # Optional: local key used just to reach the VMs. If you've already run
 # `ssh-copy-id` or have an agent, you can omit this in .env.

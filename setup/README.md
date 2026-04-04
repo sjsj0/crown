@@ -30,6 +30,7 @@ One-time setup of system dependencies on each VM.
   - Build tools: `git`, `cmake`, `make`, `g++`
   - Communication: `openssh-client`, `wget`
   - Deployment: `rsync`, `tmux`
+  - gRPC/protobuf: `libgrpc++-dev`, `libprotobuf-dev`, `protobuf-compiler`, `protobuf-compiler-grpc` on Debian/Ubuntu; `grpc-devel`, `protobuf-devel`, `protobuf-compiler` on Fedora/RHEL
 - ✅ Uses `sudo` when elevated privileges are needed
 
 **Usage:**
