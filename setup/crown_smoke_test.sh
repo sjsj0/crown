@@ -109,64 +109,59 @@ cfg = json.load(open(sys.argv[1], 'r', encoding='utf-8'))
 nodes = cfg['nodes']
 
 if len(nodes) == 0:
-    raise SystemExit('no nodes in generated config')
+  raise SystemExit('no nodes in generated config')
 
+n = len(nodes)
+by_id = {}
+for node in nodes:
+  node_id = int(node['id'])
+  if node_id < 0 or node_id >= n:
+    raise SystemExit(f'invalid id {node_id}; expected [0,{n - 1}]')
+  if node_id in by_id:
+    raise SystemExit(f'duplicate id {node_id}')
+  by_id[node_id] = node
 
-def parse_token(text: str) -> int:
-    return int(text, 16) if text.lower().startswith('0x') else int(text)
-
-
-def token_in_range(token: int, start: int, end: int) -> bool:
-    if start <= end:
-        return start <= token <= end
-    return token >= start or token <= end
+for expected in range(n):
+  if expected not in by_id:
+    raise SystemExit(f'missing id {expected}')
 
 
 def fnv1a64(key: str) -> int:
-    h = 14695981039346656037
-    for b in key.encode('utf-8'):
-        h ^= b
-        h = (h * 1099511628211) & ((1 << 64) - 1)
-    return h
+  h = 14695981039346656037
+  for b in key.encode('utf-8'):
+    h ^= b
+    h = (h * 1099511628211) & ((1 << 64) - 1)
+  return h
 
 
-head_ranges = []
-for i, node in enumerate(nodes):
-    for r in node.get('head_ranges', []):
-        head_ranges.append((i, parse_token(r['start']), parse_token(r['end'])))
-
-
-def head_owner(key: str):
-    token = fnv1a64(key)
-    hits = [idx for idx, s, e in head_ranges if token_in_range(token, s, e)]
-    if len(hits) != 1:
-        return None
-    return hits[0]
+def head_owner(key: str) -> int:
+  return fnv1a64(key) % n
 
 
 keys = {}
-remaining = set(range(len(nodes)))
+remaining = set(range(n))
 probe = 0
 while remaining and probe < 2_000_000:
-    k = f'smoke-key-{probe}'
-    owner = head_owner(k)
-    if owner is not None and owner in remaining:
-        keys[owner] = k
-        remaining.remove(owner)
-    probe += 1
+  k = f'smoke-key-{probe}'
+  owner = head_owner(k)
+  if owner in remaining:
+    keys[owner] = k
+    remaining.remove(owner)
+  probe += 1
 
 if remaining:
-    raise SystemExit(f'failed to discover keys for head indexes: {sorted(remaining)}')
+  raise SystemExit(f'failed to discover keys for head indexes: {sorted(remaining)}')
 
-print(f"NODE_COUNT={len(nodes)}")
-for i, node in enumerate(nodes):
-    endpoint = f"{node['host']}:{node['port']}"
-    pred = node['predecessor']
-    print(f"HEAD_ENDPOINT_{i}={shlex.quote(endpoint)}")
-    print(f"TAIL_ENDPOINT_{i}={shlex.quote(pred)}")
-    print(f"KEY_HEAD_{i}={shlex.quote(keys[i])}")
+print(f"NODE_COUNT={n}")
+for i in range(n):
+  node = by_id[i]
+  endpoint = f"{node['host']}:{node['port']}"
+  pred = node['predecessor']
+  print(f"HEAD_ENDPOINT_{i}={shlex.quote(endpoint)}")
+  print(f"TAIL_ENDPOINT_{i}={shlex.quote(pred)}")
+  print(f"KEY_HEAD_{i}={shlex.quote(keys[i])}")
 
-print(f"WRAP_KEY={shlex.quote(keys[len(nodes)-1])}")
+print(f"WRAP_KEY={shlex.quote(keys[n - 1])}")
 PY
 )"
 
@@ -181,15 +176,14 @@ cfg = json.load(open(src, 'r', encoding='utf-8'))
 nodes = cfg['nodes']
 n = len(nodes)
 
-head_ranges = [copy.deepcopy(node.get('head_ranges', [])) for node in nodes]
-tail_ranges = [copy.deepcopy(node.get('tail_ranges', [])) for node in nodes]
-
 cfg_wrong_head = copy.deepcopy(cfg)
 cfg_wrong_tail = copy.deepcopy(cfg)
 
-for i in range(n):
-    cfg_wrong_head['nodes'][i]['head_ranges'] = copy.deepcopy(head_ranges[(i + 1) % n])
-    cfg_wrong_tail['nodes'][i]['tail_ranges'] = copy.deepcopy(tail_ranges[(i + 1) % n])
+for node in cfg_wrong_head['nodes']:
+    node['id'] = (int(node['id']) + 1) % n
+
+for node in cfg_wrong_tail['nodes']:
+    node['id'] = (int(node['id']) - 1 + n) % n
 
 with open(out_head, 'w', encoding='utf-8') as f:
     json.dump(cfg_wrong_head, f, indent=2)
@@ -220,7 +214,7 @@ for pid in "${SERVER_PIDS[@]}"; do
 done
 
 echo "[crown-smoke] Pushing generated topology..."
-"$BUILD_DIR/client" "$CONFIG" >/dev/null
+printf 'quit\n' | "$BUILD_DIR/client" "$CONFIG" >/dev/null
 
 # 1) Same key always uses same head and tail.
 echo "[crown-smoke] Verifying stable head/tail routing for one key..."

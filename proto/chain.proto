@@ -23,8 +23,8 @@ message NodeAddress {
 }
 
 message KeyRange {
-    // For CROWN mode these are token bounds (uint64 encoded as text), not
-    // raw lexicographic key bounds.
+    // Legacy compatibility field.
+    // Modulo-based CROWN routing no longer uses explicit token ranges.
     string start_key = 1;
     string end_key   = 2;
 }
@@ -43,7 +43,9 @@ message NodeConfig {
     optional NodeAddress predecessor = 6;  // absent = no predecessor (head)
     optional NodeAddress successor   = 7;  // absent = no successor (tail)
 
-    // CROWN mode only: token/hash ring ranges owned as head/tail.
+    // Legacy compatibility fields.
+    // The current CROWN implementation computes ownership via hash(key) % N.
+    // Client populates head_ranges with N placeholders so servers can infer N.
     repeated KeyRange head_ranges = 8;
     repeated KeyRange tail_ranges = 9;
 }

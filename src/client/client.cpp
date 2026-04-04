@@ -19,7 +19,6 @@
 
 #include <iostream>
 #include <fstream>
-#include <limits>
 #include <string>
 #include <stdexcept>
 #include <sstream>
@@ -135,12 +134,19 @@ static chain::NodeAddress parse_addr(const string& s) {
 }
 
 static chain::NodeConfig build_node_config(const json& node_json,
-                                            chain::ReplicationMode mode) {
+                                            chain::ReplicationMode mode,
+                                            int crown_node_count) {
     chain::NodeConfig cfg;
     cfg.set_node_id(node_json.at("id").get<int>());
     cfg.set_mode(mode);
     cfg.set_is_head(node_json.value("is_head", false));
     cfg.set_is_tail(node_json.value("is_tail", false));
+    if (mode == chain::ReplicationMode::CROWN) {
+        // Keep wire compatibility: use head_ranges count to carry ring size.
+        for (int i = 0; i < crown_node_count; ++i) {
+            (void)cfg.add_head_ranges();
+        }
+    }
 
     string host = node_json.at("host").get<string>();
     int    port = node_json.at("port").get<int>();
@@ -153,19 +159,6 @@ static chain::NodeConfig build_node_config(const json& node_json,
         *cfg.mutable_predecessor() = parse_addr(node_json["predecessor"].get<string>());
     if (!node_json["successor"].is_null())
         *cfg.mutable_successor()   = parse_addr(node_json["successor"].get<string>());
-
-    if (node_json.contains("head_ranges"))
-        for (const auto& r : node_json["head_ranges"]) {
-            auto* kr = cfg.add_head_ranges();
-            kr->set_start_key(r.at("start").get<string>());
-            kr->set_end_key(r.at("end").get<string>());
-        }
-    if (node_json.contains("tail_ranges"))
-        for (const auto& r : node_json["tail_ranges"]) {
-            auto* kr = cfg.add_tail_ranges();
-            kr->set_start_key(r.at("start").get<string>());
-            kr->set_end_key(r.at("end").get<string>());
-        }
     return cfg;
 }
 
@@ -173,52 +166,10 @@ static chain::NodeConfig build_node_config(const json& node_json,
 // Validation
 // ============================================================
 
-struct TokenRange {
-    uint64_t start = 0, end = 0;
-    string start_text, end_text;
-};
-
 struct CrownNodeView {
     int id = 0;
     string endpoint, predecessor, successor;
-    vector<TokenRange> head_ranges, tail_ranges;
 };
-
-static bool parse_token_text(const string& text, uint64_t& out) {
-    if (text.empty()) return false;
-    try {
-        size_t consumed = 0;
-        int base = (text.size() > 2 && text[0] == '0' && (text[1]=='x'||text[1]=='X')) ? 16 : 10;
-        out = static_cast<uint64_t>(stoull(text, &consumed, base));
-        return consumed == text.size();
-    } catch (...) { return false; }
-}
-
-static string range_key(const TokenRange& r) { return to_string(r.start) + ":" + to_string(r.end); }
-static string range_text(const TokenRange& r) { return "[" + r.start_text + "," + r.end_text + "]"; }
-
-static vector<pair<uint64_t,uint64_t>> to_non_wrapped_segments(const TokenRange& r) {
-    if (r.start <= r.end) return {{r.start, r.end}};
-    return {{0, r.end}, {r.start, numeric_limits<uint64_t>::max()}};
-}
-
-static bool ranges_overlap(const TokenRange& a, const TokenRange& b) {
-    for (const auto& as : to_non_wrapped_segments(a))
-        for (const auto& bs : to_non_wrapped_segments(b))
-            if (as.first <= bs.second && bs.first <= as.second) return true;
-    return false;
-}
-
-static bool parse_token_range(const json& j, const string& where, TokenRange& out, string& err) {
-    if (!j.contains("start") || !j.contains("end")) { err = where + " needs start/end"; return false; }
-    try {
-        out.start_text = j.at("start").get<string>();
-        out.end_text   = j.at("end").get<string>();
-    } catch (const exception& ex) { err = where + ": " + ex.what(); return false; }
-    if (!parse_token_text(out.start_text, out.start)) { err = where + " bad start"; return false; }
-    if (!parse_token_text(out.end_text,   out.end))   { err = where + " bad end";   return false; }
-    return true;
-}
 
 static bool validate_minimal_config(const json& nodes, string& error) {
     if (!nodes.is_array() || nodes.empty()) { error = "'nodes' must be a non-empty array"; return false; }
@@ -243,30 +194,41 @@ static bool validate_minimal_config(const json& nodes, string& error) {
 static bool validate_crown_topology(const json& nodes, string& error) {
     vector<CrownNodeView> parsed;
     unordered_map<string, size_t> by_endpoint;
+    unordered_map<int, size_t> by_id;
 
     for (size_t i = 0; i < nodes.size(); ++i) {
         const auto& n = nodes[i];
         CrownNodeView v;
         v.id       = n.at("id").get<int>();
         v.endpoint = n.at("host").get<string>() + ":" + to_string(n.at("port").get<int>());
+
+        if (by_endpoint.count(v.endpoint)) {
+            error = "duplicate endpoint in CROWN config: " + v.endpoint;
+            return false;
+        }
+        if (by_id.count(v.id)) {
+            error = "duplicate CROWN node id: " + to_string(v.id);
+            return false;
+        }
+
         if (n["predecessor"].is_null() || n["successor"].is_null()) {
             error = "CROWN node " + v.endpoint + " must have both predecessor and successor";
             return false;
         }
         v.predecessor = n.at("predecessor").get<string>();
         v.successor   = n.at("successor").get<string>();
-        for (size_t r = 0; r < n.value("head_ranges", json::array()).size(); ++r) {
-            TokenRange tr;
-            if (!parse_token_range(n.at("head_ranges")[r], "head_ranges[" + to_string(r) + "]", tr, error)) return false;
-            v.head_ranges.push_back(tr);
-        }
-        for (size_t r = 0; r < n.value("tail_ranges", json::array()).size(); ++r) {
-            TokenRange tr;
-            if (!parse_token_range(n.at("tail_ranges")[r], "tail_ranges[" + to_string(r) + "]", tr, error)) return false;
-            v.tail_ranges.push_back(tr);
-        }
+
         by_endpoint[v.endpoint] = parsed.size();
+        by_id[v.id] = parsed.size();
         parsed.push_back(std::move(v));
+    }
+
+    for (size_t expected = 0; expected < parsed.size(); ++expected) {
+        if (!by_id.count(static_cast<int>(expected))) {
+            error = "CROWN node ids must be contiguous in [0, "
+                  + to_string(parsed.size() - 1) + "]";
+            return false;
+        }
     }
 
     for (const auto& n : parsed) {
@@ -287,36 +249,6 @@ static bool validate_crown_topology(const json& nodes, string& error) {
     }
     if (current != parsed.front().endpoint || visited.size() != parsed.size()) {
         error = "ring does not close or is disconnected"; return false;
-    }
-
-    struct OwnedRange { TokenRange range; string owner; };
-    vector<OwnedRange> all_heads, all_tails;
-    for (const auto& n : parsed) {
-        for (const auto& r : n.head_ranges) all_heads.push_back({r, n.endpoint});
-        for (const auto& r : n.tail_ranges) all_tails.push_back({r, n.endpoint});
-    }
-    if (all_heads.empty()) { error = "CROWN needs at least one head range"; return false; }
-    if (all_tails.empty()) { error = "CROWN needs at least one tail range"; return false; }
-
-    for (size_t i = 0; i < all_heads.size(); ++i)
-        for (size_t j = i+1; j < all_heads.size(); ++j)
-            if (ranges_overlap(all_heads[i].range, all_heads[j].range)) {
-                error = "head range overlap: " + all_heads[i].owner + " and " + all_heads[j].owner; return false;
-            }
-    for (size_t i = 0; i < all_tails.size(); ++i)
-        for (size_t j = i+1; j < all_tails.size(); ++j)
-            if (ranges_overlap(all_tails[i].range, all_tails[j].range)) {
-                error = "tail range overlap: " + all_tails[i].owner + " and " + all_tails[j].owner; return false;
-            }
-
-    unordered_map<string,int> hc, tc;
-    unordered_set<string> all_keys;
-    for (const auto& o : all_heads) { ++hc[range_key(o.range)]; all_keys.insert(range_key(o.range)); }
-    for (const auto& o : all_tails) { ++tc[range_key(o.range)]; all_keys.insert(range_key(o.range)); }
-    for (const auto& k : all_keys) {
-        if ((hc.count(k) ? hc[k] : 0) != 1 || (tc.count(k) ? tc[k] : 0) != 1) {
-            error = "token range " + k + " must have exactly one head and one tail"; return false;
-        }
     }
     return true;
 }
@@ -339,11 +271,6 @@ struct NodeStub {
     string                             endpoint;
     shared_ptr<grpc::Channel>          channel;
     unique_ptr<chain::ChainNode::Stub> stub;
-
-    // CROWN only — token ranges this node owns as head / tail.
-    // Empty for chain / craq nodes.
-    vector<TokenRange> head_ranges;
-    vector<TokenRange> tail_ranges;
 };
 
 struct Topology {
@@ -357,8 +284,10 @@ struct Topology {
     // so the vector must not be resized after build.
     vector<NodeStub> nodes;
 
-    // CROWN: hash a key to a uint64 token using FNV-1a, then find the
-    // node whose head_range or tail_range contains that token.
+    // CROWN only: index -> node by node id.
+    vector<NodeStub*> crown_nodes_by_index;
+
+    // CROWN: hash key to uint64 and select owner via modulo.
     static uint64_t hash_key(const string& key) {
         uint64_t h = 14695981039346656037ULL;
         for (unsigned char c : key) {
@@ -368,30 +297,19 @@ struct Topology {
         return h;
     }
 
-    // Returns true if token falls inside range, supporting wrap-around.
-    static bool token_in_range(uint64_t token, const TokenRange& r) {
-        if (r.start <= r.end)
-            return token >= r.start && token <= r.end;
-        // Wrapped range (e.g. start=0xE000... end=0x1FFF...):
-        return token >= r.start || token <= r.end;
-    }
-
     // Find the node that owns `key` as head (for writes) in CROWN mode.
     NodeStub* crown_head_for(const string& key) {
-        uint64_t token = hash_key(key);
-        for (auto& ns : nodes)
-            for (const auto& r : ns.head_ranges)
-                if (token_in_range(token, r)) return &ns;
-        return nullptr;
+        if (crown_nodes_by_index.empty()) return nullptr;
+        const size_t head_index = static_cast<size_t>(hash_key(key) % crown_nodes_by_index.size());
+        return crown_nodes_by_index[head_index];
     }
 
     // Find the node that owns `key` as tail (for reads) in CROWN mode.
     NodeStub* crown_tail_for(const string& key) {
-        uint64_t token = hash_key(key);
-        for (auto& ns : nodes)
-            for (const auto& r : ns.tail_ranges)
-                if (token_in_range(token, r)) return &ns;
-        return nullptr;
+        if (crown_nodes_by_index.empty()) return nullptr;
+        const size_t head_index = static_cast<size_t>(hash_key(key) % crown_nodes_by_index.size());
+        const size_t tail_index = (head_index + crown_nodes_by_index.size() - 1) % crown_nodes_by_index.size();
+        return crown_nodes_by_index[tail_index];
     }
 };
 
@@ -405,25 +323,6 @@ static Topology build_topology(const json& config, chain::ReplicationMode mode) 
         ns.endpoint = n.at("host").get<string>() + ":" + to_string(n.at("port").get<int>());
         ns.channel  = grpc::CreateChannel(ns.endpoint, grpc::InsecureChannelCredentials());
         ns.stub     = chain::ChainNode::NewStub(ns.channel);
-
-        // Parse CROWN token ranges if present.
-        if (n.contains("head_ranges")) {
-            for (const auto& r : n["head_ranges"]) {
-                TokenRange tr;
-                string err;
-                if (parse_token_range(r, "head_ranges", tr, err))
-                    ns.head_ranges.push_back(tr);
-            }
-        }
-        if (n.contains("tail_ranges")) {
-            for (const auto& r : n["tail_ranges"]) {
-                TokenRange tr;
-                string err;
-                if (parse_token_range(r, "tail_ranges", tr, err))
-                    ns.tail_ranges.push_back(tr);
-            }
-        }
-
         topo.nodes.push_back(std::move(ns));
     }
 
@@ -432,6 +331,20 @@ static Topology build_topology(const json& config, chain::ReplicationMode mode) 
     for (size_t i = 0; i < jnodes.size(); ++i) {
         if (jnodes[i].value("is_head", false)) topo.head = &topo.nodes[i];
         if (jnodes[i].value("is_tail", false)) topo.tail = &topo.nodes[i];
+    }
+
+    if (mode == chain::ReplicationMode::CROWN) {
+        topo.crown_nodes_by_index.assign(jnodes.size(), nullptr);
+        for (size_t i = 0; i < jnodes.size(); ++i) {
+            const int id = jnodes[i].at("id").get<int>();
+            if (id < 0 || id >= static_cast<int>(jnodes.size())) {
+                throw invalid_argument("CROWN node id out of range while building topology");
+            }
+            if (topo.crown_nodes_by_index[id] != nullptr) {
+                throw invalid_argument("duplicate CROWN node id while building topology");
+            }
+            topo.crown_nodes_by_index[id] = &topo.nodes[i];
+        }
     }
 
     return topo;
@@ -445,8 +358,8 @@ static Topology build_topology(const json& config, chain::ReplicationMode mode) 
 static void do_write(Topology& topo, const string& key, const string& value,
                      const string& client_addr) {
     // Resolve the head node for this key.
-    // CR / CRAQ: single static head.
-    // CROWN: find the node whose head_range contains hash(key).
+    // CHAIN / CRAQ: single static head.
+    // CROWN: head index = hash(key) % node_count.
     NodeStub* target_head = nullptr;
     if (topo.mode == chain::ReplicationMode::CROWN) {
         target_head = topo.crown_head_for(key);
@@ -480,8 +393,8 @@ static void do_write(Topology& topo, const string& key, const string& value,
 
 static void do_read(Topology& topo, const string& key) {
     // Resolve the tail node for this key.
-    // CR / CRAQ: single static tail.
-    // CROWN: find the node whose tail_range contains hash(key).
+    // CHAIN / CRAQ: single static tail.
+    // CROWN: tail index = (head index - 1 + node_count) % node_count.
     NodeStub* target_tail = nullptr;
     if (topo.mode == chain::ReplicationMode::CROWN) {
         target_tail = topo.crown_tail_for(key);
@@ -594,6 +507,9 @@ int main(int argc, char** argv) {
     catch (const json::exception& ex) { cerr << "JSON parse error: " << ex.what() << "\n"; return 1; }
 
     chain::ReplicationMode mode = parse_mode(config.at("mode").get<string>());
+    const int crown_node_count = (mode == chain::ReplicationMode::CROWN)
+        ? static_cast<int>(config.at("nodes").size())
+        : 0;
 
     string validation_error;
     if (!validate_config_before_configure(config, mode, validation_error)) {
@@ -606,7 +522,7 @@ int main(int argc, char** argv) {
     for (const auto& node_json : config.at("nodes")) {
         string target = node_json.at("host").get<string>() + ":"
                       + to_string(node_json.at("port").get<int>());
-        chain::NodeConfig cfg = build_node_config(node_json, mode);
+        chain::NodeConfig cfg = build_node_config(node_json, mode, crown_node_count);
         auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
         auto stub    = chain::ChainNode::NewStub(channel);
 

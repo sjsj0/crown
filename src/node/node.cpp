@@ -30,6 +30,10 @@ const string& Node::id() const {
     return config_.node_id;
 }
 
+int Node::node_index() const {
+    return config_.node_index;
+}
+
 const NodeAddress& Node::self_addr() const {
     return config_.self_addr;
 }
@@ -55,26 +59,30 @@ const optional<NodeAddress>& Node::successor() const {
 }
 
 bool Node::is_head_for(const string& key) const {
-    return matches_token_ranges(key, config_.head_ranges);
+    if (config_.mode != ReplicationMode::CROWN) {
+        return config_.is_head;
+    }
+    if (config_.crown_node_count <= 0 || config_.node_index < 0 ||
+        config_.node_index >= config_.crown_node_count) {
+        return false;
+    }
+
+    const uint64_t token = crown::token::fnv1a64(key);
+    const int head_index = static_cast<int>(token % static_cast<uint64_t>(config_.crown_node_count));
+    return config_.node_index == head_index;
 }
 
 bool Node::is_tail_for(const string& key) const {
-    return matches_token_ranges(key, config_.tail_ranges);
-}
-
-bool Node::matches_token_ranges(const string& key,
-                                const vector<KeyRange>& ranges) const {
-    const uint64_t token = crown::token::fnv1a64(key);
-    for (const auto& r : ranges) {
-        uint64_t start = 0;
-        uint64_t end = 0;
-        if (!crown::token::parse_token(r.start_key, start) ||
-            !crown::token::parse_token(r.end_key, end)) {
-            continue;
-        }
-        if (crown::token::token_in_range(token, start, end)) {
-            return true;
-        }
+    if (config_.mode != ReplicationMode::CROWN) {
+        return config_.is_tail;
     }
-    return false;
+    if (config_.crown_node_count <= 0 || config_.node_index < 0 ||
+        config_.node_index >= config_.crown_node_count) {
+        return false;
+    }
+
+    const uint64_t token = crown::token::fnv1a64(key);
+    const int head_index = static_cast<int>(token % static_cast<uint64_t>(config_.crown_node_count));
+    const int tail_index = (head_index + config_.crown_node_count - 1) % config_.crown_node_count;
+    return config_.node_index == tail_index;
 }

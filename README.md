@@ -3,7 +3,7 @@
 A C++ implementation of three chain replication variants:
 - **Chain Replication** — classic head/tail linear chain
 - **CRAQ** (Chain Replication with Apportioned Queries) — reads from any node with version consistency
-- **CROWN** — circular topology where each node acts as head/tail based on hashed key-token partitioning
+- **CROWN** — circular topology where key ownership is computed by `hash(key) % node_count`
 
 Inter-node communication uses gRPC and Protocol Buffers. Topology config is pushed to nodes at runtime by a client — nodes themselves are config-agnostic at startup.
 
@@ -85,7 +85,7 @@ The client loops through every node in the config file and sends each one its `N
 
 ### Generate a CROWN ring config automatically
 
-Use the helper script to generate a valid closed CROWN ring config with evenly partitioned token ranges:
+Use the helper script to generate a valid closed CROWN ring config:
 
 ```bash
 python3 setup/generate_crown_config.py <node_count> <base_port> --output config.crown.sample.json
@@ -118,7 +118,7 @@ Read:
 Routing rules used by `kv_client`:
 
 - CHAIN: writes -> global head, reads -> global tail.
-- CROWN: writes -> node whose `head_ranges` owns `hash(key)`, reads -> node whose `tail_ranges` owns `hash(key)`.
+- CROWN: `head_index = hash(key) % N`; writes -> node with `id=head_index`; reads -> predecessor of that head.
 - CRAQ: currently writes -> head, reads -> tail (temporary baseline).
 
 The client prints the contacted node endpoint and returned version.
@@ -198,20 +198,12 @@ What it checks:
 
 `mode` can be `"chain"`, `"craq"`, or `"crown"`.
 
-For crown mode, each node entry also accepts `head_ranges` and `tail_ranges`.
-These are token ranges on a deterministic 64-bit key-hash ring (not literal key strings):
-```json
-"head_ranges": [{ "start": "0", "end": "6148914691236517205" }],
-"tail_ranges": [{ "start": "12297829382473034411", "end": "18446744073709551615" }]
-```
-
-Range bounds are inclusive. Wrapped ranges are allowed by setting `start > end`
-(for example, `{"start":"17000000000000000000","end":"1000000000000000000"}`).
-
 CROWN mapping in this repo:
 
-- `head(key)` = node whose `head_ranges` owns `hash(key)`.
-- `tail(key)` = predecessor(`head(key)`).
+- `head_index(key) = fnv1a64(key) % N`, where `N = number of crown nodes`.
+- `head(key)` = node with `id == head_index(key)`.
+- `tail(key)` = predecessor(`head(key)`) in the configured ring.
+- CROWN node ids must be unique and contiguous in `[0, N-1]`.
 
 Valid CROWN sample (`config.crown.sample.json`):
 
@@ -226,13 +218,7 @@ Valid CROWN sample (`config.crown.sample.json`):
       "is_head": false,
       "is_tail": false,
       "predecessor": "127.0.0.1:50053",
-      "successor": "127.0.0.1:50052",
-      "head_ranges": [
-        { "start": "0", "end": "6148914691236517205" }
-      ],
-      "tail_ranges": [
-        { "start": "6148914691236517206", "end": "12297829382473034410" }
-      ]
+      "successor": "127.0.0.1:50052"
     },
     {
       "id": 1,
@@ -241,13 +227,7 @@ Valid CROWN sample (`config.crown.sample.json`):
       "is_head": false,
       "is_tail": false,
       "predecessor": "127.0.0.1:50051",
-      "successor": "127.0.0.1:50053",
-      "head_ranges": [
-        { "start": "6148914691236517206", "end": "12297829382473034410" }
-      ],
-      "tail_ranges": [
-        { "start": "12297829382473034411", "end": "18446744073709551615" }
-      ]
+      "successor": "127.0.0.1:50053"
     },
     {
       "id": 2,
@@ -256,13 +236,7 @@ Valid CROWN sample (`config.crown.sample.json`):
       "is_head": false,
       "is_tail": false,
       "predecessor": "127.0.0.1:50052",
-      "successor": "127.0.0.1:50051",
-      "head_ranges": [
-        { "start": "12297829382473034411", "end": "18446744073709551615" }
-      ],
-      "tail_ranges": [
-        { "start": "0", "end": "6148914691236517205" }
-      ]
+      "successor": "127.0.0.1:50051"
     }
   ]
 }

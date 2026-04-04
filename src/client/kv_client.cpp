@@ -19,19 +19,12 @@ enum class Mode {
     CROWN
 };
 
-struct TokenRange {
-    uint64_t start = 0;
-    uint64_t end = 0;
-};
-
 struct NodeInfo {
     int id = 0;
     string host;
     int port = 0;
     bool is_head = false;
     bool is_tail = false;
-    vector<TokenRange> head_ranges;
-    vector<TokenRange> tail_ranges;
 
     string endpoint() const {
         return host + ":" + to_string(port);
@@ -54,38 +47,7 @@ static Mode parse_mode(const string& s) {
     throw invalid_argument("Unknown mode in config: " + s);
 }
 
-static bool parse_token_range(const json& range_json,
-                              TokenRange& out,
-                              string& error) {
-    if (!range_json.contains("start") || !range_json.contains("end")) {
-        error = "range must contain 'start' and 'end'";
-        return false;
-    }
-
-    string start_text;
-    string end_text;
-    try {
-        start_text = range_json.at("start").get<string>();
-        end_text = range_json.at("end").get<string>();
-    } catch (const exception& ex) {
-        error = string("invalid range start/end values: ") + ex.what();
-        return false;
-    }
-
-    if (!crown::token::parse_token(start_text, out.start)) {
-        error = "invalid range start token: '" + start_text + "'";
-        return false;
-    }
-    if (!crown::token::parse_token(end_text, out.end)) {
-        error = "invalid range end token: '" + end_text + "'";
-        return false;
-    }
-
-    return true;
-}
-
 static bool parse_nodes(const json& nodes_json,
-                        Mode mode,
                         vector<NodeInfo>& nodes,
                         string& error) {
     if (!nodes_json.is_array() || nodes_json.empty()) {
@@ -109,30 +71,6 @@ static bool parse_nodes(const json& nodes_json,
         } catch (const exception& ex) {
             error = "invalid node at index " + to_string(i) + ": " + ex.what();
             return false;
-        }
-
-        if (mode == Mode::CROWN) {
-            if (n.contains("head_ranges") && n.at("head_ranges").is_array()) {
-                for (const auto& r : n.at("head_ranges")) {
-                    TokenRange tr;
-                    if (!parse_token_range(r, tr, error)) {
-                        error = "invalid head_ranges on node " + node.endpoint() + ": " + error;
-                        return false;
-                    }
-                    node.head_ranges.push_back(tr);
-                }
-            }
-
-            if (n.contains("tail_ranges") && n.at("tail_ranges").is_array()) {
-                for (const auto& r : n.at("tail_ranges")) {
-                    TokenRange tr;
-                    if (!parse_token_range(r, tr, error)) {
-                        error = "invalid tail_ranges on node " + node.endpoint() + ": " + error;
-                        return false;
-                    }
-                    node.tail_ranges.push_back(tr);
-                }
-            }
         }
 
         nodes.push_back(std::move(node));
@@ -165,35 +103,25 @@ static const NodeInfo* find_global_role(const vector<NodeInfo>& nodes,
     return selected;
 }
 
-static const NodeInfo* find_crown_owner(const vector<NodeInfo>& nodes,
-                                        uint64_t token,
-                                        bool use_head_ranges,
-                                        const string& key,
-                                        string& error) {
-    const NodeInfo* selected = nullptr;
+static bool build_crown_by_id(const vector<NodeInfo>& nodes,
+                              vector<const NodeInfo*>& by_id,
+                              string& error) {
+    by_id.assign(nodes.size(), nullptr);
 
     for (const auto& n : nodes) {
-        const auto& ranges = use_head_ranges ? n.head_ranges : n.tail_ranges;
-        for (const auto& r : ranges) {
-            if (crown::token::token_in_range(token, r.start, r.end)) {
-                if (selected != nullptr) {
-                    const string kind = use_head_ranges ? "head" : "tail";
-                    error = "multiple CROWN " + kind + " owners for key '" + key + "' token=" + to_string(token)
-                            + " (" + selected->endpoint() + ", " + n.endpoint() + ")";
-                    return nullptr;
-                }
-                selected = &n;
-            }
+        if (n.id < 0 || n.id >= static_cast<int>(nodes.size())) {
+            error = "CROWN node id out of range [0," + to_string(nodes.size() - 1)
+                  + "]: id=" + to_string(n.id);
+            return false;
         }
+        if (by_id[n.id] != nullptr) {
+            error = "duplicate CROWN node id: " + to_string(n.id);
+            return false;
+        }
+        by_id[n.id] = &n;
     }
 
-    if (selected == nullptr) {
-        const string kind = use_head_ranges ? "head" : "tail";
-        error = "no CROWN " + kind + " owner for key '" + key + "' token=" + to_string(token);
-        return nullptr;
-    }
-
-    return selected;
+    return true;
 }
 
 static bool load_config(const string& config_path,
@@ -226,7 +154,7 @@ static bool load_config(const string& config_path,
         return false;
     }
 
-    return parse_nodes(config.at("nodes"), mode, nodes, error);
+    return parse_nodes(config.at("nodes"), nodes, error);
 }
 
 static bool do_write_rpc(const NodeInfo& target,
@@ -323,16 +251,22 @@ int main(int argc, char** argv) {
 
     const NodeInfo* target = nullptr;
     uint64_t token = 0;
+    vector<const NodeInfo*> crown_by_id;
 
     if (mode == Mode::CROWN) {
         token = crown::token::fnv1a64(key);
+        if (!build_crown_by_id(nodes, crown_by_id, error)) {
+            cerr << "[kv_client] Route resolution failed: " << error << "\n";
+            return 1;
+        }
     }
 
     if (op == "write") {
         if (mode == Mode::CHAIN || mode == Mode::CRAQ) {
             target = find_global_role(nodes, &NodeInfo::is_head, "head", error);
         } else {
-            target = find_crown_owner(nodes, token, true, key, error);
+            const size_t head_index = static_cast<size_t>(token % crown_by_id.size());
+            target = crown_by_id[head_index];
         }
 
         if (target == nullptr) {
@@ -362,7 +296,9 @@ int main(int argc, char** argv) {
     if (mode == Mode::CHAIN || mode == Mode::CRAQ) {
         target = find_global_role(nodes, &NodeInfo::is_tail, "tail", error);
     } else {
-        target = find_crown_owner(nodes, token, false, key, error);
+        const size_t head_index = static_cast<size_t>(token % crown_by_id.size());
+        const size_t tail_index = (head_index + crown_by_id.size() - 1) % crown_by_id.size();
+        target = crown_by_id[tail_index];
     }
 
     if (target == nullptr) {

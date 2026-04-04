@@ -166,18 +166,16 @@ private:
 
     static NodeConfig proto_to_config(const chain::NodeConfig& p) {
         NodeConfig cfg;
-        cfg.node_id   = p.node_id();
+        cfg.node_id   = std::to_string(p.node_id());
+        cfg.node_index = p.node_id();
         cfg.self_addr = addr_from_proto(p.self_addr());
         cfg.is_head   = p.is_head();
         cfg.is_tail   = p.is_tail();
+        // Keep wire compatibility: client encodes ring size as head_ranges count.
+        cfg.crown_node_count = p.head_ranges_size();
 
         if (p.has_predecessor()) cfg.predecessor = addr_from_proto(p.predecessor());
         if (p.has_successor())   cfg.successor   = addr_from_proto(p.successor());
-
-        for (const auto& kr : p.head_ranges())
-            cfg.head_ranges.push_back({ kr.start_key(), kr.end_key() });
-        for (const auto& kr : p.tail_ranges())
-            cfg.tail_ranges.push_back({ kr.start_key(), kr.end_key() });
 
         switch (p.mode()) {
             case chain::ReplicationMode::CHAIN: cfg.mode = ReplicationMode::CHAIN; break;
