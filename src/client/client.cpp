@@ -521,12 +521,12 @@ static void run_interactive_loop(Topology& topo, const string& client_addr) {
 // ============================================================
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        cerr << "Usage: " << argv[0] << " <config.json> [ack_port]\n";
+    if (argc < 3) {
+        cerr << "Usage: " << argv[0] << " <config.json> <true/false> [ack_port]\n";
         return 1;
     }
 
-    const int    ack_port    = (argc >= 3) ? stoi(argv[2]) : 60000;
+    const int    ack_port    = (argc >= 4) ? stoi(argv[3]) : 60000;
     const string client_addr = "127.0.0.1:" + to_string(ack_port);
 
     // --- Start Ack server in background thread -----------------
@@ -573,13 +573,17 @@ int main(int argc, char** argv) {
 
         google::protobuf::Empty resp;
         grpc::ClientContext     ctx;
-        grpc::Status status = stub->Configure(&ctx, cfg, &resp);
-        if (status.ok())
-            cout << "[Client] Configured node " << cfg.node_id() << " at " << target << "\n";
-        else {
-            cerr << "[Client] Failed to configure node " << cfg.node_id()
-                 << " at " << target << ": " << status.error_message() << "\n";
-            ++failures;
+        if (strcmp(argv[2], "true") == 0) {
+            grpc::Status status = stub->Configure(&ctx, cfg, &resp);
+            if (status.ok())
+                cout << "[Client] Configured node " << cfg.node_id() << " at " << target << "\n";
+            else {
+                cerr << "[Client] Failed to configure node " << cfg.node_id()
+                    << " at " << target << ": " << status.error_message() << "\n";
+                ++failures;
+            }
+        } else {
+            cout << "Not configuring nodes for this run (argv[2] is not 'true').\n";
         }
     }
 
