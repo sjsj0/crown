@@ -5,6 +5,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if (WIN32)
+    add_compile_definitions(_WIN32_WINNT=0x0600 WINVER=0x0600)
+endif()
+
 # ============================================================
 # Dependencies
 # ============================================================
@@ -12,7 +16,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Let gRPC pull in protobuf itself — do NOT call find_package(Protobuf)
 # separately, it causes target redefinition conflicts on Homebrew.
 find_package(gRPC REQUIRED)
-find_package(nlohmann_json REQUIRED)
+
+include(FetchContent)
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
+
+find_package(nlohmann_json QUIET)
+if (NOT nlohmann_json_FOUND)
+    message(STATUS "nlohmann_json not found; fetching header-only dependency")
+    FetchContent_Declare(
+        nlohmann_json
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG v3.11.3
+    )
+    FetchContent_MakeAvailable(nlohmann_json)
+endif()
 
 # Convenient alias
 set(GRPC_PLUGIN $<TARGET_FILE:gRPC::grpc_cpp_plugin>)
