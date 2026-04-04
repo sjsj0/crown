@@ -12,7 +12,9 @@ set -a
 source "$ENV_FILE"
 set +a
 
-: "${SSH_USER:?Missing SSH_USER in .env}"
+# SSH user must come from .env
+SSH_USER="${SSH_USER:?Missing SSH_USER in .env}"
+echo "Using SSH_USER: $SSH_USER"
 
 # Repo settings for remote setup/build. These are intentionally configurable from .env.
 : "${REPO_URL:?Missing REPO_URL in .env}"
@@ -31,6 +33,7 @@ fi
 # Which local script to send and run remotely
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <setup|start|build|deploy|kill>"
+  echo "  Example: $0 setup"
   exit 1
 fi
 
@@ -80,6 +83,6 @@ for host in "${hosts[@]}"; do
 
   echo "   -> running $REMOTE_SCRIPT"
   ssh -t "${SSH_OPTS[@]}" "$server" \
-    "REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REMOTE_BASE_DIR='$REMOTE_BASE_DIR' REPO_NAME='$REPO_NAME' PROJECT_SUBDIR='$PROJECT_SUBDIR' bash '$REMOTE_SCRIPT'"
+    "SSH_USER='$SSH_USER' REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REMOTE_BASE_DIR='$REMOTE_BASE_DIR' REPO_NAME='$REPO_NAME' PROJECT_SUBDIR='$PROJECT_SUBDIR' PROJECT_MODE='${PROJECT_MODE:-crown}' BUILD_TYPE='${BUILD_TYPE:-Release}' NODE_HOST='${NODE_HOST:-0.0.0.0}' NODE_PORT='${NODE_PORT:-5001}' TMUX_SESSION_NAME='${TMUX_SESSION_NAME:-}' bash '$REMOTE_SCRIPT'"
 done
 

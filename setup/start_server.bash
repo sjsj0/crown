@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== CRAQ deploy starting ==="
+DEPLOY_USER="${SSH_USER:-$(whoami)}"
+echo "=== Server deploy starting (user: $DEPLOY_USER) ==="
 
 # ---------------------------
 # 1) Clone or refresh repo
@@ -10,7 +11,9 @@ REPO_URL="${REPO_URL:?REPO_URL is required}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 REMOTE_BASE_DIR="${REMOTE_BASE_DIR:-$HOME}"
 REPO_NAME="${REPO_NAME:-$(basename "${REPO_URL%.git}")}"
-PROJECT_SUBDIR="${PROJECT_SUBDIR:-crown/craq}"
+# Support both standalone CRAQ and main crown implementation
+PROJECT_SUBDIR="${PROJECT_SUBDIR:-crown}"
+PROJECT_MODE="${PROJECT_MODE:-crown}"  # 'crown' for main src, 'craq' for standalone
 
 mkdir -p "$REMOTE_BASE_DIR"
 cd "$REMOTE_BASE_DIR"
@@ -26,40 +29,41 @@ else
 fi
 
 # ---------------------------
-# 2) Resolve CRAQ project path
+# 2) Resolve project path based on mode
 # ---------------------------
-CRAQ_DIR="$REMOTE_BASE_DIR/$REPO_NAME/$PROJECT_SUBDIR"
+PRIMARY_PROJECT_DIR="$REMOTE_BASE_DIR/$REPO_NAME/$PROJECT_SUBDIR"
+ROOT_PROJECT_DIR="$REMOTE_BASE_DIR/$REPO_NAME"
+LEGACY_CRAQ_DIR="$REMOTE_BASE_DIR/$REPO_NAME/craq"
 
-if [[ ! -f "$CRAQ_DIR/CMakeLists.txt" ]]; then
-  echo "ERROR: CRAQ project not found at $CRAQ_DIR"
+if [[ -f "$PRIMARY_PROJECT_DIR/CMakeLists.txt" ]]; then
+  PROJECT_DIR="$PRIMARY_PROJECT_DIR"
+elif [[ -f "$ROOT_PROJECT_DIR/CMakeLists.txt" ]]; then
+  echo "Warning: $PRIMARY_PROJECT_DIR/CMakeLists.txt not found; falling back to repo root."
+  PROJECT_DIR="$ROOT_PROJECT_DIR"
+elif [[ "$PROJECT_MODE" == "craq" && -f "$LEGACY_CRAQ_DIR/CMakeLists.txt" ]]; then
+  echo "Warning: falling back to legacy CRAQ subdirectory at $LEGACY_CRAQ_DIR"
+  PROJECT_DIR="$LEGACY_CRAQ_DIR"
+else
+  echo "ERROR: Project not found. Checked:"
+  echo "  - $PRIMARY_PROJECT_DIR/CMakeLists.txt"
+  echo "  - $ROOT_PROJECT_DIR/CMakeLists.txt"
+  echo "  - $LEGACY_CRAQ_DIR/CMakeLists.txt"
   exit 1
 fi
 
-echo "CRAQ source: $CRAQ_DIR"
-cd "$CRAQ_DIR"
+echo "Project mode: $PROJECT_MODE"
+echo "Project source: $PROJECT_DIR"
+cd "$PROJECT_DIR"
 
 # ---------------------------
 # 2.5) Preflight tool checks
 # ---------------------------
-if ! command -v git >/dev/null 2>&1; then
-  echo "ERROR: git is not installed on this VM. Run: ./vm_setup.bash setup"
-  exit 1
-fi
-
-if ! command -v cmake >/dev/null 2>&1; then
-  echo "ERROR: cmake is not installed on this VM. Run: ./vm_setup.bash setup"
-  exit 1
-fi
-
-if ! command -v g++ >/dev/null 2>&1; then
-  echo "ERROR: g++ is not installed on this VM. Run: ./vm_setup.bash setup"
-  exit 1
-fi
-
-if ! command -v tmux >/dev/null 2>&1; then
-  echo "ERROR: tmux is not installed on this VM. Run: ./vm_setup.bash setup"
-  exit 1
-fi
+for tool in git cmake g++ tmux; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "ERROR: $tool is not installed on this VM. Run: ./vm_setup.bash setup"
+    exit 1
+  fi
+done
 
 # ---------------------------
 # 3) Configure + build
@@ -90,15 +94,21 @@ if [[ -z "$NODE_BIN" ]]; then
 fi
 
 # ---------------------------
-# 4) Run node in tmux
+# 4) Run server in tmux
 # ---------------------------
 NODE_HOST="${NODE_HOST:-0.0.0.0}"
 NODE_PORT="${NODE_PORT:-5001}"
-RUN_DIR="$CRAQ_DIR/run"
+RUN_DIR="$PROJECT_DIR/run/$DEPLOY_USER"
 mkdir -p "$RUN_DIR"
-PID_FILE="$RUN_DIR/craq_node.pid"
-LOG_FILE="$RUN_DIR/craq_node.log"
-SESSION_NAME="${TMUX_SESSION_NAME:-craq_node_${NODE_PORT}}"
+PID_FILE="$RUN_DIR/server_${NODE_PORT}.pid"
+LOG_FILE="$RUN_DIR/server_${NODE_PORT}.log"
+SESSION_NAME="${TMUX_SESSION_NAME:-${DEPLOY_USER}_node_${NODE_PORT}}"
+
+echo "User-specific paths:"
+echo "  run_dir: $RUN_DIR"
+echo "  pid_file: $PID_FILE"
+echo "  log_file: $LOG_FILE"
+echo "  session: $SESSION_NAME"
 
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   echo "Stopping existing tmux session: $SESSION_NAME"
@@ -109,23 +119,28 @@ fi
 if [[ -f "$PID_FILE" ]]; then
   OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
   if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
-    echo "Stopping existing craq_node pid=$OLD_PID"
+    echo "Stopping existing process pid=$OLD_PID"
     kill "$OLD_PID" || true
     sleep 1
   fi
 fi
 
-pkill -f "craq_node --host .* --port $NODE_PORT" >/dev/null 2>&1 || true
+# Kill any remaining processes with this binary or port pattern (user-scoped)
+if [[ "$PROJECT_MODE" == "craq" ]]; then
+  pkill -u "$DEPLOY_USER" -f "craq_node --host .* --port $NODE_PORT" >/dev/null 2>&1 || true
+else
+  pkill -u "$DEPLOY_USER" -f "server --port $NODE_PORT" >/dev/null 2>&1 || true
+fi
 
 echo "Starting $NODE_BIN --host $NODE_HOST --port $NODE_PORT"
-tmux new-session -d -s "$SESSION_NAME" "cd '$CRAQ_DIR' && exec '$NODE_BIN' --host '$NODE_HOST' --port '$NODE_PORT'"
+tmux new-session -d -s "$SESSION_NAME" "cd '$PROJECT_DIR' && exec '$NODE_BIN' --host '$NODE_HOST' --port '$NODE_PORT'"
 tmux pipe-pane -o -t "$SESSION_NAME:0.0" "cat >> '$LOG_FILE'"
 
 NEW_PID="$(tmux display-message -p -t "$SESSION_NAME:0.0" "#{pane_pid}")"
 echo "$NEW_PID" > "$PID_FILE"
 
-echo "CRAQ node started in tmux session: $SESSION_NAME"
-echo "CRAQ node pane pid: $NEW_PID"
+echo "Server started in tmux session: $SESSION_NAME"
+echo "Server pane pid: $NEW_PID"
 echo "log: $LOG_FILE"
 echo "pid: $PID_FILE"
 echo "attach: tmux attach -t $SESSION_NAME"

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== VM dependency setup (CRAQ mode) ==="
+DEPLOY_USER="${SSH_USER:-$(whoami)}"
+echo "=== VM dependency setup (user: $DEPLOY_USER) ==="
 
 run_as_root() {
   if [[ "$(id -u)" -eq 0 ]]; then
