@@ -28,6 +28,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <random>
 
 #include <grpcpp/grpcpp.h>
 #include <nlohmann/json.hpp>
@@ -268,6 +269,7 @@ static bool validate_config_before_configure(const json& config,
 // ============================================================
 
 struct NodeStub {
+    int                                id = 0;
     string                             endpoint;
     shared_ptr<grpc::Channel>          channel;
     unique_ptr<chain::ChainNode::Stub> stub;
@@ -320,6 +322,7 @@ static Topology build_topology(const json& config, chain::ReplicationMode mode) 
 
     for (const auto& n : jnodes) {
         NodeStub ns;
+        ns.id       = n.at("id").get<int>();
         ns.endpoint = n.at("host").get<string>() + ":" + to_string(n.at("port").get<int>());
         ns.channel  = grpc::CreateChannel(ns.endpoint, grpc::InsecureChannelCredentials());
         ns.stub     = chain::ChainNode::NewStub(ns.channel);
@@ -391,21 +394,45 @@ static void do_write(Topology& topo, const string& key, const string& value,
          << " key='" << key << "' to head (" << target_head->endpoint << ")\n";
 }
 
-static void do_read(Topology& topo, const string& key) {
-    // Resolve the tail node for this key.
-    // CHAIN / CRAQ: single static tail.
+static void do_read(Topology& topo, const string& key, int node_id = -1) {
+    // Resolve the target node for this key.
+    // CHAIN: single static tail.
+    // CRAQ: specified node_id or random.
     // CROWN: tail index = (head index - 1 + node_count) % node_count.
-    NodeStub* target_tail = nullptr;
+    NodeStub* target = nullptr;
     if (topo.mode == chain::ReplicationMode::CROWN) {
-        target_tail = topo.crown_tail_for(key);
-        if (!target_tail) {
+        target = topo.crown_tail_for(key);
+        if (!target) {
             cerr << "[Read] No CROWN tail found for key='" << key << "' "
                  << "(token=" << Topology::hash_key(key) << ")\n";
             return;
         }
+    } else if (topo.mode == chain::ReplicationMode::CRAQ) {
+        if (node_id != -1) {
+            // Find node with specified id
+            for (auto& ns : topo.nodes) {
+                if (ns.id == node_id) {
+                    target = &ns;
+                    break;
+                }
+            }
+            if (!target) {
+                cerr << "[Read] Node with id " << node_id << " not found.\n";
+                return;
+            }
+        } else {
+            // Random pick
+            if (topo.nodes.empty()) { cerr << "[Read] No nodes in topology.\n"; return; }
+            static std::random_device rd;
+            static std::mt19937 gen(rd());
+            std::uniform_int_distribution<> dis(0, topo.nodes.size() - 1);
+            int random_index = dis(gen);
+            target = &topo.nodes[random_index];
+        }
     } else {
-        target_tail = topo.tail;
-        if (!target_tail) { cerr << "[Read] No tail node in topology.\n"; return; }
+        // CHAIN: use tail
+        target = topo.tail;
+        if (!target) { cerr << "[Read] No tail node in topology.\n"; return; }
     }
 
     chain::ReadRequest  req;
@@ -413,7 +440,7 @@ static void do_read(Topology& topo, const string& key) {
     grpc::ClientContext ctx;
     req.set_key(key);
 
-    grpc::Status status = target_tail->stub->Read(&ctx, req, &resp);
+    grpc::Status status = target->stub->Read(&ctx, req, &resp);
     if (!status.ok()) { cerr << "[Read] Failed: " << status.error_message() << "\n"; return; }
 
     if (resp.value().empty())
@@ -422,13 +449,13 @@ static void do_read(Topology& topo, const string& key) {
         cout << "[Read] key='" << resp.key()
              << "' value='" << resp.value()
              << "' version=" << resp.version()
-             << " (via " << target_tail->endpoint << ")\n";
+             << " (via " << target->endpoint << ")\n";
 }
 
 static void print_help() {
     cout << "Commands:\n"
          << "  write <key> <value>  — non-blocking write (ack printed when tail confirms)\n"
-         << "  read  <key>          — read directly from tail\n"
+         << "  read  <key> [node_id] — read from specified node (CRAQ) or tail (CHAIN/CROWN)\n"
          << "  quit / exit          — exit\n"
          << "  help                 — show this message\n";
 }
@@ -460,8 +487,26 @@ static void run_interactive_loop(Topology& topo, const string& client_addr) {
         } else if (cmd == "read") {
             string key;
             iss >> key;
-            if (key.empty()) { cerr << "Usage: read <key>\n"; continue; }
-            do_read(topo, key);
+            int node_id = -1;
+            if (topo.mode == chain::ReplicationMode::CRAQ) {
+                string node_id_str;
+                if (iss >> node_id_str) {
+                    try {
+                        node_id = stoi(node_id_str);
+                    } catch (const exception&) {
+                        node_id = -1;
+                    }
+                }
+            }
+            if (key.empty()) { 
+                if (topo.mode == chain::ReplicationMode::CRAQ) {
+                    cerr << "Usage: read <key> [node_id]\n"; 
+                } else {
+                    cerr << "Usage: read <key>\n"; 
+                }
+                continue; 
+            }
+            do_read(topo, key, node_id);
 
         } else {
             cerr << "Unknown command '" << cmd << "'. Type 'help'.\n";
