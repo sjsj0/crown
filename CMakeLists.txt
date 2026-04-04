@@ -55,6 +55,7 @@ add_custom_command(
     COMMAND protobuf::protoc
     ARGS
         --proto_path "${PROTO_DIR}"
+        --experimental_allow_proto3_optional
         --cpp_out "${PROTO_GEN_DIR}"
         --grpc_out "${PROTO_GEN_DIR}"
         --plugin=protoc-gen-grpc=${GRPC_PLUGIN}
