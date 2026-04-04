@@ -293,8 +293,11 @@ int main(int argc, char** argv) {
     }
 
     // op == read
-    if (mode == Mode::CHAIN || mode == Mode::CRAQ) {
+    if (mode == Mode::CHAIN) {
         target = find_global_role(nodes, &NodeInfo::is_tail, "tail", error);
+    } else if (mode == Mode::CRAQ) {
+        // CRAQ supports reads from non-tail nodes; use head to exercise version-query path.
+        target = find_global_role(nodes, &NodeInfo::is_head, "head", error);
     } else {
         const size_t head_index = static_cast<size_t>(token % crown_by_id.size());
         const size_t tail_index = (head_index + crown_by_id.size() - 1) % crown_by_id.size();

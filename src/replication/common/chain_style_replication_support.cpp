@@ -38,6 +38,43 @@ LatestReplicaValue ChainStyleReplicationSupport::read_clean(const std::string& k
     return out;
 }
 
+LatestReplicaValue ChainStyleReplicationSupport::read_latest_seen(const std::string& key) const {
+    LatestReplicaValue out;
+
+    const auto it = by_key_.find(key);
+    if (it == by_key_.end() || it->second.latest_seen_version == 0) {
+        return out;
+    }
+
+    out.found = true;
+    out.value = it->second.latest_seen_value;
+    out.version = it->second.latest_seen_version;
+    return out;
+}
+
+bool ChainStyleReplicationSupport::read_value_at_version(const std::string& key,
+                                                         uint64_t version,
+                                                         std::string& value_out) const {
+    const auto it = by_key_.find(key);
+    if (it == by_key_.end() || version == 0) {
+        return false;
+    }
+
+    const KeyState& state = it->second;
+    if (state.clean_version == version) {
+        value_out = state.clean_value;
+        return true;
+    }
+
+    const auto dirty_it = state.dirty_versions.find(version);
+    if (dirty_it == state.dirty_versions.end()) {
+        return false;
+    }
+
+    value_out = dirty_it->second;
+    return true;
+}
+
 void ChainStyleReplicationSupport::mark_version_clean(const std::string& key, uint64_t version) {
     KeyState& state = by_key_[key];
 

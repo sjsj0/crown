@@ -1,28 +1,252 @@
 #include "craq_replication.h"
+
+#include <google/protobuf/empty.pb.h>
+
 #include <iostream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+
 #include "chain.pb.h"
+#include "node/node.h"
 
 using namespace std;
 
+namespace {
+
+string craq_node_label(const Node& node) {
+    if (!node.id().empty()) {
+        return node.id();
+    }
+    return node.self_addr().to_string();
+}
+
+void forward_propagate_async(std::shared_ptr<chain::ChainNode::Stub> successor,
+                             chain::PropagateRequest req,
+                             const std::string& from_node) {
+    std::thread([successor = std::move(successor),
+                 req = std::move(req),
+                 from_node]() mutable {
+        if (!successor) {
+            cerr << "[CRAQ] Async PROPAGATE skipped from " << from_node
+                 << ": no successor stub\n";
+            return;
+        }
+
+        google::protobuf::Empty ignored;
+        grpc::ClientContext ctx;
+        grpc::Status status = successor->Propagate(&ctx, req, &ignored);
+        if (!status.ok()) {
+            cerr << "[CRAQ] Async PROPAGATE failed from " << from_node
+                 << " key='" << req.key() << "' version=" << req.version()
+                 << ": " << status.error_message() << "\n";
+        }
+    }).detach();
+}
+
+void forward_ack_async(std::shared_ptr<chain::ChainNode::Stub> predecessor,
+                       chain::AckRequest req,
+                       const std::string& from_node) {
+    std::thread([predecessor = std::move(predecessor),
+                 req = std::move(req),
+                 from_node]() mutable {
+        if (!predecessor) {
+            cerr << "[CRAQ] Async ACK skipped from " << from_node
+                 << ": no predecessor stub\n";
+            return;
+        }
+
+        google::protobuf::Empty ignored;
+        grpc::ClientContext ctx;
+        grpc::Status status = predecessor->Ack(&ctx, req, &ignored);
+        if (!status.ok()) {
+            cerr << "[CRAQ] Async ACK failed from " << from_node
+                 << " key='" << req.key() << "' version=" << req.version()
+                 << ": " << status.error_message() << "\n";
+        }
+    }).detach();
+}
+
+chain::ReadResponse build_read_response(const std::string& key,
+                                        const std::string& value,
+                                        uint64_t version) {
+    chain::ReadResponse resp;
+    resp.set_key(key);
+    resp.set_value(value);
+    resp.set_version(version);
+    return resp;
+}
+
+} // namespace
+
 chain::WriteResponse CRAQReplication::handle_write(const chain::WriteRequest& req, Node& node) {
-    cout << "[CRAQ] handle_write called\n";
-    return chain::WriteResponse();
+    if (!node.is_head()) {
+        throw runtime_error("CRAQ write rejected: node is not head");
+    }
+
+    const uint64_t version = support_.assign_next_version(req.key());
+    support_.record_local_write(req.key(), req.value(), version);
+
+    cout << "[CRAQ] Head " << craq_node_label(node)
+         << " accepted write key='" << req.key() << "' version=" << version
+         << " (response means accepted by head; commit happens later when ACK returns)\n";
+
+    chain::WriteResponse resp;
+    resp.set_success(true);
+    resp.set_version(version);
+
+    if (node.is_tail()) {
+        support_.mark_version_clean(req.key(), version);
+        cout << "[CRAQ] Single-node chain committed immediately key='" << req.key()
+             << "' version=" << version << "\n";
+        return resp;
+    }
+
+    chain::PropagateRequest fwd;
+    fwd.set_key(req.key());
+    fwd.set_value(req.value());
+    fwd.set_version(version);
+    fwd.set_origin_id(node.id());
+    fwd.set_client_addr(req.client_addr());
+    fwd.set_request_id(req.request_id());
+
+    auto succ = support_.successor_stub();
+    forward_propagate_async(succ, std::move(fwd), craq_node_label(node));
+
+    return resp;
 }
 
 chain::ReadResponse CRAQReplication::handle_read(const chain::ReadRequest& req, Node& node) {
-    cout << "[CRAQ] handle_read called\n";
-    return chain::ReadResponse();
+    const auto local_clean = support_.read_clean(req.key());
+
+    if (node.is_tail()) {
+        if (!local_clean.found) {
+            throw runtime_error("CRAQ read failed: key not found or not committed");
+        }
+
+        cout << "[CRAQ] Tail " << craq_node_label(node)
+             << " serving CLEAN read key='" << req.key()
+             << "' version=" << local_clean.version << "\n";
+        return build_read_response(req.key(), local_clean.value, local_clean.version);
+    }
+
+    const auto local_latest = support_.read_latest_seen(req.key());
+    const bool has_dirty = local_latest.found &&
+                           (!local_clean.found || local_latest.version > local_clean.version);
+
+    if (!has_dirty) {
+        if (!local_clean.found) {
+            throw runtime_error("CRAQ read failed: key not found");
+        }
+
+        cout << "[CRAQ] Non-tail " << craq_node_label(node)
+             << " serving local CLEAN read key='" << req.key()
+             << "' version=" << local_clean.version << "\n";
+        return build_read_response(req.key(), local_clean.value, local_clean.version);
+    }
+
+    chain::VersionQueryRequest query;
+    query.set_key(req.key());
+    const chain::VersionQueryResponse tail_state = handle_version_query(query, node);
+    const uint64_t latest_committed = tail_state.latest_version();
+
+    if (latest_committed == 0) {
+        throw runtime_error("CRAQ read failed: key not committed at tail");
+    }
+
+    if (local_clean.found && local_clean.version == latest_committed) {
+        cout << "[CRAQ] Non-tail " << craq_node_label(node)
+             << " dirty read path resolved to local CLEAN key='" << req.key()
+             << "' version=" << local_clean.version << "\n";
+        return build_read_response(req.key(), local_clean.value, local_clean.version);
+    }
+
+    string value;
+    if (!support_.read_value_at_version(req.key(), latest_committed, value)) {
+        throw runtime_error("CRAQ read failed: local node cannot materialize tail-committed version");
+    }
+
+    cout << "[CRAQ] Non-tail " << craq_node_label(node)
+         << " served read using local DIRTY version matching tail key='" << req.key()
+         << "' version=" << latest_committed << "\n";
+    return build_read_response(req.key(), value, latest_committed);
 }
 
 void CRAQReplication::handle_propagate(const chain::PropagateRequest& req, Node& node) {
-    cout << "[CRAQ] handle_propagate called\n";
+    support_.record_local_write(req.key(), req.value(), req.version());
+
+    cout << "[CRAQ] Node " << craq_node_label(node)
+         << " received DIRTY PROPAGATE key='" << req.key()
+         << "' version=" << req.version() << "\n";
+
+    if (node.is_tail()) {
+        support_.mark_version_clean(req.key(), req.version());
+
+        cout << "[CRAQ] Tail committed key='" << req.key()
+             << "' version=" << req.version() << " and scheduling ACK upstream\n";
+
+        if (!node.is_head()) {
+            auto pred = support_.predecessor_stub();
+
+            chain::AckRequest ack;
+            ack.set_key(req.key());
+            ack.set_version(req.version());
+            ack.set_client_addr(req.client_addr());
+            ack.set_request_id(req.request_id());
+
+            forward_ack_async(pred, std::move(ack), craq_node_label(node));
+        }
+        return;
+    }
+
+    auto succ = support_.successor_stub();
+    chain::PropagateRequest fwd = req;
+    forward_propagate_async(succ, std::move(fwd), craq_node_label(node));
 }
 
 void CRAQReplication::handle_ack(const chain::AckRequest& req, Node& node) {
-    cout << "[CRAQ] handle_ack called\n";
+    support_.mark_version_clean(req.key(), req.version());
+
+    cout << "[CRAQ] Node " << craq_node_label(node)
+         << " marked CLEAN key='" << req.key()
+         << "' version=" << req.version() << "\n";
+
+    if (node.is_head()) {
+        cout << "[CRAQ] Head finalized commit request_id=" << req.request_id()
+             << " key='" << req.key() << "' version=" << req.version()
+             << " client_addr='" << req.client_addr() << "'\n";
+        return;
+    }
+
+    auto pred = support_.predecessor_stub();
+    chain::AckRequest fwd = req;
+    forward_ack_async(pred, std::move(fwd), craq_node_label(node));
 }
 
 chain::VersionQueryResponse CRAQReplication::handle_version_query(const chain::VersionQueryRequest& req, Node& node) {
-    cout << "[CRAQ] handle_version_query called\n";
-    return chain::VersionQueryResponse();
+    chain::VersionQueryResponse resp;
+    resp.set_key(req.key());
+
+    if (node.is_tail()) {
+        const auto clean = support_.read_clean(req.key());
+        resp.set_latest_version(clean.found ? clean.version : 0);
+        return resp;
+    }
+
+    auto succ = support_.successor_stub();
+    if (!succ) {
+        throw runtime_error("CRAQ version query failed: missing successor stub");
+    }
+
+    grpc::ClientContext ctx;
+    chain::VersionQueryResponse downstream;
+    grpc::Status status = succ->VersionQuery(&ctx, req, &downstream);
+    if (!status.ok()) {
+        throw runtime_error("CRAQ version query failed: " + status.error_message());
+    }
+    return downstream;
+}
+
+void CRAQReplication::on_config_change(Node& node) {
+    support_.on_config_change(node);
 }

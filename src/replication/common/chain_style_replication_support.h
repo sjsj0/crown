@@ -32,6 +32,14 @@ public:
     // Returns the latest committed (clean) value/version.
     LatestReplicaValue read_clean(const std::string& key) const;
 
+    // Returns the latest locally seen value/version (clean or dirty).
+    LatestReplicaValue read_latest_seen(const std::string& key) const;
+
+    // Resolve a specific version to a value from local clean/dirty state.
+    bool read_value_at_version(const std::string& key,
+                               uint64_t version,
+                               std::string& value_out) const;
+
     // Rebuild predecessor/successor channels and stubs for new topology.
     void on_config_change(const Node& node);
 
