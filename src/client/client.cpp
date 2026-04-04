@@ -1125,13 +1125,13 @@ int main(int argc, char** argv) {
 
     // --- Configure all nodes -----------------------------------
     int failures = 0;
-    for (const auto& node_json : config.at("nodes")) {
-        string target = node_json.at("host").get<string>() + ":"
-                      + to_string(node_json.at("port").get<int>());
-        chain::NodeConfig cfg = build_node_config(node_json, mode, crown_node_count);
-        auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
-        auto stub    = chain::ChainNode::NewStub(channel);
-
+    if (should_configure) {
+        for (const auto& node_json : config.at("nodes")) {
+            string target = node_json.at("host").get<string>() + ":"
+                            + to_string(node_json.at("port").get<int>());
+            chain::NodeConfig cfg = build_node_config(node_json, mode, crown_node_count);
+            auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
+            auto stub    = chain::ChainNode::NewStub(channel);
             google::protobuf::Empty resp;
             grpc::ClientContext     ctx;
             grpc::Status status = stub->Configure(&ctx, cfg, &resp);
