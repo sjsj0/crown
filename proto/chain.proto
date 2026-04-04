@@ -42,12 +42,13 @@ message NodeConfig {
 
     optional NodeAddress predecessor = 6;  // absent = no predecessor (head)
     optional NodeAddress successor   = 7;  // absent = no successor (tail)
+    optional NodeAddress tail        = 8;  // CRAQ-only direct tail endpoint for version queries
 
     // Legacy compatibility fields.
     // The current CROWN implementation computes ownership via hash(key) % N.
     // Client populates head_ranges with N placeholders so servers can infer N.
-    repeated KeyRange head_ranges = 8;
-    repeated KeyRange tail_ranges = 9;
+    repeated KeyRange head_ranges = 9;
+    repeated KeyRange tail_ranges = 10;
 }
 
 // ============================================================

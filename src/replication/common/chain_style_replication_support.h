@@ -45,6 +45,7 @@ public:
 
     std::shared_ptr<chain::ChainNode::Stub> predecessor_stub() const;
     std::shared_ptr<chain::ChainNode::Stub> successor_stub() const;
+    std::shared_ptr<chain::ChainNode::Stub> tail_stub() const;
 
 private:
     struct KeyState {
@@ -62,6 +63,8 @@ private:
 
     std::shared_ptr<grpc::Channel> predecessor_channel_;
     std::shared_ptr<grpc::Channel> successor_channel_;
+    std::shared_ptr<grpc::Channel> tail_channel_;
     std::shared_ptr<chain::ChainNode::Stub> predecessor_stub_;
     std::shared_ptr<chain::ChainNode::Stub> successor_stub_;
+    std::shared_ptr<chain::ChainNode::Stub> tail_stub_;
 };

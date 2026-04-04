@@ -40,6 +40,9 @@ struct NodeConfig {
     // CROWN mode: total number of nodes in the ring.
     // Key ownership is computed as hash(key) % crown_node_count.
     int crown_node_count = 0;
+
+    // CRAQ only: direct tail endpoint for version queries.
+    std::optional<NodeAddress> tail;
 };
 
 // ============================================================

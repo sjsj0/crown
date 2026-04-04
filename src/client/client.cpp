@@ -528,7 +528,8 @@ static chain::NodeAddress parse_addr(const string& s) {
 
 static chain::NodeConfig build_node_config(const json& node_json,
                                             chain::ReplicationMode mode,
-                                            int crown_node_count) {
+                                            int crown_node_count,
+                                            const string& craq_tail_addr = "") {
     chain::NodeConfig cfg;
     cfg.set_node_id(node_json.at("id").get<int>());
     cfg.set_mode(mode);
@@ -539,6 +540,9 @@ static chain::NodeConfig build_node_config(const json& node_json,
         for (int i = 0; i < crown_node_count; ++i) {
             (void)cfg.add_head_ranges();
         }
+    }
+    if (mode == chain::ReplicationMode::CRAQ && !craq_tail_addr.empty()) {
+        *cfg.mutable_tail() = parse_addr(craq_tail_addr);
     }
 
     string host = node_json.at("host").get<string>();
@@ -1104,15 +1108,29 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    string craq_tail_addr;
+    if (mode == chain::ReplicationMode::CRAQ) {
+        for (const auto& node_json : config.at("nodes")) {
+            if (node_json.value("is_tail", false)) {
+                craq_tail_addr = node_json.at("host").get<string>() + ":"
+                              + to_string(node_json.at("port").get<int>());
+                break;
+            }
+        }
+        if (craq_tail_addr.empty()) {
+            cerr << "[Client] CRAQ config must include a tail node with is_tail=true\n";
+            return 1;
+        }
+    }
+
     // --- Configure all nodes -----------------------------------
     int failures = 0;
-    if (should_configure) {
-        for (const auto& node_json : config.at("nodes")) {
-            string target = node_json.at("host").get<string>() + ":"
-                        + to_string(node_json.at("port").get<int>());
-            chain::NodeConfig cfg = build_node_config(node_json, mode, crown_node_count);
-            auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
-            auto stub    = chain::ChainNode::NewStub(channel);
+    for (const auto& node_json : config.at("nodes")) {
+        string target = node_json.at("host").get<string>() + ":"
+                      + to_string(node_json.at("port").get<int>());
+        chain::NodeConfig cfg = build_node_config(node_json, mode, crown_node_count);
+        auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
+        auto stub    = chain::ChainNode::NewStub(channel);
 
             google::protobuf::Empty resp;
             grpc::ClientContext     ctx;

@@ -102,8 +102,10 @@ void ChainStyleReplicationSupport::mark_version_clean(const std::string& key, ui
 void ChainStyleReplicationSupport::on_config_change(const Node& node) {
     predecessor_channel_.reset();
     successor_channel_.reset();
+    tail_channel_.reset();
     predecessor_stub_.reset();
     successor_stub_.reset();
+    tail_stub_.reset();
 
     if (node.predecessor().has_value()) {
         predecessor_channel_ = grpc::CreateChannel(
@@ -120,6 +122,14 @@ void ChainStyleReplicationSupport::on_config_change(const Node& node) {
         auto succ_stub = chain::ChainNode::NewStub(successor_channel_);
         successor_stub_ = std::shared_ptr<chain::ChainNode::Stub>(std::move(succ_stub));
     }
+
+    if (node.config().tail.has_value()) {
+        tail_channel_ = grpc::CreateChannel(
+            node.config().tail->to_string(),
+            grpc::InsecureChannelCredentials());
+        auto tail_stub = chain::ChainNode::NewStub(tail_channel_);
+        tail_stub_ = std::shared_ptr<chain::ChainNode::Stub>(std::move(tail_stub));
+    }
 }
 
 std::shared_ptr<chain::ChainNode::Stub> ChainStyleReplicationSupport::predecessor_stub() const {
@@ -128,4 +138,8 @@ std::shared_ptr<chain::ChainNode::Stub> ChainStyleReplicationSupport::predecesso
 
 std::shared_ptr<chain::ChainNode::Stub> ChainStyleReplicationSupport::successor_stub() const {
     return successor_stub_;
+}
+
+std::shared_ptr<chain::ChainNode::Stub> ChainStyleReplicationSupport::tail_stub() const {
+    return tail_stub_;
 }

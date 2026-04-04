@@ -176,6 +176,7 @@ private:
 
         if (p.has_predecessor()) cfg.predecessor = addr_from_proto(p.predecessor());
         if (p.has_successor())   cfg.successor   = addr_from_proto(p.successor());
+        if (p.has_tail())        cfg.tail        = addr_from_proto(p.tail());
 
         switch (p.mode()) {
             case chain::ReplicationMode::CHAIN: cfg.mode = ReplicationMode::CHAIN; break;

@@ -269,9 +269,20 @@ chain::VersionQueryResponse CRAQReplication::handle_version_query(const chain::V
         return resp;
     }
 
+    auto tail = support_.tail_stub();
+    if (tail) {
+        grpc::ClientContext ctx;
+        chain::VersionQueryResponse downstream;
+        grpc::Status status = tail->VersionQuery(&ctx, req, &downstream);
+        if (!status.ok()) {
+            throw runtime_error("CRAQ version query failed: " + status.error_message());
+        }
+        return downstream;
+    }
+
     auto succ = support_.successor_stub();
     if (!succ) {
-        throw runtime_error("CRAQ version query failed: missing successor stub");
+        throw runtime_error("CRAQ version query failed: missing successor or tail stub");
     }
 
     grpc::ClientContext ctx;
