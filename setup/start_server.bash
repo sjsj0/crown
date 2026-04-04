@@ -82,14 +82,15 @@ cmake --build build -j "$CPU_COUNT"
 echo "Build completed."
 
 NODE_BIN=""
-if [[ -x "build/craq_node" ]]; then
-  NODE_BIN="build/craq_node"
-elif [[ -x "build/Debug/craq_node" ]]; then
-  NODE_BIN="build/Debug/craq_node"
+if [[ -x "build/server" ]]; then
+  NODE_BIN="build/server"
+elif [[ -x "build/Debug/server" ]]; then
+  NODE_BIN="build/Debug/server"
 fi
 
 if [[ -z "$NODE_BIN" ]]; then
-  echo "ERROR: craq_node binary not found after build."
+  echo "ERROR: server binary not found after build."
+  echo "       Looked for build/server (and build/Debug/server)."
   exit 1
 fi
 
@@ -125,12 +126,8 @@ if [[ -f "$PID_FILE" ]]; then
   fi
 fi
 
-# Kill any remaining processes with this binary or port pattern (user-scoped)
-if [[ "$PROJECT_MODE" == "craq" ]]; then
-  pkill -u "$DEPLOY_USER" -f "craq_node --host .* --port $NODE_PORT" >/dev/null 2>&1 || true
-else
-  pkill -u "$DEPLOY_USER" -f "server --port $NODE_PORT" >/dev/null 2>&1 || true
-fi
+# Kill any remaining server process for this user/port before starting.
+pkill -u "$DEPLOY_USER" -f "server --host .* --port $NODE_PORT" >/dev/null 2>&1 || true
 
 echo "Starting $NODE_BIN --host $NODE_HOST --port $NODE_PORT"
 tmux new-session -d -s "$SESSION_NAME" "cd '$PROJECT_DIR' && exec '$NODE_BIN' --host '$NODE_HOST' --port '$NODE_PORT'"

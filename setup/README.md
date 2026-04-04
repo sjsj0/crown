@@ -56,6 +56,7 @@ Clone/pull repo, build project, start node in tmux.
 - ✅ Preflight checks: Validates git, cmake, g++, tmux installed
 - ✅ Checks if process already running; saves pid for later cleanup
 - ✅ Pipe logs to file with `tmux pipe-pane`
+- ✅ Launches the current `server` binary from `build/server`
 
 **Usage:**
 ```bash
@@ -90,7 +91,7 @@ Stop all nodes for a given user.
 **Changes:**
 - ✅ Uses `SSH_USER` from environment (or current user fallback)
 - ✅ Kills user-scoped tmux sessions (matches `${SSH_USER}_node_*` pattern)
-- ✅ Kills user processes matching `server` or `craq_node`
+- ✅ Kills user processes matching `server` (and legacy `craq_node` if present)
 - ✅ Cleans up pid files in user-specific `run/` directories
 - ✅ Safe: Only kills processes owned by the specified user (uses `pkill -u`)
 - ✅ Works across multiple project modes and locations
@@ -185,7 +186,6 @@ chmod +x setup/kill.bash
 tail -f /remote/path/to/crown/run/username/server_5001.log
 
 # Check process:
-ps aux | grep craq_node
 ps aux | grep server
 
 # Manually attach tmux:
