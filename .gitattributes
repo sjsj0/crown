@@ -1,0 +1,4 @@
+# Keep shell scripts Linux-compatible regardless of contributor OS.
+*.sh text eol=lf
+*.bash text eol=lf
+*.zsh text eol=lf
