@@ -2,13 +2,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import signal
-import socket
+import shlex
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, List, Sequence
@@ -19,39 +16,47 @@ class RunnerError(RuntimeError):
 
 
 @dataclass
-class StartedProcess:
-    process: subprocess.Popen
-    log_handle: IO[str]
-
-
-@dataclass
 class RunnerConfig:
     root_dir: Path
-    build_dir: Path
     work_dir: Path
     log_dir: Path
-    cfg_dir: Path
-    base_config: Path
-    client_bin: Path
-    server_bin: Path
+    ssh_log_dir: Path
+    summary_csv: Path
+
+    hosts: List[str]
     modes: List[str]
     ops: List[str]
-    client_counts: List[int]
+
     write_op_count: int
     read_op_count: int
     key_count: int
-    node_count_override: int | None
+    craq_read_node_id: int
+
+    ssh_user: str
+    ssh_opts: List[str]
+    remote_repo_dir: str
+    remote_client_bin: str
+    remote_config_template: str
+    remote_log_dir: str
+
     key_prefix_base: str
     value_prefix_base: str
     ack_base_port: int
-    craq_read_node_id: int
-    build_first: bool
-    start_servers: bool
     reconfigure_each_run: bool
-    summary_csv: Path
+
+    dry_run: bool
+    fail_fast: bool
 
 
-SERVER_PROCS: List[StartedProcess] = []
+@dataclass
+class ActiveLaunch:
+    host: str
+    client_index: int
+    remote_log_file: str
+    local_client_log: Path
+    local_ssh_log: Path
+    process: subprocess.Popen[bytes]
+    log_handle: IO[str]
 
 
 def log(msg: str) -> None:
@@ -66,16 +71,6 @@ def env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
         return default
-    try:
-        return int(raw)
-    except ValueError as exc:
-        raise RunnerError(f"invalid integer for {name}: {raw}") from exc
-
-
-def env_optional_int(name: str) -> int | None:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return None
     try:
         return int(raw)
     except ValueError as exc:
@@ -103,63 +98,98 @@ def argparse_bool(raw: str) -> bool:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def parse_hosts_text(text: str) -> List[str]:
+    hosts: List[str] = []
+    for line in text.splitlines():
+        cleaned = line.split("#", 1)[0].strip()
+        if not cleaned:
+            continue
+        for token in cleaned.split(","):
+            host = token.strip()
+            if host:
+                hosts.append(host)
+    return hosts
+
+
+def unique_preserve_order(items: Sequence[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def shell_quote(s: str) -> str:
+    return shlex.quote(s)
+
+
+def format_shell_cmd(args: Sequence[str]) -> str:
+    return " ".join(shell_quote(a) for a in args)
+
+
+def run_cmd(args: Sequence[str], quiet: bool = False) -> None:
+    kwargs = {}
+    if quiet:
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+    try:
+        subprocess.run(args, check=True, **kwargs)
+    except subprocess.CalledProcessError as exc:
+        raise RunnerError(f"command failed ({exc.returncode}): {format_shell_cmd(args)}") from exc
+
+
 def parse_args(root_dir: Path) -> argparse.Namespace:
-    build_dir_default = env_str("BUILD_DIR", str(root_dir / "build"))
-    work_dir_default = env_str("WORK_DIR", str(Path(build_dir_default) / "throughput_runs"))
+    work_dir_default = env_str("WORK_DIR", str(root_dir / "build" / "distributed_throughput_runs"))
 
     p = argparse.ArgumentParser(
-        description="Run throughput experiments across chain/craq/crown modes.",
-    )
-
-    p.add_argument("--build-dir", default=build_dir_default)
-    p.add_argument("--work-dir", default=work_dir_default)
-    p.add_argument("--base-config", default=env_str("BASE_CONFIG", str(root_dir / "config.json")))
-    p.add_argument("--client-bin", default=env_str("CLIENT_BIN", str(Path(build_dir_default) / "client")))
-    p.add_argument("--server-bin", default=env_str("SERVER_BIN", str(Path(build_dir_default) / "server")))
-
-    p.add_argument("--modes", nargs="+", default=env_words("MODES", "chain craq crown"))
-    p.add_argument("--ops", nargs="+", default=env_words("OPS", "write read"))
-    p.add_argument(
-        "--client-counts",
-        nargs="+",
-        type=int,
-        default=[int(v) for v in env_words("CLIENT_COUNTS", "1 2 4 8")],
-    )
-
-    p.add_argument("--write-op-count", type=int, default=env_int("WRITE_OP_COUNT", 5000))
-    p.add_argument("--read-op-count", type=int, default=env_int("READ_OP_COUNT", 5000))
-    p.add_argument("--key-count", type=int, default=env_int("KEY_COUNT", 64))
-    p.add_argument(
-        "--node-count",
-        type=int,
-        default=env_optional_int("NODE_COUNT"),
-        help=(
-            "Optional override for node count used to generate mode configs. "
-            "If omitted, node count is read from --base-config."
+        description=(
+            "Run distributed throughput experiments across chain/craq/crown with one client process per host."
         ),
     )
 
-    p.add_argument("--key-prefix-base", default=env_str("KEY_PREFIX_BASE", "bench-key"))
-    p.add_argument("--value-prefix-base", default=env_str("VALUE_PREFIX_BASE", "bench-value"))
+    p.add_argument("--work-dir", default=work_dir_default)
 
-    p.add_argument("--ack-base-port", type=int, default=env_int("ACK_BASE_PORT", 61000))
+    p.add_argument("--hosts", default=env_str("HOSTS", ""), help="Comma-separated host list")
+    p.add_argument("--hosts-file", default=env_str("HOSTS_FILE", ""), help="Host file (CSV or one-per-line)")
+
+    p.add_argument("--modes", nargs="+", default=env_words("MODES", "chain craq crown"))
+    p.add_argument("--ops", nargs="+", default=env_words("OPS", "write read"))
+
+    p.add_argument("--write-op-count", type=int, default=env_int("WRITE_OP_COUNT", 50000))
+    p.add_argument("--read-op-count", type=int, default=env_int("READ_OP_COUNT", 50000))
+    p.add_argument("--key-count", type=int, default=env_int("KEY_COUNT", 64))
     p.add_argument("--craq-read-node-id", type=int, default=env_int("CRAQ_READ_NODE_ID", -1))
 
+    p.add_argument("--ssh-user", default=env_str("SSH_USER", ""))
+    p.add_argument("--ssh-key", default=env_str("SSH_KEY_LOCAL", ""))
+    p.add_argument("--remote-repo-dir", default=env_str("REMOTE_REPO_DIR", ""))
+    p.add_argument("--remote-client-bin", default=env_str("REMOTE_CLIENT_BIN", "build/client"))
     p.add_argument(
-        "--build-first",
-        type=argparse_bool,
-        default=parse_bool(env_str("BUILD_FIRST", "1"), "BUILD_FIRST"),
+        "--remote-config-template",
+        default=env_str("REMOTE_CONFIG_TEMPLATE", "build/prod_configs/config.{mode}.json"),
+        help="Remote config path template, e.g. build/prod_configs/config.{mode}.json",
     )
-    p.add_argument(
-        "--start-servers",
-        type=argparse_bool,
-        default=parse_bool(env_str("START_SERVERS", "1"), "START_SERVERS"),
-    )
+    p.add_argument("--remote-log-dir", default=env_str("REMOTE_LOG_DIR", "build/prod_bench_logs"))
+
+    p.add_argument("--key-prefix-base", default=env_str("KEY_PREFIX_BASE", "bench-key"))
+    p.add_argument("--value-prefix-base", default=env_str("VALUE_PREFIX_BASE", "bench-value"))
+    p.add_argument("--ack-base-port", type=int, default=env_int("ACK_BASE_PORT", 61000))
+
     p.add_argument(
         "--reconfigure-each-run",
         type=argparse_bool,
         default=parse_bool(env_str("RECONFIGURE_EACH_RUN", "1"), "RECONFIGURE_EACH_RUN"),
     )
+    p.add_argument(
+        "--fail-fast",
+        type=argparse_bool,
+        default=parse_bool(env_str("FAIL_FAST", "1"), "FAIL_FAST"),
+        help="Stop on first failing case when true",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Print planned SSH/SCP commands without executing")
 
     return p.parse_args()
 
@@ -167,6 +197,7 @@ def parse_args(root_dir: Path) -> argparse.Namespace:
 def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
     modes = [m.strip().lower() for m in args.modes if m.strip()]
     ops = [o.strip().lower() for o in args.ops if o.strip()]
+
     allowed_modes = {"chain", "craq", "crown"}
     allowed_ops = {"write", "read"}
 
@@ -182,369 +213,263 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
     if bad_ops:
         raise RunnerError(f"unknown ops: {' '.join(bad_ops)}")
 
-    if not args.client_counts:
-        raise RunnerError("--client-counts cannot be empty")
-    if any(n <= 0 for n in args.client_counts):
-        raise RunnerError("--client-counts values must be positive")
-
     if args.write_op_count <= 0:
         raise RunnerError("--write-op-count must be > 0")
     if args.read_op_count <= 0:
         raise RunnerError("--read-op-count must be > 0")
     if args.key_count <= 0:
         raise RunnerError("--key-count must be > 0")
-    if args.node_count is not None and args.node_count <= 0:
-        raise RunnerError("--node-count must be > 0 when provided")
     if not (1 <= args.ack_base_port <= 65535):
         raise RunnerError("--ack-base-port must be in [1, 65535]")
 
-    build_dir = Path(args.build_dir)
+    raw_hosts: List[str] = []
+    if args.hosts:
+        raw_hosts.extend(parse_hosts_text(args.hosts.replace(",", "\n")))
+
+    if args.hosts_file:
+        hosts_file = Path(args.hosts_file)
+        if not hosts_file.is_file():
+            raise RunnerError(f"hosts file not found: {hosts_file}")
+        raw_hosts.extend(parse_hosts_text(hosts_file.read_text(encoding="utf-8")))
+
+    hosts = unique_preserve_order(raw_hosts)
+    if not hosts:
+        raise RunnerError("no hosts provided; use --hosts and/or --hosts-file")
+
+    ssh_user = args.ssh_user.strip()
+    if not ssh_user:
+        raise RunnerError("--ssh-user is required")
+
+    remote_repo_dir = args.remote_repo_dir.strip()
+    if not remote_repo_dir:
+        remote_repo_dir = "/home/crown"
+
+    ssh_opts = [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    ssh_key = args.ssh_key.strip()
+    if ssh_key:
+        key_path = Path(ssh_key)
+        if not key_path.is_file():
+            raise RunnerError(f"ssh key not found: {ssh_key}")
+        ssh_opts = ["-i", str(key_path)] + ssh_opts
+
     work_dir = Path(args.work_dir)
     log_dir = work_dir / "logs"
-    cfg_dir = work_dir / "configs"
+    ssh_log_dir = work_dir / "ssh_logs"
     summary_csv = work_dir / "summary.csv"
 
     return RunnerConfig(
         root_dir=root_dir,
-        build_dir=build_dir,
         work_dir=work_dir,
         log_dir=log_dir,
-        cfg_dir=cfg_dir,
-        base_config=Path(args.base_config),
-        client_bin=Path(args.client_bin),
-        server_bin=Path(args.server_bin),
+        ssh_log_dir=ssh_log_dir,
+        summary_csv=summary_csv,
+        hosts=hosts,
         modes=modes,
         ops=ops,
-        client_counts=list(args.client_counts),
         write_op_count=args.write_op_count,
         read_op_count=args.read_op_count,
         key_count=args.key_count,
-        node_count_override=args.node_count,
+        craq_read_node_id=args.craq_read_node_id,
+        ssh_user=ssh_user,
+        ssh_opts=ssh_opts,
+        remote_repo_dir=remote_repo_dir,
+        remote_client_bin=args.remote_client_bin,
+        remote_config_template=args.remote_config_template,
+        remote_log_dir=args.remote_log_dir,
         key_prefix_base=args.key_prefix_base,
         value_prefix_base=args.value_prefix_base,
         ack_base_port=args.ack_base_port,
-        craq_read_node_id=args.craq_read_node_id,
-        build_first=args.build_first,
-        start_servers=args.start_servers,
         reconfigure_each_run=args.reconfigure_each_run,
-        summary_csv=summary_csv,
+        dry_run=args.dry_run,
+        fail_fast=args.fail_fast,
     )
 
 
-def wait_for_port(host: str, port: int, timeout_sec: float) -> bool:
-    deadline = time.monotonic() + timeout_sec
-    while time.monotonic() < deadline:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            sock.settimeout(0.2)
-            sock.connect((host, port))
-            return True
-        except OSError:
-            time.sleep(0.1)
-        finally:
-            sock.close()
-    return False
+def cleanup_previous_logs(cfg: RunnerConfig) -> None:
+    cfg.log_dir.mkdir(parents=True, exist_ok=True)
+    cfg.ssh_log_dir.mkdir(parents=True, exist_ok=True)
+
+    for path in cfg.log_dir.glob("*.log"):
+        path.unlink(missing_ok=True)
+    for path in cfg.ssh_log_dir.glob("*.log"):
+        path.unlink(missing_ok=True)
 
 
-def run_cmd(args: Sequence[str], quiet: bool = False) -> None:
-    kwargs = {}
-    if quiet:
-        kwargs["stdout"] = subprocess.DEVNULL
-        kwargs["stderr"] = subprocess.DEVNULL
-    try:
-        subprocess.run(args, check=True, **kwargs)
-    except subprocess.CalledProcessError as exc:
-        joined = " ".join(args)
-        raise RunnerError(f"command failed ({exc.returncode}): {joined}") from exc
-
-
-def cleanup_servers() -> None:
-    for sp in SERVER_PROCS:
-        if sp.process.poll() is None:
-            sp.process.terminate()
-
-    for sp in SERVER_PROCS:
-        if sp.process.poll() is None:
-            try:
-                sp.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                sp.process.kill()
-                sp.process.wait(timeout=5)
-
-    for sp in SERVER_PROCS:
-        try:
-            sp.log_handle.close()
-        except Exception:
-            pass
-
-    SERVER_PROCS.clear()
-
-
-def install_signal_handlers() -> None:
-    def _handle_signal(signum: int, _frame) -> None:  # type: ignore[override]
-        cleanup_servers()
-        sys.exit(128 + signum)
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
-
-def derive_config_generation_params(base_config: Path, node_count_override: int | None = None) -> tuple[str, int, int]:
-    with base_config.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    nodes = cfg.get("nodes", [])
-    if not isinstance(nodes, list) or not nodes:
-        raise RunnerError("invalid base config: missing non-empty nodes array")
-
-    ports = [int(node["port"]) for node in nodes]
-    base_port = min(ports)
-    expected = list(range(base_port, base_port + len(ports)))
-    if sorted(ports) != expected:
-        raise RunnerError("base config ports must be contiguous for mode config generation")
-
-    host = str(nodes[0]["host"])
-    node_count = len(nodes) if node_count_override is None else node_count_override
-    return host, base_port, node_count
-
-
-def ensure_executable(path: Path, label: str) -> None:
-    if not path.is_file() or not os.access(path, os.X_OK):
-        raise RunnerError(f"missing {label}: {path}")
-
-
-def start_servers(server_bin: Path, work_dir: Path, host: str, base_port: int, node_count: int) -> None:
-    log(f"Starting {node_count} server processes...")
-
-    for i in range(node_count):
-        port = base_port + i
-        server_log = work_dir / f"server_{port}.log"
-        log_handle = server_log.open("w", encoding="utf-8")
-
-        process = subprocess.Popen(
-            [str(server_bin), "--port", str(port)],
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-        )
-        SERVER_PROCS.append(StartedProcess(process=process, log_handle=log_handle))
-
-    time.sleep(1)
-
-    for i in range(node_count):
-        port = base_port + i
-        process = SERVER_PROCS[i].process
-
-        if process.poll() is not None:
-            raise RunnerError(f"server process died during startup (pid={process.pid})")
-
-        if not wait_for_port(host, port, timeout_sec=10):
-            raise RunnerError(f"server did not open {host}:{port} within startup timeout")
-
-
-def servers_healthy(host: str, base_port: int, node_count: int) -> bool:
-    if len(SERVER_PROCS) != node_count:
-        return False
-
-    for i in range(node_count):
-        port = base_port + i
-        process = SERVER_PROCS[i].process
-        if process.poll() is not None:
-            return False
-        if not wait_for_port(host, port, timeout_sec=0.2):
-            return False
-
-    return True
-
-
-def run_clients_for_case(
+def build_remote_client_command(
     cfg: RunnerConfig,
-    cfg_path: Path,
+    *,
     mode: str,
     op: str,
-    nclients: int,
-    run_idx: int,
-    force_first_configure: bool = False,
-) -> None:
-    total_ops = cfg.write_op_count if op == "write" else cfg.read_op_count
-    log(f"Running mode={mode} op={op} clients={nclients} total_ops={total_ops}")
+    client_index: int,
+    num_clients: int,
+    ack_port: int,
+    should_configure: bool,
+) -> tuple[List[str], str, str]:
+    configure_flag = "true" if should_configure else "false"
+    config_path = cfg.remote_config_template.format(mode=mode)
 
-    started: List[StartedProcess] = []
+    key_prefix = f"{cfg.key_prefix_base}-{mode}-{op}-"
+    value_prefix = f"{cfg.value_prefix_base}-{mode}-{op}-"
 
-    try:
-        for i in range(nclients):
-            ack_port = cfg.ack_base_port + run_idx * 100 + i
-            should_configure = (cfg.reconfigure_each_run or force_first_configure) and i == 0
-            configure_flag = "true" if should_configure else "false"
+    cmd = [
+        cfg.remote_client_bin,
+        config_path,
+        configure_flag,
+        str(ack_port),
+    ]
 
-            key_prefix = f"{cfg.key_prefix_base}-{mode}-{op}-"
-            value_prefix = f"{cfg.value_prefix_base}-{mode}-{op}-"
-            log_file = cfg.log_dir / f"{mode}_{op}_c{nclients}_i{i}.log"
-            log_handle = log_file.open("w", encoding="utf-8")
-
-            cmd = [
-                str(cfg.client_bin),
-                str(cfg_path),
-                configure_flag,
-                str(ack_port),
+    if op == "write":
+        cmd.extend(
+            [
+                "bench-write",
+                str(cfg.write_op_count),
+                str(cfg.key_count),
+                str(client_index),
+                str(num_clients),
+                key_prefix,
+                value_prefix,
             ]
+        )
+    else:
+        cmd.extend(
+            [
+                "bench-read",
+                str(cfg.read_op_count),
+                str(cfg.key_count),
+                str(client_index),
+                str(num_clients),
+                str(cfg.craq_read_node_id),
+                key_prefix,
+            ]
+        )
 
-            if op == "write":
-                cmd.extend(
-                    [
-                        "bench-write",
-                        str(cfg.write_op_count),
-                        str(cfg.key_count),
-                        str(i),
-                        str(nclients),
-                        key_prefix,
-                        value_prefix,
-                    ]
-                )
-            elif op == "read":
-                cmd.extend(
-                    [
-                        "bench-read",
-                        str(cfg.read_op_count),
-                        str(cfg.key_count),
-                        str(i),
-                        str(nclients),
-                        str(cfg.craq_read_node_id),
-                        key_prefix,
-                    ]
-                )
-            else:
-                raise RunnerError(f"unknown op in OPS: {op}")
-
-            process = subprocess.Popen(cmd, stdout=log_handle, stderr=subprocess.STDOUT)
-            started.append(StartedProcess(process=process, log_handle=log_handle))
-
-        failed = False
-        for sp in started:
-            if sp.process.wait() != 0:
-                failed = True
-
-        if failed:
-            raise RunnerError(f"one or more client processes failed for mode={mode} op={op} clients={nclients}")
-    finally:
-        for sp in started:
-            try:
-                sp.log_handle.close()
-            except Exception:
-                pass
+    remote_log_file = f"{cfg.remote_log_dir}/{mode}_{op}_c{num_clients}_i{client_index}.log"
+    return cmd, config_path, remote_log_file
 
 
-def main() -> int:
-    install_signal_handlers()
+def launch_case(cfg: RunnerConfig, mode: str, op: str, run_idx: int) -> None:
+    num_clients = len(cfg.hosts)
+    total_ops = cfg.write_op_count if op == "write" else cfg.read_op_count
+    log(f"Running mode={mode} op={op} clients={num_clients} total_ops={total_ops}")
 
-    root_dir = Path(__file__).resolve().parent.parent
-    args = parse_args(root_dir)
-    cfg = build_config(args, root_dir)
+    launches: List[ActiveLaunch] = []
 
-    cfg.log_dir.mkdir(parents=True, exist_ok=True)
-    cfg.cfg_dir.mkdir(parents=True, exist_ok=True)
+    for client_index, host in enumerate(cfg.hosts):
+        should_configure = cfg.reconfigure_each_run and client_index == 0
+        ack_port = cfg.ack_base_port + run_idx * 100 + client_index
 
-    if not cfg.base_config.is_file():
-        raise RunnerError(f"missing base config: {cfg.base_config}")
+        client_cmd, config_path, remote_log_file = build_remote_client_command(
+            cfg,
+            mode=mode,
+            op=op,
+            client_index=client_index,
+            num_clients=num_clients,
+            ack_port=ack_port,
+            should_configure=should_configure,
+        )
 
-    if cfg.build_first:
-        log("Building project...")
-        run_cmd(["cmake", "-S", str(cfg.root_dir), "-B", str(cfg.build_dir)], quiet=True)
-        run_cmd(["cmake", "--build", str(cfg.build_dir), "-j4"], quiet=True)
+        host_tag = host.replace("/", "_").replace(":", "_")
+        local_client_log = cfg.log_dir / f"{mode}_{op}_c{num_clients}_i{client_index}.log"
+        local_ssh_log = cfg.ssh_log_dir / f"{mode}_{op}_c{num_clients}_i{client_index}_{host_tag}.log"
 
-    ensure_executable(cfg.client_bin, "client binary")
-    ensure_executable(cfg.server_bin, "server binary")
+        remote_script = " ; ".join(
+            [
+                "set -euo pipefail",
+                f"cd {shell_quote(cfg.remote_repo_dir)}",
+                (
+                    f"if [[ ! -x {shell_quote(cfg.remote_client_bin)} ]]; then "
+                    f"echo 'missing client binary: {cfg.remote_client_bin}' >&2; exit 10; fi"
+                ),
+                (
+                    f"if [[ ! -f {shell_quote(config_path)} ]]; then "
+                    f"echo 'missing config file: {config_path}' >&2; exit 11; fi"
+                ),
+                f"mkdir -p {shell_quote(cfg.remote_log_dir)}",
+                (
+                    "echo "
+                    f"{shell_quote(f'[remote] host=$(hostname -f 2>/dev/null || hostname) client_index={client_index}/{num_clients} mode={mode} op={op}')}"
+                ),
+                f"{format_shell_cmd(client_cmd)} > {shell_quote(remote_log_file)} 2>&1",
+                f"echo {shell_quote(f'[remote] done client_index={client_index} log={remote_log_file}')}",
+            ]
+        )
 
-    cfg_chain = cfg.cfg_dir / "config.chain.json"
-    cfg_craq = cfg.cfg_dir / "config.craq.json"
-    cfg_crown = cfg.cfg_dir / "config.crown.json"
+        ssh_cmd = [
+            "ssh",
+            *cfg.ssh_opts,
+            f"{cfg.ssh_user}@{host}",
+            f"bash -lc {shell_quote(remote_script)}",
+        ]
+        scp_cmd = [
+            "scp",
+            *cfg.ssh_opts,
+            f"{cfg.ssh_user}@{host}:{remote_log_file}",
+            str(local_client_log),
+        ]
 
-    host, base_port, node_count = derive_config_generation_params(cfg.base_config, cfg.node_count_override)
-    if cfg.node_count_override is not None:
-        log(f"Using node-count override: {cfg.node_count_override}")
+        if cfg.dry_run:
+            log(f"[dry-run] launch: {format_shell_cmd(ssh_cmd)}")
+            log(f"[dry-run] collect: {format_shell_cmd(scp_cmd)}")
+            continue
 
-    log(f"Generating mode configs via setup/generate_mode_configs.py (host={host} base_port={base_port} nodes={node_count})...")
-    run_cmd(
-        [
-            sys.executable,
-            str(cfg.root_dir / "setup" / "generate_mode_configs.py"),
-            str(node_count),
-            "--base-port",
-            str(base_port),
-            "--host",
-            host,
-            "--output-dir",
-            str(cfg.cfg_dir),
-            "--prefix",
-            "config",
-        ],
-        quiet=True,
-    )
+        log_handle = local_ssh_log.open("w", encoding="utf-8")
+        process = subprocess.Popen(ssh_cmd, stdout=log_handle, stderr=subprocess.STDOUT)
+        launches.append(
+            ActiveLaunch(
+                host=host,
+                client_index=client_index,
+                remote_log_file=remote_log_file,
+                local_client_log=local_client_log,
+                local_ssh_log=local_ssh_log,
+                process=process,
+                log_handle=log_handle,
+            )
+        )
 
-    if cfg.start_servers:
-        start_servers(cfg.server_bin, cfg.work_dir, host, base_port, node_count)
+    if cfg.dry_run:
+        return
 
-    run_idx = 0
-    mode_to_cfg = {
-        "chain": cfg_chain,
-        "craq": cfg_craq,
-        "crown": cfg_crown,
-    }
+    failures: List[ActiveLaunch] = []
+    for launch in launches:
+        rc = launch.process.wait()
+        launch.log_handle.close()
+        if rc != 0:
+            failures.append(launch)
+            log(
+                f"Client failed host={launch.host} client_index={launch.client_index}; "
+                f"ssh log={launch.local_ssh_log}"
+            )
 
-    for mode_idx, mode in enumerate(cfg.modes):
-        cfg_path = mode_to_cfg.get(mode)
-        if cfg_path is None:
-            raise RunnerError(f"unknown mode in MODES: {mode}")
+    if failures:
+        raise RunnerError(
+            f"one or more distributed clients failed for mode={mode} op={op}; "
+            f"failed={len(failures)}/{len(launches)}"
+        )
 
-        mode_transition_restart = False
-        if cfg.start_servers and mode_idx > 0:
-            log(f"Restarting server cluster for mode transition -> {mode}...")
-            cleanup_servers()
-            start_servers(cfg.server_bin, cfg.work_dir, host, base_port, node_count)
-            mode_transition_restart = True
+    for launch in launches:
+        scp_cmd = [
+            "scp",
+            *cfg.ssh_opts,
+            f"{cfg.ssh_user}@{launch.host}:{launch.remote_log_file}",
+            str(launch.local_client_log),
+        ]
+        try:
+            run_cmd(scp_cmd)
+        except RunnerError as exc:
+            raise RunnerError(
+                f"failed to collect remote log for host={launch.host} "
+                f"client_index={launch.client_index} remote={launch.remote_log_file}"
+            ) from exc
 
-        for op in cfg.ops:
-            for nclients in cfg.client_counts:
-                force_first_configure = mode_transition_restart
-                mode_transition_restart = False
-                if cfg.start_servers and not servers_healthy(host, base_port, node_count):
-                    log("Detected unavailable server process; restarting server cluster before next case...")
-                    cleanup_servers()
-                    start_servers(cfg.server_bin, cfg.work_dir, host, base_port, node_count)
-                    force_first_configure = True
 
-                try:
-                    run_clients_for_case(
-                        cfg=cfg,
-                        cfg_path=cfg_path,
-                        mode=mode,
-                        op=op,
-                        nclients=nclients,
-                        run_idx=run_idx,
-                        force_first_configure=force_first_configure,
-                    )
-                except RunnerError as exc:
-                    if not cfg.start_servers:
-                        raise
-
-                    log(
-                        "Case failed; restarting server cluster and retrying once "
-                        f"(mode={mode} op={op} clients={nclients})."
-                    )
-                    cleanup_servers()
-                    start_servers(cfg.server_bin, cfg.work_dir, host, base_port, node_count)
-
-                    run_clients_for_case(
-                        cfg=cfg,
-                        cfg_path=cfg_path,
-                        mode=mode,
-                        op=op,
-                        nclients=nclients,
-                        run_idx=run_idx,
-                        force_first_configure=True,
-                    )
-                run_idx += 1
-
-    log("Aggregating BENCH_SUMMARY lines into CSV...")
+def aggregate_results(cfg: RunnerConfig) -> None:
     run_cmd(
         [
             sys.executable,
@@ -556,11 +481,45 @@ def main() -> int:
         ]
     )
 
-    log("Completed.")
-    log(f"Logs: {cfg.log_dir}")
-    log(f"Summary: {cfg.summary_csv}")
 
-    cleanup_servers()
+def main() -> int:
+    root_dir = Path(__file__).resolve().parent.parent
+    args = parse_args(root_dir)
+    cfg = build_config(args, root_dir)
+
+    cleanup_previous_logs(cfg)
+
+    log("Distributed benchmark configuration")
+    log(f"  hosts={cfg.hosts}")
+    log(f"  modes={cfg.modes}")
+    log(f"  ops={cfg.ops}")
+    log(f"  write_op_count={cfg.write_op_count}")
+    log(f"  read_op_count={cfg.read_op_count}")
+    log(f"  key_count={cfg.key_count}")
+    log(f"  work_dir={cfg.work_dir}")
+
+    run_idx = 0
+    for mode in cfg.modes:
+        for op in cfg.ops:
+            try:
+                launch_case(cfg, mode, op, run_idx)
+            except RunnerError:
+                if cfg.fail_fast:
+                    raise
+                log(f"Continuing after failed case mode={mode} op={op} because --fail-fast=false")
+            run_idx += 1
+
+    if cfg.dry_run:
+        log("Dry run complete. No commands executed.")
+        return 0
+
+    log("Aggregating BENCH_SUMMARY lines into CSV...")
+    aggregate_results(cfg)
+
+    log("Completed distributed throughput runs.")
+    log(f"Client logs: {cfg.log_dir}")
+    log(f"SSH logs: {cfg.ssh_log_dir}")
+    log(f"Summary: {cfg.summary_csv}")
     return 0
 
 
@@ -569,5 +528,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except RunnerError as exc:
         print(f"[throughput-runner] ERROR: {exc}", file=sys.stderr)
-        cleanup_servers()
         raise SystemExit(1)

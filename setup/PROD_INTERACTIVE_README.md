@@ -58,26 +58,28 @@ CRAQ:
 
 `for i in 1 2 3 4 5; do h="sp26-cs525-120${i}.cs.illinois.edu"; ssh <user>@$h "pkill -f './build/server --port' || true"; done`
 
-## 9) Run distributed write benchmark (one client per VM)
+## 9) Run distributed throughput tests (single or multiple client VMs)
 
-Step 4 command to run from a controller VM:
+Run from your controller VM (or from one of the client VMs):
 
-`cd /home/ritwikg3/crown && bash ./setup/run_prod_distributed_write_bench.bash --hosts "$(cat setup/prod_hosts.csv)" --ssh-user ritwikg3 --remote-repo-dir /home/ritwikg3/crown --config-path build/prod_configs/config.crown.json --write-op-count 50000 --key-count 64 --ack-port 61000`
+`cd /home/crown`
 
-The hosts list is read from `setup/prod_hosts.csv` in this repo.
+### Single-client run (one client VM)
 
-Alternative host list format is still supported:
+`python3 setup/run_throughput_experiments.py --hosts sp26-cs525-1201.cs.illinois.edu --ssh-user ritwikg3 --remote-repo-dir /home/crown --modes chain craq crown --ops write read --write-op-count 5000 --read-op-count 5000 --key-count 64 --work-dir build/prod_throughput_single_client`
 
-`cp setup/prod_hosts.sample.txt setup/prod_hosts.txt && bash ./setup/run_prod_distributed_write_bench.bash --hosts-file setup/prod_hosts.txt --ssh-user ritwikg3 --remote-repo-dir /home/ritwikg3/crown --config-path build/prod_configs/config.crown.json --write-op-count 50000 --key-count 64`
+### Multi-client simultaneous run (one client process per VM)
+
+`python3 setup/run_throughput_experiments.py --hosts "$(cat setup/prod_hosts.csv)" --ssh-user ritwikg3 --remote-repo-dir /home/crown --modes chain craq crown --ops write read --write-op-count 50000 --read-op-count 50000 --key-count 64 --work-dir build/prod_throughput_multi_client`
 
 Behavior:
 
-- SSHes to each host and launches one `bench-write` client per host.
-- Assigns `client_index` automatically (`0..N-1`) based on host order.
-- Uses `configure=true` only on the first host/client; others run with `configure=false`.
-- Waits for all clients to finish and reports per-host success/failure.
-- Writes remote client logs under `build/prod_bench_logs` on each VM.
-- Writes local SSH launcher logs under `build/prod_ssh_launcher_logs`.
+- Launches exactly one client process per host in `--hosts`.
+- Auto-assigns `client_index=0..N-1` in host order.
+- Uses `configure=true` only on the first client in each mode/op case.
+- Collects remote logs to local `--work-dir/logs`.
+- Writes SSH execution logs to local `--work-dir/ssh_logs`.
+- Writes aggregate summary to local `--work-dir/summary.csv`.
 
 ## Notes
 
