@@ -69,7 +69,7 @@ chain::WriteResponse CROWNReplication::handle_write(const chain::WriteRequest& r
     }
 
     const uint64_t version = support_.assign_next_version(req.key());
-    support_.record_local_write(req.key(), req.value(), version);
+    support_.record_local_write_if_newer(req.key(), req.value(), version);
 
     cout << "[CROWN] Head accepted write key='" << req.key()
         << "' assigned version=" << version
@@ -80,7 +80,7 @@ chain::WriteResponse CROWNReplication::handle_write(const chain::WriteRequest& r
     resp.set_version(version);
 
     if (node.is_tail_for(req.key())) {
-       support_.mark_version_clean(req.key(), version);
+        support_.mark_version_committed_if_newer(req.key(), req.value(), version);
 
         cout << "[CROWN] Single-node ownership committed key='" << req.key()
              << "' version=" << version << "\n";
@@ -90,7 +90,7 @@ chain::WriteResponse CROWNReplication::handle_write(const chain::WriteRequest& r
         ack.set_version(version);
         ack.set_client_addr(req.client_addr());
         ack.set_request_id(req.request_id());
-        support_.enqueue_client_ack(ack);
+        support_.send_client_ack(ack);
 
         return resp;
     }
@@ -118,18 +118,18 @@ chain::ReadResponse CROWNReplication::handle_read(const chain::ReadRequest& req,
         throw runtime_error("CROWN read rejected: node is not key tail");
     }
 
-    const auto clean = support_.read_clean(req.key());
-    if (!clean.found) {
+        const auto committed = support_.read_committed(req.key());
+        if (!committed.found) {
         throw runtime_error("CROWN read failed: key not found or not committed");
     }
 
     cout << "[CROWN] Tail serving read key='" << req.key()
-         << "' CLEAN version=" << clean.version << "\n";
+            << "' committed version=" << committed.version << "\n";
 
     chain::ReadResponse resp;
     resp.set_key(req.key());
-    resp.set_value(clean.value);
-    resp.set_version(clean.version);
+        resp.set_value(committed.value);
+        resp.set_version(committed.version);
     return resp;
 }
 
@@ -140,12 +140,12 @@ void CROWNReplication::handle_propagate(const chain::PropagateRequest& req, Node
         throw runtime_error("CROWN propagate rejected: version must be non-zero");
     }
 
-    support_.record_local_write(req.key(), req.value(), req.version());
+    support_.record_local_write_if_newer(req.key(), req.value(), req.version());
     cout << "[CROWN] Node " << crown_node_label(node)
-         << " recorded DIRTY key='" << req.key() << "' version=" << req.version() << "\n";
+         << " recorded propagated write key='" << req.key() << "' version=" << req.version() << "\n";
 
     if (node.is_tail_for(req.key())) {
-        support_.mark_version_clean(req.key(), req.version());
+        support_.mark_version_committed_if_newer(req.key(), req.value(), req.version());
 
         cout << "[CROWN] Key-tail committed key='" << req.key()
              << " version=" << req.version() << " and notifying client directly\n";
@@ -155,7 +155,7 @@ void CROWNReplication::handle_propagate(const chain::PropagateRequest& req, Node
         ack.set_version(req.version());
         ack.set_client_addr(req.client_addr());
         ack.set_request_id(req.request_id());
-        support_.enqueue_client_ack(ack);
+        support_.send_client_ack(ack);
         return;
     }
 
@@ -164,7 +164,7 @@ void CROWNReplication::handle_propagate(const chain::PropagateRequest& req, Node
     forward_propagate_clockwise_async(succ, std::move(fwd), crown_node_label(node));
 
     cout << "[CROWN] Node " << crown_node_label(node)
-         << " forwarded DIRTY PROPAGATE clockwise key='" << req.key()
+            << " forwarded PROPAGATE clockwise key='" << req.key()
          << "' version=" << req.version() << "\n";
 }
 
@@ -176,5 +176,4 @@ void CROWNReplication::handle_ack(const chain::AckRequest& req, Node& node) {
 
 void CROWNReplication::on_config_change(Node& node) {
     support_.on_config_change(node);
-    support_.start_ack_workers();
 }

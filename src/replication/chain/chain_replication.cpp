@@ -52,7 +52,7 @@ chain::WriteResponse ChainReplication::handle_write(const chain::WriteRequest& r
     }
 
     const uint64_t version = support_.assign_next_version(req.key());
-    support_.record_local_write(req.key(), req.value(), version);
+    support_.record_local_write_if_newer(req.key(), req.value(), version);
 
     cout << "[Chain] Head " << chain_node_label(node)
         << " accepted write key='" << req.key() << "' version=" << version
@@ -63,16 +63,16 @@ chain::WriteResponse ChainReplication::handle_write(const chain::WriteRequest& r
     resp.set_version(version);
 
     if (node.is_tail()) {
-       support_.mark_version_clean(req.key(), version);
-       cout << "[Chain] Single-node chain committed immediately key='" << req.key()
-           << "' version=" << version << "\n";
+        support_.mark_version_committed_if_newer(req.key(), req.value(), version);
+        cout << "[Chain] Single-node chain committed immediately key='" << req.key()
+             << "' version=" << version << "\n";
 
         chain::AckRequest ack;
         ack.set_key(req.key());
         ack.set_version(version);
         ack.set_client_addr(req.client_addr());
         ack.set_request_id(req.request_id());
-        support_.enqueue_client_ack(ack);
+        support_.send_client_ack(ack);
 
         return resp;
     }
@@ -98,28 +98,28 @@ chain::ReadResponse ChainReplication::handle_read(const chain::ReadRequest& req,
         throw runtime_error("CHAIN read rejected: node is not tail");
     }
 
-    const auto clean = support_.read_clean(req.key());
-    if (!clean.found) {
+        const auto committed = support_.read_committed(req.key());
+        if (!committed.found) {
         throw runtime_error("CHAIN read failed: key not found or not committed");
     }
 
     cout << "[Chain] Tail " << chain_node_label(node)
-         << " serving CLEAN read key='" << req.key() << "' version=" << clean.version << "\n";
+            << " serving committed read key='" << req.key() << "' version=" << committed.version << "\n";
 
     chain::ReadResponse resp;
     resp.set_key(req.key());
-    resp.set_value(clean.value);
-    resp.set_version(clean.version);
+        resp.set_value(committed.value);
+        resp.set_version(committed.version);
     return resp;
 }
 
 void ChainReplication::handle_propagate(const chain::PropagateRequest& req, Node& node) {
     cout << "[Chain] Node " << chain_node_label(node)
          << " received PROPAGATE key='" << req.key() << "' version=" << req.version() << "\n";
-    support_.record_local_write(req.key(), req.value(), req.version());
+    support_.record_local_write_if_newer(req.key(), req.value(), req.version());
 
     if (node.is_tail()) {
-        support_.mark_version_clean(req.key(), req.version());
+        support_.mark_version_committed_if_newer(req.key(), req.value(), req.version());
 
         cout << "[Chain] Tail committed key='" << req.key() << "' version=" << req.version()
              << " and will notify client asynchronously\n";
@@ -129,7 +129,7 @@ void ChainReplication::handle_propagate(const chain::PropagateRequest& req, Node
         ack.set_version(req.version());
         ack.set_client_addr(req.client_addr());
         ack.set_request_id(req.request_id());
-        support_.enqueue_client_ack(ack);
+        support_.send_client_ack(ack);
         return;
     }
 
@@ -150,5 +150,4 @@ void ChainReplication::handle_ack(const chain::AckRequest& req, Node& node) {
 
 void ChainReplication::on_config_change(Node& node) {
     support_.on_config_change(node);
-    support_.start_ack_workers();
 }

@@ -57,6 +57,7 @@ Clone/pull repo, build project, start node in tmux.
   - `PROJECT_SUBDIR`: Path within repo (use `.` for repo root)
   - `NODE_HOST`: Bind address (default: `0.0.0.0`)
   - `NODE_PORT`: Server port (default: `5001`)
+  - `SERVER_LOG`: `true`/`false` to enable server stdout/stderr logs (default: `false`)
 - ✅ Shared session names: `crown_node_${port}` by default
 - ✅ Shared log/pid directories: `${PROJECT_DIR}/run/shared/`
 - ✅ Shared tmux socket: `/tmp/crown-shared/tmux.sock` (others can attach)
@@ -76,6 +77,9 @@ NODE_PORT=5002 PROJECT_MODE=crown ./start_server.bash
 # Multiple nodes on same VM:
 NODE_PORT=5001 ./start_server.bash
 NODE_PORT=5002 ./start_server.bash
+
+# Enable server logs explicitly:
+SERVER_LOG=true NODE_PORT=5001 ./start_server.bash
 ```
 
 **Output:**
