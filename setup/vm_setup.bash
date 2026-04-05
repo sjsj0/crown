@@ -50,10 +50,10 @@ LOCAL_SCRIPT_NAME="$(basename "$LOCAL_SCRIPT")"
 
 # Hosts (without usernames)
 hosts=(
- "sp26-cs525-1201.cs.illinois.edu"
- "sp26-cs525-1202.cs.illinois.edu"
- "sp26-cs525-1203.cs.illinois.edu"
-#  "sp26-cs525-1204.cs.illinois.edu"
+#  "sp26-cs525-1201.cs.illinois.edu"
+#  "sp26-cs525-1202.cs.illinois.edu"
+#  "sp26-cs525-1203.cs.illinois.edu"
+ "sp26-cs525-1204.cs.illinois.edu"
 #  "sp26-cs525-1205.cs.illinois.edu"
 #  "sp26-cs525-1206.cs.illinois.edu"
 #  "sp26-cs525-1207.cs.illinois.edu"
@@ -61,7 +61,7 @@ hosts=(
 #  "sp26-cs525-1209.cs.illinois.edu"
 #  "sp26-cs525-1210.cs.illinois.edu"
 #  "sp26-cs525-1211.cs.illinois.edu"
- "sp26-cs525-1212.cs.illinois.edu"
+#  "sp26-cs525-1212.cs.illinois.edu"
 #  "sp26-cs525-1213.cs.illinois.edu"
 #  "sp26-cs525-1214.cs.illinois.edu"
 #  "sp26-cs525-1215.cs.illinois.edu"
@@ -83,6 +83,6 @@ for host in "${hosts[@]}"; do
 
   echo "   -> running $REMOTE_SCRIPT"
   ssh -t "${SSH_OPTS[@]}" "$server" \
-    "SSH_USER='$SSH_USER' REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REMOTE_BASE_DIR='$REMOTE_BASE_DIR' REPO_NAME='$REPO_NAME' PROJECT_SUBDIR='$PROJECT_SUBDIR' PROJECT_MODE='${PROJECT_MODE:-crown}' BUILD_TYPE='${BUILD_TYPE:-Release}' NODE_HOST='${NODE_HOST:-0.0.0.0}' NODE_PORT='${NODE_PORT:-5001}' SERVER_LOG='${SERVER_LOG:-false}' TMUX_SESSION_NAME='${TMUX_SESSION_NAME:-}' TMUX_SOCKET='${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}' RUN_SCOPE='${RUN_SCOPE:-shared}' tr -d '\r' < '$REMOTE_SCRIPT' | bash -s --"
+    "export SSH_USER='$SSH_USER' REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REMOTE_BASE_DIR='$REMOTE_BASE_DIR' REPO_NAME='$REPO_NAME' PROJECT_SUBDIR='$PROJECT_SUBDIR' PROJECT_MODE='${PROJECT_MODE:-crown}' BUILD_TYPE='${BUILD_TYPE:-Release}' NODE_HOST='${NODE_HOST:-0.0.0.0}' NODE_PORT='${NODE_PORT:-5001}' SERVER_LOG='${SERVER_LOG:-false}' TMUX_SESSION_NAME='${TMUX_SESSION_NAME:-}' TMUX_SOCKET='${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}' RUN_SCOPE='${RUN_SCOPE:-shared}'; tr -d '\r' < '$REMOTE_SCRIPT' | bash -s --"
 done
 

@@ -76,6 +76,15 @@ fi
 
 NODE_HOST="${NODE_HOST:-0.0.0.0}"
 NODE_PORT="${NODE_PORT:-5001}"
+SERVER_LOG_RAW="${SERVER_LOG:-true}"
+case "${SERVER_LOG_RAW,,}" in
+  1|true|yes|y|on) SERVER_LOG="true" ;;
+  0|false|no|n|off|"") SERVER_LOG="false" ;;
+  *)
+    echo "ERROR: SERVER_LOG must be true/false (or 1/0, yes/no). Got: $SERVER_LOG_RAW"
+    exit 1
+    ;;
+esac
 RUN_SCOPE="${RUN_SCOPE:-shared}"
 TMUX_SOCKET="${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}"
 SESSION_NAME="${TMUX_SESSION_NAME:-crown}"
@@ -84,6 +93,7 @@ RUN_DIR="$PROJECT_DIR/run/$RUN_SCOPE"
 mkdir -p "$RUN_DIR"
 PID_FILE="$RUN_DIR/server_${NODE_PORT}.pid"
 LOG_FILE="$RUN_DIR/server_${NODE_PORT}.log"
+OUT_FILE="$RUN_DIR/server_${NODE_PORT}.out"
 
 TMUX_SOCKET_DIR="$(dirname "$TMUX_SOCKET")"
 mkdir -p "$TMUX_SOCKET_DIR"
@@ -107,10 +117,13 @@ fi
 
 pkill -u "$DEPLOY_USER" -f "server --host .* --port $NODE_PORT" >/dev/null 2>&1 || true
 
-echo "Starting $NODE_BIN --host $NODE_HOST --port $NODE_PORT"
-"${TMUX_CMD[@]}" new-session -d -s "$SESSION_NAME" "cd '$PROJECT_DIR' && exec '$NODE_BIN' --host '$NODE_HOST' --port '$NODE_PORT'"
+SERVER_CMD="cd '$PROJECT_DIR' && exec '$NODE_BIN' --host '$NODE_HOST' --port '$NODE_PORT' --server-log '$SERVER_LOG'"
+echo "Run command: $SERVER_CMD"
+echo "Starting $NODE_BIN --host $NODE_HOST --port $NODE_PORT --server-log $SERVER_LOG"
+printf '[launch] %s\n' "$SERVER_CMD" | tee -a "$LOG_FILE" >> "$OUT_FILE"
+"${TMUX_CMD[@]}" new-session -d -s "$SESSION_NAME" "$SERVER_CMD"
 chmod 666 "$TMUX_SOCKET" 2>/dev/null || true
-"${TMUX_CMD[@]}" pipe-pane -o -t "$SESSION_NAME:0.0" "cat >> '$LOG_FILE'"
+"${TMUX_CMD[@]}" pipe-pane -o -t "$SESSION_NAME:0.0" "cat | tee -a '$LOG_FILE' >> '$OUT_FILE'"
 
 NEW_PID="$("${TMUX_CMD[@]}" display-message -p -t "$SESSION_NAME:0.0" "#{pane_pid}")"
 echo "$NEW_PID" > "$PID_FILE"
@@ -118,5 +131,6 @@ echo "$NEW_PID" > "$PID_FILE"
 echo "Server started in tmux session: $SESSION_NAME"
 echo "Server pane pid: $NEW_PID"
 echo "log: $LOG_FILE"
+echo "out: $OUT_FILE"
 echo "pid: $PID_FILE"
 echo "  attach: tmux -S $TMUX_SOCKET attach -t $SESSION_NAME"

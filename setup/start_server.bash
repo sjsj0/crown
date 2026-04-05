@@ -119,6 +119,28 @@ done
 # 3) Configure + build
 # ---------------------------
 BUILD_TYPE="${BUILD_TYPE:-Release}"
+
+# Shared deployments can leave build/_deps owned by a different user.
+# Normalize permissions and clear stale FetchContent cache before configuring.
+if [[ -d "build" ]]; then
+  echo "Preparing existing build directory permissions..."
+  if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    sudo chown -R "$DEPLOY_USER":"$DEPLOY_USER" build || true
+    sudo chmod -R u+rwX,go+rwX build || true
+  else
+    chmod -R u+rwX,go+rwX build 2>/dev/null || true
+  fi
+
+  if [[ -d "build/_deps" || -f "build/CMakeCache.txt" || -d "build/CMakeFiles" ]]; then
+    echo "Clearing stale CMake/FetchContent state..."
+    if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+      sudo rm -rf build/_deps build/CMakeCache.txt build/CMakeFiles
+    else
+      rm -rf build/_deps build/CMakeCache.txt build/CMakeFiles
+    fi
+  fi
+fi
+
 echo "Configuring with CMake (type=$BUILD_TYPE)..."
 cmake -S . -B build -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
 
@@ -149,7 +171,7 @@ fi
 # ---------------------------
 NODE_HOST="${NODE_HOST:-0.0.0.0}"
 NODE_PORT="${NODE_PORT:-5001}"
-SERVER_LOG_RAW="${SERVER_LOG:-false}"
+SERVER_LOG_RAW="${SERVER_LOG:-true}"
 case "${SERVER_LOG_RAW,,}" in
   1|true|yes|y|on) SERVER_LOG="true" ;;
   0|false|no|n|off|"") SERVER_LOG="false" ;;
@@ -163,6 +185,7 @@ RUN_DIR="$PROJECT_DIR/run/$RUN_SCOPE"
 mkdir -p "$RUN_DIR"
 PID_FILE="$RUN_DIR/server_${NODE_PORT}.pid"
 LOG_FILE="$RUN_DIR/server_${NODE_PORT}.log"
+OUT_FILE="$RUN_DIR/server_${NODE_PORT}.out"
 # SESSION_NAME="${TMUX_SESSION_NAME:-crown_node_${NODE_PORT}}"
 SESSION_NAME="${TMUX_SESSION_NAME:-crown}"
 TMUX_SOCKET="${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}"
@@ -175,6 +198,7 @@ echo "Shared paths:"
 echo "  run_dir: $RUN_DIR"
 echo "  pid_file: $PID_FILE"
 echo "  log_file: $LOG_FILE"
+echo "  out_file: $OUT_FILE"
 echo "  session: $SESSION_NAME"
 echo "  tmux_socket: $TMUX_SOCKET"
 
@@ -196,10 +220,13 @@ fi
 # Kill any remaining server process for this user/port before starting.
 pkill -u "$DEPLOY_USER" -f "server --host .* --port $NODE_PORT" >/dev/null 2>&1 || true
 
+SERVER_CMD="cd '$PROJECT_DIR' && exec '$NODE_BIN' --host '$NODE_HOST' --port '$NODE_PORT' --server-log '$SERVER_LOG'"
+echo "Run command: $SERVER_CMD"
 echo "Starting $NODE_BIN --host $NODE_HOST --port $NODE_PORT --server-log $SERVER_LOG"
-"${TMUX_CMD[@]}" new-session -d -s "$SESSION_NAME" "cd '$PROJECT_DIR' && exec '$NODE_BIN' --host '$NODE_HOST' --port '$NODE_PORT' --server-log '$SERVER_LOG'"
+printf '[launch] %s\n' "$SERVER_CMD" | tee -a "$LOG_FILE" >> "$OUT_FILE"
+"${TMUX_CMD[@]}" new-session -d -s "$SESSION_NAME" "$SERVER_CMD"
 chmod 666 "$TMUX_SOCKET" 2>/dev/null || true
-"${TMUX_CMD[@]}" pipe-pane -o -t "$SESSION_NAME:0.0" "cat >> '$LOG_FILE'"
+"${TMUX_CMD[@]}" pipe-pane -o -t "$SESSION_NAME:0.0" "cat | tee -a '$LOG_FILE' >> '$OUT_FILE'"
 
 NEW_PID="$("${TMUX_CMD[@]}" display-message -p -t "$SESSION_NAME:0.0" "#{pane_pid}")"
 echo "$NEW_PID" > "$PID_FILE"
@@ -207,6 +234,7 @@ echo "$NEW_PID" > "$PID_FILE"
 echo "Server started in tmux session: $SESSION_NAME"
 echo "Server pane pid: $NEW_PID"
 echo "log: $LOG_FILE"
+echo "out: $OUT_FILE"
 echo "pid: $PID_FILE"
 echo "attach: tmux -S $TMUX_SOCKET attach -t $SESSION_NAME"
 
