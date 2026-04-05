@@ -32,7 +32,7 @@ fi
 
 # Which local script to send and run remotely
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <setup|start|build|deploy|kill>"
+  echo "Usage: $0 <setup|start|build|deploy|rerun|kill>"
   echo "  Example: $0 setup"
   exit 1
 fi
@@ -41,8 +41,9 @@ ACTION="$1"
 case "$ACTION" in
   setup) LOCAL_SCRIPT="$SCRIPT_DIR/setup.bash" ;;
   start|build|deploy) LOCAL_SCRIPT="$SCRIPT_DIR/start_server.bash" ;;
+  rerun) LOCAL_SCRIPT="$SCRIPT_DIR/rerun.bash" ;;
   kill)  LOCAL_SCRIPT="$SCRIPT_DIR/kill.bash" ;;
-  *) echo "Invalid action: $ACTION"; echo "Usage: $0 <setup|start|build|deploy|kill>"; exit 1 ;;
+  *) echo "Invalid action: $ACTION"; echo "Usage: $0 <setup|start|build|deploy|rerun|kill>"; exit 1 ;;
 esac
 [[ -f "$LOCAL_SCRIPT" ]] || { echo "Error: $LOCAL_SCRIPT not found"; exit 1; }
 REMOTE_SCRIPT="/home/${SSH_USER}/$(basename "$LOCAL_SCRIPT")"
