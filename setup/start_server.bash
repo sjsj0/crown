@@ -65,6 +65,17 @@ else
   git clone -b "$REPO_BRANCH" "$REPO_URL" "$REPO_NAME"
 fi
 
+# Always enforce shared access on the repo directory.
+if [[ -e "$REPO_DIR" ]]; then
+  if chmod -R 777 "$REPO_DIR" 2>/dev/null; then
+    :
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    sudo chmod -R 777 "$REPO_DIR"
+  else
+    echo "Warning: unable to set shared permissions on $REPO_DIR (need sudo)."
+  fi
+fi
+
 # ---------------------------
 # 2) Resolve project path based on mode
 # ---------------------------
