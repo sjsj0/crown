@@ -96,6 +96,7 @@ static unordered_map<uint64_t, PendingWrite> g_pending;  // request_id -> Pendin
 
 // Monotonically increasing request ID generator.
 static atomic<uint64_t> g_next_request_id{1};
+static atomic<bool> g_benchmark_mode_active{false};
 
 // ============================================================
 // Benchmark helpers
@@ -478,18 +479,31 @@ static uint64_t add_pending(const string& key, const string& value) {
 
 // Called by the Ack listener thread. Removes from map and prints confirmation.
 static void ack_pending(uint64_t request_id, uint64_t version) {
-    lock_guard<mutex> lk(g_pending_mtx);
-    auto it = g_pending.find(request_id);
-    if (it == g_pending.end()) {
-        // Already removed or unknown — ignore.
-        cout << "\n[Ack] Received ack for unknown request_id=" << request_id << "\n> " << flush;
+    string key;
+    bool found = false;
+    {
+        lock_guard<mutex> lk(g_pending_mtx);
+        auto it = g_pending.find(request_id);
+        if (it != g_pending.end()) {
+            key = it->second.key;
+            g_pending.erase(it);
+            found = true;
+        }
+    }
+
+    if (!found) {
+        if (!g_benchmark_mode_active.load(memory_order_relaxed)) {
+            cout << "\n[Ack] Received ack for unknown request_id=" << request_id << "\n> " << flush;
+        }
         return;
     }
-        benchmark_note_write_ack(request_id);
-    cout << "\n[Ack] Write committed: request_id=" << request_id
-         << " key='" << it->second.key << "'"
-         << " version=" << version << "\n> " << flush;
-    g_pending.erase(it);
+
+    benchmark_note_write_ack(request_id);
+    if (!g_benchmark_mode_active.load(memory_order_relaxed)) {
+        cout << "\n[Ack] Write committed: request_id=" << request_id
+             << " key='" << key << "'"
+             << " version=" << version << "\n> " << flush;
+    }
 }
 
 // ============================================================
@@ -1172,6 +1186,8 @@ int main(int argc, char** argv) {
     if (run_mode == ClientRunMode::INTERACTIVE) {
         run_interactive_loop(topo, client_addr);
     } else {
+        g_benchmark_mode_active.store(true, memory_order_release);
+
         const bool is_write = (run_mode == ClientRunMode::BENCH_WRITE);
         cout << "[Client] Running " << (is_write ? "bench-write" : "bench-read")
              << " mode=" << mode_name(mode)
@@ -1193,6 +1209,8 @@ int main(int argc, char** argv) {
             + ":c" + to_string(bench_cfg.client_index)
             + "/" + to_string(bench_cfg.num_clients);
         cout << benchmark_summary_line(summary, tag) << "\n";
+
+        g_benchmark_mode_active.store(false, memory_order_release);
     }
 
     // --- Shutdown ----------------------------------------------
