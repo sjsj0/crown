@@ -37,9 +37,8 @@ class RunnerConfig:
     modes: List[str]
     ops: List[str]
     client_counts: List[int]
-    duration_sec: float
-    write_rate_rps: float
-    read_rate_rps: float
+    write_op_count: int
+    read_op_count: int
     key_count: int
     node_count_override: int | None
     key_prefix_base: str
@@ -81,16 +80,6 @@ def env_optional_int(name: str) -> int | None:
         return int(raw)
     except ValueError as exc:
         raise RunnerError(f"invalid integer for {name}: {raw}") from exc
-
-
-def env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except ValueError as exc:
-        raise RunnerError(f"invalid float for {name}: {raw}") from exc
 
 
 def env_words(name: str, default: str) -> List[str]:
@@ -137,9 +126,8 @@ def parse_args(root_dir: Path) -> argparse.Namespace:
         default=[int(v) for v in env_words("CLIENT_COUNTS", "1 2 4 8")],
     )
 
-    p.add_argument("--duration-sec", type=float, default=env_float("DURATION_SEC", 10.0))
-    p.add_argument("--write-rate-rps", type=float, default=env_float("WRITE_RATE_RPS", 100.0))
-    p.add_argument("--read-rate-rps", type=float, default=env_float("READ_RATE_RPS", 100.0))
+    p.add_argument("--write-op-count", type=int, default=env_int("WRITE_OP_COUNT", 5000))
+    p.add_argument("--read-op-count", type=int, default=env_int("READ_OP_COUNT", 5000))
     p.add_argument("--key-count", type=int, default=env_int("KEY_COUNT", 64))
     p.add_argument(
         "--node-count",
@@ -199,12 +187,10 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
     if any(n <= 0 for n in args.client_counts):
         raise RunnerError("--client-counts values must be positive")
 
-    if args.duration_sec <= 0:
-        raise RunnerError("--duration-sec must be > 0")
-    if args.write_rate_rps <= 0:
-        raise RunnerError("--write-rate-rps must be > 0")
-    if args.read_rate_rps <= 0:
-        raise RunnerError("--read-rate-rps must be > 0")
+    if args.write_op_count <= 0:
+        raise RunnerError("--write-op-count must be > 0")
+    if args.read_op_count <= 0:
+        raise RunnerError("--read-op-count must be > 0")
     if args.key_count <= 0:
         raise RunnerError("--key-count must be > 0")
     if args.node_count is not None and args.node_count <= 0:
@@ -230,9 +216,8 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
         modes=modes,
         ops=ops,
         client_counts=list(args.client_counts),
-        duration_sec=args.duration_sec,
-        write_rate_rps=args.write_rate_rps,
-        read_rate_rps=args.read_rate_rps,
+        write_op_count=args.write_op_count,
+        read_op_count=args.read_op_count,
         key_count=args.key_count,
         node_count_override=args.node_count,
         key_prefix_base=args.key_prefix_base,
@@ -380,7 +365,8 @@ def run_clients_for_case(
     run_idx: int,
     force_first_configure: bool = False,
 ) -> None:
-    log(f"Running mode={mode} op={op} clients={nclients} duration={cfg.duration_sec}s")
+    total_ops = cfg.write_op_count if op == "write" else cfg.read_op_count
+    log(f"Running mode={mode} op={op} clients={nclients} total_ops={total_ops}")
 
     started: List[StartedProcess] = []
 
@@ -406,8 +392,7 @@ def run_clients_for_case(
                 cmd.extend(
                     [
                         "bench-write",
-                        str(cfg.duration_sec),
-                        str(cfg.write_rate_rps),
+                        str(cfg.write_op_count),
                         str(cfg.key_count),
                         str(i),
                         str(nclients),
@@ -419,8 +404,7 @@ def run_clients_for_case(
                 cmd.extend(
                     [
                         "bench-read",
-                        str(cfg.duration_sec),
-                        str(cfg.read_rate_rps),
+                        str(cfg.read_op_count),
                         str(cfg.key_count),
                         str(i),
                         str(nclients),

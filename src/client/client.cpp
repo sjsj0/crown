@@ -179,22 +179,6 @@ static shared_ptr<ThroughputMetricsState> benchmark_current_metrics_state() {
     state.enabled.store(false, memory_order_release);
 }
 
-[[maybe_unused]] static double benchmark_per_client_rate(double total_rate_per_sec, int num_clients) {
-    if (total_rate_per_sec <= 0.0 || num_clients <= 0) return 0.0;
-    return total_rate_per_sec / static_cast<double>(num_clients);
-}
-
-[[maybe_unused]] static SteadyClock::time_point benchmark_next_send_time(
-    SteadyClock::time_point window_start,
-    uint64_t send_count,
-    double rate_per_sec) {
-    if (rate_per_sec <= 0.0) return window_start;
-
-    const long double nanos =
-        (static_cast<long double>(send_count) * 1000000000.0L) / static_cast<long double>(rate_per_sec);
-    return window_start + chrono::nanoseconds(static_cast<int64_t>(nanos));
-}
-
 [[maybe_unused]] static string benchmark_key_for_index(const string& prefix, uint64_t index) {
     return prefix + to_string(index);
 }
@@ -330,8 +314,7 @@ enum class ClientRunMode {
 };
 
 struct BenchmarkRunConfig {
-    double duration_sec = 0.0;
-    double total_rate_rps = 0.0;
+    uint64_t total_ops = 0;
     int key_count = 0;
     int client_index = 0;
     int num_clients = 1;
@@ -354,11 +337,11 @@ static bool parse_int_text(const string& s, int& out) {
     }
 }
 
-static bool parse_double_text(const string& s, double& out) {
+static bool parse_uint64_text(const string& s, uint64_t& out) {
     if (s.empty()) return false;
     try {
         size_t consumed = 0;
-        out = stod(s, &consumed);
+        out = stoull(s, &consumed, 10);
         return consumed == s.size();
     } catch (...) {
         return false;
@@ -396,8 +379,8 @@ static bool benchmark_wait_for_pending_acks(chrono::milliseconds timeout) {
 static void print_usage(const char* bin) {
     cerr << "Usage:\n"
          << "  " << bin << " <config.json> <true/false> [ack_port]\n"
-         << "  " << bin << " <config.json> <true/false> [ack_port] bench-write <duration_sec> <total_rate_rps> <key_count> <client_index> <num_clients> [key_prefix] [value_prefix]\n"
-         << "  " << bin << " <config.json> <true/false> [ack_port] bench-read  <duration_sec> <total_rate_rps> <key_count> <client_index> <num_clients> [craq_node_id] [key_prefix]\n";
+         << "  " << bin << " <config.json> <true/false> [ack_port] bench-write <total_ops> <key_count> <client_index> <num_clients> [key_prefix] [value_prefix]\n"
+         << "  " << bin << " <config.json> <true/false> [ack_port] bench-read  <total_ops> <key_count> <client_index> <num_clients> [craq_node_id] [key_prefix]\n";
 }
 
 static bool parse_run_mode_args(int argc,
@@ -433,17 +416,13 @@ static bool parse_run_mode_args(int argc,
 
     run_mode = is_write ? ClientRunMode::BENCH_WRITE : ClientRunMode::BENCH_READ;
 
-    if (argc - argi < 5) {
-        err = "benchmark mode requires: <duration_sec> <total_rate_rps> <key_count> <client_index> <num_clients>";
+    if (argc - argi < 4) {
+        err = "benchmark mode requires: <total_ops> <key_count> <client_index> <num_clients>";
         return false;
     }
 
-    if (!parse_double_text(argv[argi++], bench_cfg.duration_sec) || bench_cfg.duration_sec <= 0.0) {
-        err = "duration_sec must be > 0";
-        return false;
-    }
-    if (!parse_double_text(argv[argi++], bench_cfg.total_rate_rps) || bench_cfg.total_rate_rps <= 0.0) {
-        err = "total_rate_rps must be > 0";
+    if (!parse_uint64_text(argv[argi++], bench_cfg.total_ops) || bench_cfg.total_ops == 0) {
+        err = "total_ops must be > 0";
         return false;
     }
     if (!parse_int_text(argv[argi++], bench_cfg.key_count) || bench_cfg.key_count <= 0) {
@@ -947,20 +926,14 @@ static ThroughputMetricsSummary run_bench_write(Topology& topo,
     benchmark_attach_metrics_state(state);
 
     const vector<string> keys = benchmark_build_keyset(cfg.key_prefix, static_cast<size_t>(cfg.key_count));
-    const double per_client_rps = benchmark_per_client_rate(cfg.total_rate_rps, cfg.num_clients);
 
     benchmark_start_metrics_window(*state);
-    const auto run_duration = chrono::duration_cast<SteadyClock::duration>(chrono::duration<double>(cfg.duration_sec));
-    const auto end_time = state->window_start + run_duration;
-
     uint64_t op_index = 0;
-    while (SteadyClock::now() < end_time) {
-        const auto due = benchmark_next_send_time(state->window_start, op_index, per_client_rps);
-        if (due > SteadyClock::now()) this_thread::sleep_until(due);
-        if (SteadyClock::now() >= end_time) break;
-
+    while (true) {
         const uint64_t global_op = static_cast<uint64_t>(cfg.client_index)
             + static_cast<uint64_t>(cfg.num_clients) * op_index;
+        if (global_op >= cfg.total_ops) break;
+
         const string& key = benchmark_select_key_round_robin(keys, global_op);
         const string value = cfg.value_prefix + to_string(cfg.client_index) + "-" + to_string(op_index);
         (void)do_write(topo, key, value, client_addr, false);
@@ -989,20 +962,14 @@ static ThroughputMetricsSummary run_bench_read(Topology& topo,
     auto state = make_shared<ThroughputMetricsState>();
     benchmark_attach_metrics_state(state);
 
-    const double per_client_rps = benchmark_per_client_rate(cfg.total_rate_rps, cfg.num_clients);
     benchmark_start_metrics_window(*state);
 
-    const auto run_duration = chrono::duration_cast<SteadyClock::duration>(chrono::duration<double>(cfg.duration_sec));
-    const auto end_time = state->window_start + run_duration;
-
     uint64_t op_index = 0;
-    while (SteadyClock::now() < end_time) {
-        const auto due = benchmark_next_send_time(state->window_start, op_index, per_client_rps);
-        if (due > SteadyClock::now()) this_thread::sleep_until(due);
-        if (SteadyClock::now() >= end_time) break;
-
+    while (true) {
         const uint64_t global_op = static_cast<uint64_t>(cfg.client_index)
             + static_cast<uint64_t>(cfg.num_clients) * op_index;
+        if (global_op >= cfg.total_ops) break;
+
         const string& key = benchmark_select_key_round_robin(keys, global_op);
 
         int node_id = -1;
@@ -1202,8 +1169,7 @@ int main(int argc, char** argv) {
         const bool is_write = (run_mode == ClientRunMode::BENCH_WRITE);
         cout << "[Client] Running " << (is_write ? "bench-write" : "bench-read")
              << " mode=" << mode_name(mode)
-             << " duration_s=" << bench_cfg.duration_sec
-             << " total_rate_rps=" << bench_cfg.total_rate_rps
+             << " total_ops=" << bench_cfg.total_ops
              << " key_count=" << bench_cfg.key_count
              << " client_index=" << bench_cfg.client_index
              << " num_clients=" << bench_cfg.num_clients;

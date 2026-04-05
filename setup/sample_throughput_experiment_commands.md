@@ -18,31 +18,31 @@ cmake --build build -j4
 Included in each command below:
 
 ```text
---client-counts 1 2 4 8 --duration-sec 10 --key-count 64 --write-rate-rps 100 --read-rate-rps 100 --start-servers true --build-first false --reconfigure-each-run true
+--client-counts 1 2 4 8 --write-op-count 5000 --read-op-count 5000 --key-count 64 --start-servers true --build-first false --reconfigure-each-run true
 ```
 
 ## 1) CHAIN: write + read experiments
 
 ```bash
-./setup/run_throughput_experiments.py --modes chain --ops write read --work-dir build/throughput_runs_chain --client-counts 1 2 4 8 --duration-sec 10 --key-count 64 --write-rate-rps 100 --read-rate-rps 100 --start-servers true --build-first false --reconfigure-each-run true
+./setup/run_throughput_experiments.py --modes chain --ops write read --work-dir build/throughput_runs_chain --client-counts 1 2 4 8 --write-op-count 5000 --read-op-count 5000 --key-count 64 --start-servers true --build-first false --reconfigure-each-run true
 ```
 
 ## 2) CRAQ: write + read experiments
 
 ```bash
-./setup/run_throughput_experiments.py --modes craq --ops write read --work-dir build/throughput_runs_craq --client-counts 1 2 4 8 --duration-sec 10 --key-count 64 --write-rate-rps 100 --read-rate-rps 100 --start-servers true --build-first false --reconfigure-each-run true
+./setup/run_throughput_experiments.py --modes craq --ops write read --work-dir build/throughput_runs_craq --client-counts 1 2 4 8 --write-op-count 5000 --read-op-count 5000 --key-count 64 --start-servers true --build-first false --reconfigure-each-run true
 ```
 
 ## 3) CROWN: write + read experiments
 
 ```bash
-./setup/run_throughput_experiments.py --modes crown --ops write read --work-dir build/throughput_runs_crown --client-counts 1 2 4 8 --duration-sec 10 --key-count 64 --write-rate-rps 100 --read-rate-rps 100 --start-servers true --build-first false --reconfigure-each-run true
+./setup/run_throughput_experiments.py --modes crown --ops write read --work-dir build/throughput_runs_crown --client-counts 1 2 4 8 --write-op-count 5000 --read-op-count 5000 --key-count 64 --start-servers true --build-first false --reconfigure-each-run true
 ```
 
 ## 4) All Modes In One Run: CHAIN + CRAQ + CROWN, write + read
 
 ```bash
-./setup/run_throughput_experiments.py --modes chain craq crown --ops write read --work-dir build/throughput_runs_all_modes --client-counts 1 2 4 8 --duration-sec 10 --key-count 64 --write-rate-rps 100 --read-rate-rps 100 --start-servers true --build-first false --reconfigure-each-run true
+./setup/run_throughput_experiments.py --modes chain craq crown --ops write read --work-dir build/throughput_runs_all_modes --client-counts 1 2 4 8 --write-op-count 5000 --read-op-count 5000 --key-count 64 --start-servers true --build-first false --reconfigure-each-run true
 ```
 
 ## Expected Summary CSV Outputs
@@ -69,17 +69,16 @@ Output directory for that run. Contains generated configs, per-client logs, and 
 How many client processes to launch concurrently for each experiment case.
 Example: 1 2 4 8 means run four separate cases (1-client, 2-client, 4-client, 8-client).
 
-### --duration-sec
-How long each individual experiment case runs (in seconds).
+### --write-op-count
+Total number of write operations to issue in each write case, across all clients.
+
+### --read-op-count
+Total number of read operations to issue in each read case, across all clients.
 
 ### --key-count
 Number of distinct keys used in the workload keyspace.
 
-### --write-rate-rps
-Total write request rate (requests/second) across all clients in write experiments.
-
-### --read-rate-rps
-Total read request rate (requests/second) across all clients in read experiments.
+Bench requests are sent as fast as possible (no client-side pacing).
 
 ### --start-servers
 Whether the runner should automatically start server processes.

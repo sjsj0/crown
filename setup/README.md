@@ -111,6 +111,42 @@ Stop all nodes for a given user.
 ./vm_setup.bash kill
 ```
 
+### 5. `run_prod_distributed_write_bench.bash` (Distributed Write Benchmark Launcher)
+Launches one benchmark write client per VM over SSH for prod runs.
+
+**Highlights:**
+- ✅ One `bench-write` process per host (parallel SSH fan-out)
+- ✅ Automatic benchmark indexing: `client_index=0..N-1`, `num_clients=N`
+- ✅ Uses `configure=true` only on the first client/host
+- ✅ Waits for completion and reports per-host pass/fail
+- ✅ Saves remote client logs and local SSH orchestration logs
+
+**Usage:**
+```bash
+bash ./setup/run_prod_distributed_write_bench.bash \
+  --hosts sp26-cs525-1201.cs.illinois.edu,sp26-cs525-1202.cs.illinois.edu,sp26-cs525-1203.cs.illinois.edu \
+  --ssh-user <your-netid> \
+  --remote-repo-dir /home/<your-netid>/crown \
+  --config-path build/prod_configs/config.crown.json \
+  --write-op-count 50000 \
+  --key-count 64
+
+# Alternative host input file:
+cp setup/prod_hosts.sample.txt setup/prod_hosts.txt
+bash ./setup/run_prod_distributed_write_bench.bash \
+  --hosts-file setup/prod_hosts.txt \
+  --ssh-user <your-netid> \
+  --remote-repo-dir /home/<your-netid>/crown \
+  --config-path build/prod_configs/config.crown.json \
+  --write-op-count 50000 \
+  --key-count 64
+```
+
+**Notes:**
+- `--write-op-count` is global; clients split the total count by `client_index/num_clients`.
+- Remote logs default to `build/prod_bench_logs` on each VM.
+- Local launcher logs default to `build/prod_ssh_launcher_logs`.
+
 ## Configuration (.env file)
 
 Use the existing `.env` file in this directory and customize it:
