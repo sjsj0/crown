@@ -946,6 +946,7 @@ static ThroughputMetricsSummary run_bench_write(Topology& topo,
     benchmark_attach_metrics_state(state);
 
     const vector<string> keys = benchmark_build_keyset(cfg.key_prefix, static_cast<size_t>(cfg.key_count));
+    const auto issue_start = SteadyClock::now();
 
     benchmark_start_metrics_window(*state);
     uint64_t op_index = 0;
@@ -959,6 +960,21 @@ static ThroughputMetricsSummary run_bench_write(Topology& topo,
         (void)do_write(topo, key, value, client_addr, false);
         ++op_index;
     }
+
+    const auto issue_end = SteadyClock::now();
+    const double issue_duration_sec =
+        chrono::duration_cast<chrono::duration<double>>(issue_end - issue_start).count();
+    const double issue_wps = (issue_duration_sec > 0.0)
+        ? (static_cast<double>(op_index) / issue_duration_sec)
+        : 0.0;
+    cout << fixed << setprecision(3)
+         << "BENCH_WRITE_ISSUE"
+         << " client_index=" << cfg.client_index
+         << " num_clients=" << cfg.num_clients
+         << " ops_issued=" << op_index
+         << " issue_duration_s=" << issue_duration_sec
+         << " issue_wps=" << issue_wps
+         << "\n";
 
     benchmark_wait_for_pending_acks();
     benchmark_stop_metrics_window(*state);

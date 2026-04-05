@@ -1,6 +1,7 @@
 // server.cpp — entry point for a chain-replication node.
 //
-// The server does NOT read any config from files or CLI args (beyond --port).
+// The server does NOT read topology config from files or CLI args.
+// CLI args only control bind host/port and optional server logging.
 // All topology config is pushed to it by client.cpp via the Configure RPC.
 // The server just starts, registers the gRPC service, and waits.
 
@@ -8,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <stdexcept>
+#include <cctype>
 
 #include <grpcpp/grpcpp.h>
 #include "chain.grpc.pb.h"
@@ -19,6 +21,31 @@
 #include "replication/crown/crown_replication.h"
 
 using namespace std;
+
+namespace {
+
+bool parse_bool_flag(const string& raw, bool* out) {
+    string normalized;
+    normalized.reserve(raw.size());
+    for (unsigned char ch : raw)
+        normalized.push_back(static_cast<char>(std::tolower(ch)));
+
+    if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "y" || normalized == "on") {
+        *out = true;
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "n" || normalized == "off") {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+void print_usage(const char* program_name) {
+    cerr << "Usage: " << program_name << " [--host <host>] [--port <port>] [--server-log <true|false>]\n";
+}
+
+} // namespace
 
 // ============================================================
 // gRPC service implementation
@@ -193,13 +220,48 @@ private:
 // ============================================================
 
 int main(int argc, char** argv) {
-    // The only thing the server needs at launch is which port to listen on.
-    // Everything else comes from the client via Configure RPC.
+    // The server only needs host/port and optional log behavior at launch.
+    // Topology config still comes from the client via Configure RPC.
+    string host = "0.0.0.0";
     string port = "50051";
-    if (argc == 3 && string(argv[1]) == "--port")
-        port = argv[2];
+    bool server_log_enabled = false;
 
-    string addr = "0.0.0.0:" + port;
+    for (int i = 1; i < argc; ++i) {
+        const string arg = argv[i];
+
+        if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            return 0;
+        }
+
+        if (arg == "--host" || arg == "--port" || arg == "--server-log") {
+            if (i + 1 >= argc) {
+                cerr << "[Server] Missing value for " << arg << "\n";
+                print_usage(argv[0]);
+                return 1;
+            }
+
+            const string value = argv[++i];
+            if (arg == "--host") {
+                host = value;
+            } else if (arg == "--port") {
+                port = value;
+            } else {
+                if (!parse_bool_flag(value, &server_log_enabled)) {
+                    cerr << "[Server] Invalid value for --server-log: " << value << "\n";
+                    print_usage(argv[0]);
+                    return 1;
+                }
+            }
+            continue;
+        }
+
+        cerr << "[Server] Unknown argument: " << arg << "\n";
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    const string addr = host + ":" + port;
     ChainNodeServiceImpl service;
 
     grpc::ServerBuilder builder;
@@ -212,7 +274,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    cout << "[Server] Listening on " << addr << " — waiting for client config.\n";
+    if (server_log_enabled)
+        cout << "[Server] Listening on " << addr << " - waiting for client config.\n";
+    else {
+        cout.setstate(std::ios_base::failbit);
+        cerr.setstate(std::ios_base::failbit);
+    }
+
     server->Wait();
     return 0;
 }

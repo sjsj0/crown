@@ -18,7 +18,7 @@ This creates:
 
 Example for 5 nodes (`1201`..`1205`), all listening on `50051`:
 
-`for i in 1 2 3 4 5; do h="sp26-cs525-120${i}.cs.illinois.edu"; p=50051; ssh <user>@$h "cd /path/to/crown && nohup ./build/server --port $p > server_$p.log 2>&1 &"; done`
+`for i in 1 2 3 4 5; do h="sp26-cs525-120${i}.cs.illinois.edu"; p=50051; ssh <user>@$h "cd /path/to/crown && nohup ./build/server --port $p --server-log true > server_$p.log 2>&1 &"; done`
 
 ## 3) Optional connectivity check
 
