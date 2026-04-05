@@ -2,6 +2,12 @@
 
 This directory contains scripts for deploying and managing Crown/CRAQ nodes on remote VMs.
 
+## Prod Interactive Mode
+
+For a focused step-by-step guide to run the interactive client against prod hosts, see:
+
+- `setup/PROD_INTERACTIVE_README.md`
+
 ## Scripts Overview
 
 ### 1. `vm_setup.bash` (Orchestrator)
