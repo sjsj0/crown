@@ -143,3 +143,115 @@ std::shared_ptr<chain::ChainNode::Stub> ChainStyleReplicationSupport::successor_
 std::shared_ptr<chain::ChainNode::Stub> ChainStyleReplicationSupport::tail_stub() const {
     return tail_stub_;
 }
+void ChainStyleReplicationSupport::enqueue_client_ack(const chain::AckRequest& req) {
+    {
+        lock_guard<mutex> lk(client_ack_queue_mtx_);
+        client_ack_queue_.push_back(req);
+    }
+    client_ack_queue_cv_.notify_one();
+}
+
+void ChainStyleReplicationSupport::enqueue_predecessor_ack(const chain::AckRequest& req) {
+    {
+        lock_guard<mutex> lk(pred_ack_queue_mtx_);
+        pred_ack_queue_.push_back(req);
+    }
+    pred_ack_queue_cv_.notify_one();
+}
+
+void ChainStyleReplicationSupport::start_ack_workers() {
+    stop_ack_workers();
+
+    client_ack_worker_running_.store(true, memory_order_release);
+    client_ack_worker_thread_ = make_shared<thread>([this] { client_ack_worker_loop(); });
+
+    pred_ack_worker_running_.store(true, memory_order_release);
+    pred_ack_worker_thread_ = make_shared<thread>([this] { predecessor_ack_worker_loop(); });
+}
+
+void ChainStyleReplicationSupport::stop_ack_workers() {
+    client_ack_worker_running_.store(false, memory_order_release);
+    client_ack_queue_cv_.notify_one();
+    if (client_ack_worker_thread_ && client_ack_worker_thread_->joinable()) {
+        client_ack_worker_thread_->join();
+    }
+    client_ack_worker_thread_.reset();
+
+    pred_ack_worker_running_.store(false, memory_order_release);
+    pred_ack_queue_cv_.notify_one();
+    if (pred_ack_worker_thread_ && pred_ack_worker_thread_->joinable()) {
+        pred_ack_worker_thread_->join();
+    }
+    pred_ack_worker_thread_.reset();
+}
+
+void ChainStyleReplicationSupport::client_ack_worker_loop() {
+    while (client_ack_worker_running_.load(memory_order_acquire)) {
+        chain::AckRequest req;
+        {
+            unique_lock<mutex> lk(client_ack_queue_mtx_);
+            client_ack_queue_cv_.wait(lk, [this] {
+                return !client_ack_queue_.empty() || !client_ack_worker_running_.load(memory_order_acquire);
+            });
+
+            if (!client_ack_worker_running_.load(memory_order_acquire)) break;
+            if (client_ack_queue_.empty()) continue;
+
+            req = client_ack_queue_.front();
+            client_ack_queue_.pop_front();
+        }
+
+        if (req.client_addr().empty()) continue;
+
+        auto channel = grpc::CreateChannel(req.client_addr(), grpc::InsecureChannelCredentials());
+        auto stub = chain::ChainNode::NewStub(channel);
+
+        google::protobuf::Empty ignored;
+        grpc::ClientContext ctx;
+        grpc::Status status = stub->Ack(&ctx, req, &ignored);
+        if (!status.ok()) {
+            cerr << "[ChainStyleReplicationSupport] Client ACK failed to " << req.client_addr()
+                 << " request_id=" << req.request_id()
+                 << ": " << status.error_message() << "\n";
+        }
+    }
+}
+
+void ChainStyleReplicationSupport::predecessor_ack_worker_loop() {
+    while (pred_ack_worker_running_.load(memory_order_acquire)) {
+        chain::AckRequest req;
+        shared_ptr<chain::ChainNode::Stub> pred;
+        {
+            unique_lock<mutex> pred_lk(pred_ack_queue_mtx_);
+            pred_ack_queue_cv_.wait(pred_lk, [this] {
+                return !pred_ack_queue_.empty() || !pred_ack_worker_running_.load(memory_order_acquire);
+            });
+
+            if (!pred_ack_worker_running_.load(memory_order_acquire)) break;
+            if (pred_ack_queue_.empty()) continue;
+
+            req = pred_ack_queue_.front();
+            pred_ack_queue_.pop_front();
+        }
+
+        // Get the predecessor stub (requires separate lock to avoid deadlock).
+        {
+            lock_guard<mutex> stub_lk(pred_ack_queue_mtx_);  // Reuse for simplicity; ideally a separate lock.
+            pred = predecessor_stub_;
+        }
+
+        if (!pred) {
+            cerr << "[ChainStyleReplicationSupport] Predecessor ACK skipped: no predecessor stub\n";
+            continue;
+        }
+
+        google::protobuf::Empty ignored;
+        grpc::ClientContext ctx;
+        grpc::Status status = pred->Ack(&ctx, req, &ignored);
+        if (!status.ok()) {
+            cerr << "[ChainStyleReplicationSupport] Predecessor ACK failed"
+                 << " key='" << req.key() << "' version=" << req.version()
+                 << ": " << status.error_message() << "\n";
+        }
+    }
+}

@@ -5,6 +5,11 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <thread>
+#include <deque>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 
 #include <grpcpp/grpcpp.h>
 #include "chain.grpc.pb.h"
@@ -47,7 +52,18 @@ public:
     std::shared_ptr<chain::ChainNode::Stub> successor_stub() const;
     std::shared_ptr<chain::ChainNode::Stub> tail_stub() const;
 
+    // Enqueue ACK messages for background delivery.
+    void enqueue_client_ack(const chain::AckRequest& req);
+    void enqueue_predecessor_ack(const chain::AckRequest& req);
+
+    // Start and stop background ACK worker threads.
+    void start_ack_workers();
+    void stop_ack_workers();
+
 private:
+    // Worker thread entry points.
+    void client_ack_worker_loop();
+    void predecessor_ack_worker_loop();
     struct KeyState {
         uint64_t next_version = 0;
         uint64_t latest_seen_version = 0;
@@ -67,4 +83,17 @@ private:
     std::shared_ptr<chain::ChainNode::Stub> predecessor_stub_;
     std::shared_ptr<chain::ChainNode::Stub> successor_stub_;
     std::shared_ptr<chain::ChainNode::Stub> tail_stub_;
+
+    // ACK worker thread management.
+    std::mutex client_ack_queue_mtx_;
+    std::condition_variable client_ack_queue_cv_;
+    std::deque<chain::AckRequest> client_ack_queue_;
+    std::shared_ptr<std::thread> client_ack_worker_thread_;
+    std::atomic<bool> client_ack_worker_running_{false};
+
+    std::mutex pred_ack_queue_mtx_;
+    std::condition_variable pred_ack_queue_cv_;
+    std::deque<chain::AckRequest> pred_ack_queue_;
+    std::shared_ptr<std::thread> pred_ack_worker_thread_;
+    std::atomic<bool> pred_ack_worker_running_{false};
 };

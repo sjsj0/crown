@@ -44,30 +44,6 @@ void forward_propagate_async(std::shared_ptr<chain::ChainNode::Stub> successor,
     }).detach();
 }
 
-void notify_client_ack_async(chain::AckRequest req,
-                             const std::string& from_node) {
-    std::thread([req = std::move(req), from_node]() mutable {
-        if (req.client_addr().empty()) {
-            cerr << "[Chain] Client ACK skipped from " << from_node
-                 << ": empty client_addr\n";
-            return;
-        }
-
-        auto channel = grpc::CreateChannel(req.client_addr(), grpc::InsecureChannelCredentials());
-        auto client_stub = chain::ChainNode::NewStub(channel);
-
-        google::protobuf::Empty ignored;
-        grpc::ClientContext ctx;
-        grpc::Status status = client_stub->Ack(&ctx, req, &ignored);
-        if (!status.ok()) {
-            cerr << "[Chain] Client ACK failed from " << from_node
-                 << " request_id=" << req.request_id()
-                 << " client_addr='" << req.client_addr()
-                 << "': " << status.error_message() << "\n";
-        }
-    }).detach();
-}
-
 } // namespace
 
 chain::WriteResponse ChainReplication::handle_write(const chain::WriteRequest& req, Node& node) {
@@ -96,7 +72,7 @@ chain::WriteResponse ChainReplication::handle_write(const chain::WriteRequest& r
         ack.set_version(version);
         ack.set_client_addr(req.client_addr());
         ack.set_request_id(req.request_id());
-        notify_client_ack_async(std::move(ack), chain_node_label(node));
+        support_.enqueue_client_ack(ack);
 
         return resp;
     }
@@ -153,7 +129,7 @@ void ChainReplication::handle_propagate(const chain::PropagateRequest& req, Node
         ack.set_version(req.version());
         ack.set_client_addr(req.client_addr());
         ack.set_request_id(req.request_id());
-        notify_client_ack_async(std::move(ack), chain_node_label(node));
+        support_.enqueue_client_ack(ack);
         return;
     }
 
@@ -174,4 +150,5 @@ void ChainReplication::handle_ack(const chain::AckRequest& req, Node& node) {
 
 void ChainReplication::on_config_change(Node& node) {
     support_.on_config_change(node);
+    support_.start_ack_workers();
 }
