@@ -149,15 +149,6 @@ fi
 # ---------------------------
 NODE_HOST="${NODE_HOST:-0.0.0.0}"
 NODE_PORT="${NODE_PORT:-5001}"
-SERVER_LOG_RAW="${SERVER_LOG:-false}"
-case "${SERVER_LOG_RAW,,}" in
-  1|true|yes|y|on) SERVER_LOG="true" ;;
-  0|false|no|n|off|"") SERVER_LOG="false" ;;
-  *)
-    echo "ERROR: SERVER_LOG must be true/false (or 1/0, yes/no). Got: $SERVER_LOG_RAW"
-    exit 1
-    ;;
-esac
 RUN_SCOPE="${RUN_SCOPE:-shared}"
 RUN_DIR="$PROJECT_DIR/run/$RUN_SCOPE"
 mkdir -p "$RUN_DIR"
@@ -196,8 +187,8 @@ fi
 # Kill any remaining server process for this user/port before starting.
 pkill -u "$DEPLOY_USER" -f "server --host .* --port $NODE_PORT" >/dev/null 2>&1 || true
 
-echo "Starting $NODE_BIN --host $NODE_HOST --port $NODE_PORT --server-log $SERVER_LOG"
-"${TMUX_CMD[@]}" new-session -d -s "$SESSION_NAME" "cd '$PROJECT_DIR' && exec '$NODE_BIN' --host '$NODE_HOST' --port '$NODE_PORT' --server-log '$SERVER_LOG'"
+echo "Starting $NODE_BIN --host $NODE_HOST --port $NODE_PORT"
+"${TMUX_CMD[@]}" new-session -d -s "$SESSION_NAME" "cd '$PROJECT_DIR' && exec '$NODE_BIN' --host '$NODE_HOST' --port '$NODE_PORT'"
 chmod 666 "$TMUX_SOCKET" 2>/dev/null || true
 "${TMUX_CMD[@]}" pipe-pane -o -t "$SESSION_NAME:0.0" "cat >> '$LOG_FILE'"
 
