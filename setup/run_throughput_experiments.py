@@ -41,6 +41,7 @@ class RunnerConfig:
     write_rate_rps: float
     read_rate_rps: float
     key_count: int
+    node_count_override: int | None
     key_prefix_base: str
     value_prefix_base: str
     ack_base_port: int
@@ -66,6 +67,16 @@ def env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
         return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RunnerError(f"invalid integer for {name}: {raw}") from exc
+
+
+def env_optional_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
     try:
         return int(raw)
     except ValueError as exc:
@@ -130,6 +141,15 @@ def parse_args(root_dir: Path) -> argparse.Namespace:
     p.add_argument("--write-rate-rps", type=float, default=env_float("WRITE_RATE_RPS", 100.0))
     p.add_argument("--read-rate-rps", type=float, default=env_float("READ_RATE_RPS", 100.0))
     p.add_argument("--key-count", type=int, default=env_int("KEY_COUNT", 64))
+    p.add_argument(
+        "--node-count",
+        type=int,
+        default=env_optional_int("NODE_COUNT"),
+        help=(
+            "Optional override for node count used to generate mode configs. "
+            "If omitted, node count is read from --base-config."
+        ),
+    )
 
     p.add_argument("--key-prefix-base", default=env_str("KEY_PREFIX_BASE", "bench-key"))
     p.add_argument("--value-prefix-base", default=env_str("VALUE_PREFIX_BASE", "bench-value"))
@@ -187,6 +207,8 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
         raise RunnerError("--read-rate-rps must be > 0")
     if args.key_count <= 0:
         raise RunnerError("--key-count must be > 0")
+    if args.node_count is not None and args.node_count <= 0:
+        raise RunnerError("--node-count must be > 0 when provided")
     if not (1 <= args.ack_base_port <= 65535):
         raise RunnerError("--ack-base-port must be in [1, 65535]")
 
@@ -212,6 +234,7 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
         write_rate_rps=args.write_rate_rps,
         read_rate_rps=args.read_rate_rps,
         key_count=args.key_count,
+        node_count_override=args.node_count,
         key_prefix_base=args.key_prefix_base,
         value_prefix_base=args.value_prefix_base,
         ack_base_port=args.ack_base_port,
@@ -281,7 +304,7 @@ def install_signal_handlers() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
 
 
-def prepare_mode_configs(base_config: Path, cfg_chain: Path, cfg_craq: Path) -> tuple[str, int, int]:
+def derive_config_generation_params(base_config: Path, node_count_override: int | None = None) -> tuple[str, int, int]:
     with base_config.open("r", encoding="utf-8") as f:
         cfg = json.load(f)
 
@@ -293,24 +316,10 @@ def prepare_mode_configs(base_config: Path, cfg_chain: Path, cfg_craq: Path) -> 
     base_port = min(ports)
     expected = list(range(base_port, base_port + len(ports)))
     if sorted(ports) != expected:
-        raise RunnerError("base config ports must be contiguous for crown generation")
-
-    cfg_chain_data = dict(cfg)
-    cfg_chain_data["mode"] = "chain"
-
-    cfg_craq_data = dict(cfg)
-    cfg_craq_data["mode"] = "craq"
-
-    with cfg_chain.open("w", encoding="utf-8") as f:
-        json.dump(cfg_chain_data, f, indent=2)
-        f.write("\n")
-
-    with cfg_craq.open("w", encoding="utf-8") as f:
-        json.dump(cfg_craq_data, f, indent=2)
-        f.write("\n")
+        raise RunnerError("base config ports must be contiguous for mode config generation")
 
     host = str(nodes[0]["host"])
-    node_count = len(nodes)
+    node_count = len(nodes) if node_count_override is None else node_count_override
     return host, base_port, node_count
 
 
@@ -347,6 +356,21 @@ def start_servers(server_bin: Path, work_dir: Path, host: str, base_port: int, n
             raise RunnerError(f"server did not open {host}:{port} within startup timeout")
 
 
+def servers_healthy(host: str, base_port: int, node_count: int) -> bool:
+    if len(SERVER_PROCS) != node_count:
+        return False
+
+    for i in range(node_count):
+        port = base_port + i
+        process = SERVER_PROCS[i].process
+        if process.poll() is not None:
+            return False
+        if not wait_for_port(host, port, timeout_sec=0.2):
+            return False
+
+    return True
+
+
 def run_clients_for_case(
     cfg: RunnerConfig,
     cfg_path: Path,
@@ -354,6 +378,7 @@ def run_clients_for_case(
     op: str,
     nclients: int,
     run_idx: int,
+    force_first_configure: bool = False,
 ) -> None:
     log(f"Running mode={mode} op={op} clients={nclients} duration={cfg.duration_sec}s")
 
@@ -362,7 +387,8 @@ def run_clients_for_case(
     try:
         for i in range(nclients):
             ack_port = cfg.ack_base_port + run_idx * 100 + i
-            configure_flag = "true" if cfg.reconfigure_each_run and i == 0 else "false"
+            should_configure = (cfg.reconfigure_each_run or force_first_configure) and i == 0
+            configure_flag = "true" if should_configure else "false"
 
             key_prefix = f"{cfg.key_prefix_base}-{mode}-{op}-"
             value_prefix = f"{cfg.value_prefix_base}-{mode}-{op}-"
@@ -448,20 +474,24 @@ def main() -> int:
     cfg_craq = cfg.cfg_dir / "config.craq.json"
     cfg_crown = cfg.cfg_dir / "config.crown.json"
 
-    log(f"Preparing CHAIN/CRAQ configs from {cfg.base_config}...")
-    host, base_port, node_count = prepare_mode_configs(cfg.base_config, cfg_chain, cfg_craq)
+    host, base_port, node_count = derive_config_generation_params(cfg.base_config, cfg.node_count_override)
+    if cfg.node_count_override is not None:
+        log(f"Using node-count override: {cfg.node_count_override}")
 
-    log(f"Generating CROWN config (host={host} base_port={base_port} nodes={node_count})...")
+    log(f"Generating mode configs via setup/generate_mode_configs.py (host={host} base_port={base_port} nodes={node_count})...")
     run_cmd(
         [
             sys.executable,
-            str(cfg.root_dir / "setup" / "generate_crown_config.py"),
+            str(cfg.root_dir / "setup" / "generate_mode_configs.py"),
             str(node_count),
+            "--base-port",
             str(base_port),
             "--host",
             host,
-            "--output",
-            str(cfg_crown),
+            "--output-dir",
+            str(cfg.cfg_dir),
+            "--prefix",
+            "config",
         ],
         quiet=True,
     )
@@ -476,21 +506,58 @@ def main() -> int:
         "crown": cfg_crown,
     }
 
-    for mode in cfg.modes:
+    for mode_idx, mode in enumerate(cfg.modes):
         cfg_path = mode_to_cfg.get(mode)
         if cfg_path is None:
             raise RunnerError(f"unknown mode in MODES: {mode}")
 
+        mode_transition_restart = False
+        if cfg.start_servers and mode_idx > 0:
+            log(f"Restarting server cluster for mode transition -> {mode}...")
+            cleanup_servers()
+            start_servers(cfg.server_bin, cfg.work_dir, host, base_port, node_count)
+            mode_transition_restart = True
+
         for op in cfg.ops:
             for nclients in cfg.client_counts:
-                run_clients_for_case(
-                    cfg=cfg,
-                    cfg_path=cfg_path,
-                    mode=mode,
-                    op=op,
-                    nclients=nclients,
-                    run_idx=run_idx,
-                )
+                force_first_configure = mode_transition_restart
+                mode_transition_restart = False
+                if cfg.start_servers and not servers_healthy(host, base_port, node_count):
+                    log("Detected unavailable server process; restarting server cluster before next case...")
+                    cleanup_servers()
+                    start_servers(cfg.server_bin, cfg.work_dir, host, base_port, node_count)
+                    force_first_configure = True
+
+                try:
+                    run_clients_for_case(
+                        cfg=cfg,
+                        cfg_path=cfg_path,
+                        mode=mode,
+                        op=op,
+                        nclients=nclients,
+                        run_idx=run_idx,
+                        force_first_configure=force_first_configure,
+                    )
+                except RunnerError as exc:
+                    if not cfg.start_servers:
+                        raise
+
+                    log(
+                        "Case failed; restarting server cluster and retrying once "
+                        f"(mode={mode} op={op} clients={nclients})."
+                    )
+                    cleanup_servers()
+                    start_servers(cfg.server_bin, cfg.work_dir, host, base_port, node_count)
+
+                    run_clients_for_case(
+                        cfg=cfg,
+                        cfg_path=cfg_path,
+                        mode=mode,
+                        op=op,
+                        nclients=nclients,
+                        run_idx=run_idx,
+                        force_first_configure=True,
+                    )
                 run_idx += 1
 
     log("Aggregating BENCH_SUMMARY lines into CSV...")

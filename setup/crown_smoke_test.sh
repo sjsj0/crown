@@ -97,7 +97,7 @@ cmake --build "$BUILD_DIR" -j4 >/dev/null
 mkdir -p "$WORK_DIR"
 
 echo "[crown-smoke] Generating CROWN config..."
-python3 "$ROOT_DIR/setup/generate_crown_config.py" "$NODE_COUNT" "$BASE_PORT" --host "$HOST" --output "$CONFIG" >/dev/null
+python3 "$ROOT_DIR/setup/generate_mode_configs.py" "$NODE_COUNT" --base-port "$BASE_PORT" --host "$HOST" --output-dir "$WORK_DIR" --prefix config --modes crown >/dev/null
 
 # Export KEY_HEAD_<i>, WRAP_KEY, HEAD_ENDPOINT_<i>, TAIL_ENDPOINT_<i>, NODE_COUNT from config.
 eval "$(python3 - "$CONFIG" <<'PY'
@@ -214,7 +214,7 @@ for pid in "${SERVER_PIDS[@]}"; do
 done
 
 echo "[crown-smoke] Pushing generated topology..."
-printf 'quit\n' | "$BUILD_DIR/client" "$CONFIG" >/dev/null
+printf 'quit\n' | "$BUILD_DIR/client" "$CONFIG" true >/dev/null
 
 # 1) Same key always uses same head and tail.
 echo "[crown-smoke] Verifying stable head/tail routing for one key..."

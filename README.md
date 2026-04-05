@@ -83,19 +83,38 @@ The client loops through every node in the config file and sends each one its `N
 
 `src/client/client.cpp` is intentionally limited to topology/config push and was not changed for replication write/commit behavior.
 
-### Generate a CROWN ring config automatically
+### Generate mode configs automatically
 
-Use the helper script to generate a valid closed CROWN ring config:
-
-```bash
-python3 setup/generate_crown_config.py <node_count> <base_port> --output config.crown.sample.json
-```
-
-Example (3 nodes, ports 50051-50053):
+Use the helper script to generate CHAIN, CRAQ, and CROWN configs together:
 
 ```bash
-python3 setup/generate_crown_config.py 3 50051 --output config.crown.sample.json
+python3 setup/generate_mode_configs.py <node_count> --base-port <port> --env <dev|prod> --output-dir <dir>
 ```
+
+Example:
+
+```bash
+python3 setup/generate_mode_configs.py 3 --base-port 50051 --env prod --output-dir configs
+```
+
+This writes:
+
+- `configs/config.chain.json`
+- `configs/config.craq.json`
+- `configs/config.crown.json`
+
+To generate only CROWN config from the same script:
+
+```bash
+python3 setup/generate_mode_configs.py 3 --base-port 50051 --env dev --output-dir . --prefix config --modes crown
+```
+
+Host generation rules:
+
+- `--env dev`: all node hosts are `127.0.0.1`
+- `--env prod`: node hosts are `sp26-cs525-1201.cs.illinois.edu`, `sp26-cs525-1202.cs.illinois.edu`, ...
+
+You can optionally pass `--host <value>` to override and use one host for all generated nodes.
 
 A checked-in 3-node sample is provided at `config.crown.sample.json`.
 
