@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <limits>
 
 #include "chain.pb.h"
 #include "node/node.h"
@@ -21,19 +22,42 @@ string crown_node_label(const Node& node) {
     return node.self_addr().to_string();
 }
 
-void log_key_ownership(const Node& node, const string& key, const string& action) {
-    const bool is_head = node.is_head_for(key);
-    const bool is_tail = node.is_tail_for(key);
-    cout << "[CROWN] Node " << crown_node_label(node)
-         << " action=" << action
-         << " key='" << key << "'"
-         << " is_head_for=" << (is_head ? "true" : "false")
-         << " is_tail_for=" << (is_tail ? "true" : "false")
-         << " predecessor="
-         << (node.predecessor().has_value() ? node.predecessor()->to_string() : "<none>")
-         << " successor="
-         << (node.successor().has_value() ? node.successor()->to_string() : "<none>")
-         << "\n";
+int parse_origin_index_or_throw(const std::string& origin_id, int ring_size) {
+    if (origin_id.empty()) {
+        throw runtime_error("CROWN propagate rejected: missing origin_id");
+    }
+
+    size_t consumed = 0;
+    long long parsed = 0;
+    try {
+        parsed = stoll(origin_id, &consumed, 10);
+    } catch (const exception&) {
+        throw runtime_error("CROWN propagate rejected: origin_id must be numeric");
+    }
+
+    if (consumed != origin_id.size()) {
+        throw runtime_error("CROWN propagate rejected: origin_id must be numeric");
+    }
+    if (parsed < 0 || parsed > numeric_limits<int>::max()) {
+        throw runtime_error("CROWN propagate rejected: origin_id out of range");
+    }
+
+    const int origin_index = static_cast<int>(parsed);
+    if (origin_index >= ring_size) {
+        throw runtime_error("CROWN propagate rejected: origin_id outside ring size");
+    }
+    return origin_index;
+}
+
+bool is_request_tail_node(const Node& node, const chain::PropagateRequest& req) {
+    const int ring_size = node.config().crown_node_count;
+    if (ring_size <= 1) {
+        return true;
+    }
+
+    const int origin_index = parse_origin_index_or_throw(req.origin_id(), ring_size);
+    const int tail_index = (origin_index + ring_size - 1) % ring_size;
+    return node.node_index() == tail_index;
 }
 
 void forward_propagate_clockwise_async(std::shared_ptr<chain::ChainNode::Stub> successor,
@@ -62,11 +86,9 @@ void forward_propagate_clockwise_async(std::shared_ptr<chain::ChainNode::Stub> s
 } // namespace
 
 chain::WriteResponse CROWNReplication::handle_write(const chain::WriteRequest& req, Node& node) {
-    log_key_ownership(node, req.key(), "handle_write");
-
-    if (!node.is_head_for(req.key())) {
-        throw runtime_error("CROWN write rejected: node is not key head");
-    }
+    cout << "[CROWN] Node " << crown_node_label(node)
+         << " handling write key='" << req.key() << "'"
+         << " (client is responsible for routing to correct head)\n";
 
     const uint64_t version = support_.assign_next_version(req.key());
     support_.record_local_write_if_newer(req.key(), req.value(), version);
@@ -79,7 +101,8 @@ chain::WriteResponse CROWNReplication::handle_write(const chain::WriteRequest& r
     resp.set_success(true);
     resp.set_version(version);
 
-    if (node.is_tail_for(req.key())) {
+    const int ring_size = node.config().crown_node_count;
+    if (ring_size <= 1) {
         support_.mark_version_committed_if_newer(req.key(), req.value(), version);
 
         cout << "[CROWN] Single-node ownership committed key='" << req.key()
@@ -99,7 +122,7 @@ chain::WriteResponse CROWNReplication::handle_write(const chain::WriteRequest& r
     fwd.set_key(req.key());
     fwd.set_value(req.value());
     fwd.set_version(version);
-    fwd.set_origin_id(node.id());
+    fwd.set_origin_id(to_string(node.node_index()));
     fwd.set_client_addr(req.client_addr());
     fwd.set_request_id(req.request_id());
 
@@ -112,14 +135,12 @@ chain::WriteResponse CROWNReplication::handle_write(const chain::WriteRequest& r
 }
 
 chain::ReadResponse CROWNReplication::handle_read(const chain::ReadRequest& req, Node& node) {
-    log_key_ownership(node, req.key(), "handle_read");
+    cout << "[CROWN] Node " << crown_node_label(node)
+         << " handling read key='" << req.key() << "'"
+         << " (client is responsible for routing to correct tail)\n";
 
-    if (!node.is_tail_for(req.key())) {
-        throw runtime_error("CROWN read rejected: node is not key tail");
-    }
-
-        const auto committed = support_.read_committed(req.key());
-        if (!committed.found) {
+    const auto committed = support_.read_committed(req.key());
+    if (!committed.found) {
         throw runtime_error("CROWN read failed: key not found or not committed");
     }
 
@@ -134,7 +155,10 @@ chain::ReadResponse CROWNReplication::handle_read(const chain::ReadRequest& req,
 }
 
 void CROWNReplication::handle_propagate(const chain::PropagateRequest& req, Node& node) {
-    log_key_ownership(node, req.key(), "handle_propagate");
+    cout << "[CROWN] Node " << crown_node_label(node)
+         << " handling propagate key='" << req.key() << "'"
+         << " version=" << req.version()
+         << " origin_id=" << req.origin_id() << "\n";
 
     if (req.version() == 0) {
         throw runtime_error("CROWN propagate rejected: version must be non-zero");
@@ -144,7 +168,7 @@ void CROWNReplication::handle_propagate(const chain::PropagateRequest& req, Node
     cout << "[CROWN] Node " << crown_node_label(node)
          << " recorded propagated write key='" << req.key() << "' version=" << req.version() << "\n";
 
-    if (node.is_tail_for(req.key())) {
+    if (is_request_tail_node(node, req)) {
         support_.mark_version_committed_if_newer(req.key(), req.value(), req.version());
 
         cout << "[CROWN] Key-tail committed key='" << req.key()

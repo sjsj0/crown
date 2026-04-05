@@ -748,6 +748,51 @@ struct Topology {
     }
 };
 
+struct PreparedBenchmarkWrite {
+    NodeStub* target_head = nullptr;
+    string key;
+    string value;
+};
+
+static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
+    Topology& topo,
+    const BenchmarkRunConfig& cfg) {
+    const vector<string> keys = benchmark_build_keyset(cfg.key_prefix, static_cast<size_t>(cfg.key_count));
+
+    vector<PreparedBenchmarkWrite> prepared;
+    prepared.reserve(static_cast<size_t>(
+        (cfg.total_ops + static_cast<uint64_t>(cfg.num_clients) - 1)
+        / static_cast<uint64_t>(cfg.num_clients)));
+
+    uint64_t op_index = 0;
+    while (true) {
+        const uint64_t global_op = static_cast<uint64_t>(cfg.client_index)
+            + static_cast<uint64_t>(cfg.num_clients) * op_index;
+        if (global_op >= cfg.total_ops) break;
+
+        PreparedBenchmarkWrite next;
+        next.key = benchmark_select_key_round_robin(keys, global_op);
+        next.value = cfg.value_prefix + to_string(cfg.client_index) + "-" + to_string(op_index);
+
+        if (topo.mode == chain::ReplicationMode::CROWN) {
+            next.target_head = topo.crown_head_for(next.key);
+            if (!next.target_head) {
+                throw runtime_error("bench-write prepare failed: no CROWN head for key='" + next.key + "'");
+            }
+        } else {
+            next.target_head = topo.head;
+            if (!next.target_head) {
+                throw runtime_error("bench-write prepare failed: no head node in topology");
+            }
+        }
+
+        prepared.push_back(std::move(next));
+        ++op_index;
+    }
+
+    return prepared;
+}
+
 [[maybe_unused]] static int benchmark_select_craq_node_id(const Topology& topo,
                                                            uint64_t operation_index,
                                                            int preferred_node_id = -1) {
@@ -945,36 +990,76 @@ static ThroughputMetricsSummary run_bench_write(Topology& topo,
     auto state = make_shared<ThroughputMetricsState>();
     benchmark_attach_metrics_state(state);
 
-    const vector<string> keys = benchmark_build_keyset(cfg.key_prefix, static_cast<size_t>(cfg.key_count));
-    const auto issue_start = SteadyClock::now();
+    const vector<PreparedBenchmarkWrite> prepared_writes = benchmark_prepare_write_batch(topo, cfg);
+
+    struct AsyncWriteCall {
+        uint64_t request_id = 0;
+        chain::WriteRequest request;
+        chain::WriteResponse response;
+        grpc::ClientContext ctx;
+        grpc::Status status;
+        unique_ptr<grpc::ClientAsyncResponseReader<chain::WriteResponse>> rpc;
+    };
 
     benchmark_start_metrics_window(*state);
-    uint64_t op_index = 0;
-    while (true) {
-        const uint64_t global_op = static_cast<uint64_t>(cfg.client_index)
-            + static_cast<uint64_t>(cfg.num_clients) * op_index;
-        if (global_op >= cfg.total_ops) break;
+    const auto issue_start = SteadyClock::now();
 
-        const string& key = benchmark_select_key_round_robin(keys, global_op);
-        const string value = cfg.value_prefix + to_string(cfg.client_index) + "-" + to_string(op_index);
-        (void)do_write(topo, key, value, client_addr, false);
-        ++op_index;
+    grpc::CompletionQueue cq;
+    size_t issued = 0;
+    for (const auto& prepared : prepared_writes) {
+        uint64_t request_id = add_pending(prepared.key, prepared.value);
+        benchmark_note_write_issued(request_id);
+
+        auto* call = new AsyncWriteCall();
+        call->request_id = request_id;
+        call->request.set_key(prepared.key);
+        call->request.set_value(prepared.value);
+        call->request.set_version(0);  // head assigns the real version
+        call->request.set_client_addr(client_addr);
+        call->request.set_request_id(request_id);
+
+        call->rpc = prepared.target_head->stub->AsyncWrite(&call->ctx, call->request, &cq);
+        if (!call->rpc) {
+            benchmark_note_write_rpc_failure();
+            (void)remove_pending_request(request_id);
+            delete call;
+            continue;
+        }
+
+        call->rpc->Finish(&call->response, &call->status, call);
+        ++issued;
     }
 
     const auto issue_end = SteadyClock::now();
     const double issue_duration_sec =
         chrono::duration_cast<chrono::duration<double>>(issue_end - issue_start).count();
     const double issue_wps = (issue_duration_sec > 0.0)
-        ? (static_cast<double>(op_index) / issue_duration_sec)
+        ? (static_cast<double>(issued) / issue_duration_sec)
         : 0.0;
     cout << fixed << setprecision(3)
          << "BENCH_WRITE_ISSUE"
          << " client_index=" << cfg.client_index
          << " num_clients=" << cfg.num_clients
-         << " ops_issued=" << op_index
+         << " ops_issued=" << issued
          << " issue_duration_s=" << issue_duration_sec
          << " issue_wps=" << issue_wps
          << "\n";
+
+    for (size_t completed = 0; completed < issued; ++completed) {
+        void* tag = nullptr;
+        bool ok = false;
+        if (!cq.Next(&tag, &ok) || tag == nullptr) {
+            throw runtime_error("bench-write async completion queue closed unexpectedly");
+        }
+
+        auto* call = static_cast<AsyncWriteCall*>(tag);
+        if (!ok || !call->status.ok() || !call->response.success()) {
+            benchmark_note_write_rpc_failure();
+            (void)remove_pending_request(call->request_id);
+        }
+        delete call;
+    }
+    cq.Shutdown();
 
     benchmark_wait_for_pending_acks();
     benchmark_stop_metrics_window(*state);
