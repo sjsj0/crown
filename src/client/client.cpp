@@ -367,13 +367,19 @@ static bool remove_pending_request(uint64_t request_id) {
     return g_pending.erase(request_id) > 0;
 }
 
-static bool benchmark_wait_for_pending_acks(chrono::milliseconds timeout) {
-    const auto deadline = SteadyClock::now() + timeout;
-    while (SteadyClock::now() < deadline) {
-        if (pending_write_count() == 0) return true;
+static void benchmark_wait_for_pending_acks() {
+    auto last_log = SteadyClock::now();
+    while (true) {
+        const size_t pending = pending_write_count();
+        if (pending == 0) return;
+
+        const auto now = SteadyClock::now();
+        if (now - last_log >= chrono::seconds(2)) {
+            cout << "[Bench] Waiting for " << pending << " pending ack(s)...\n";
+            last_log = now;
+        }
         this_thread::sleep_for(chrono::milliseconds(5));
     }
-    return pending_write_count() == 0;
 }
 
 static void print_usage(const char* bin) {
@@ -940,7 +946,7 @@ static ThroughputMetricsSummary run_bench_write(Topology& topo,
         ++op_index;
     }
 
-    (void)benchmark_wait_for_pending_acks(chrono::milliseconds(3000));
+    benchmark_wait_for_pending_acks();
     benchmark_stop_metrics_window(*state);
     const ThroughputMetricsSummary summary = benchmark_build_summary(*state);
     benchmark_detach_metrics_state();
@@ -957,7 +963,7 @@ static ThroughputMetricsSummary run_bench_read(Topology& topo,
         const string value = cfg.value_prefix + "seed-" + to_string(cfg.client_index) + "-" + to_string(i);
         (void)do_write(topo, keys[i], value, client_addr, false);
     }
-    (void)benchmark_wait_for_pending_acks(chrono::milliseconds(8000));
+    benchmark_wait_for_pending_acks();
 
     auto state = make_shared<ThroughputMetricsState>();
     benchmark_attach_metrics_state(state);
