@@ -35,7 +35,7 @@ if [[ ! -e "$REPO_DIR" && ! -w "$REMOTE_BASE_DIR" ]]; then
     echo "Preparing shared repo path with sudo: $REPO_DIR"
     sudo mkdir -p "$REPO_DIR"
     sudo chown -R "$DEPLOY_USER":"$DEPLOY_USER" "$REPO_DIR"
-    sudo chmod 777 "$REPO_DIR"
+    sudo chmod -R 777 "$REPO_DIR"
   else
     echo "ERROR: $REMOTE_BASE_DIR is not writable for $DEPLOY_USER."
     echo "       Configure passwordless sudo or choose a writable REMOTE_BASE_DIR."
@@ -47,7 +47,7 @@ if [[ -e "$REPO_DIR" && ! -w "$REPO_DIR" ]]; then
   if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
     echo "Fixing repo ownership with sudo: $REPO_DIR"
     sudo chown -R "$DEPLOY_USER":"$DEPLOY_USER" "$REPO_DIR"
-    sudo chmod 777 "$REPO_DIR"
+    sudo chmod -R 777 "$REPO_DIR"
   else
     echo "ERROR: $REPO_DIR is not writable for $DEPLOY_USER."
     echo "       Configure passwordless sudo or fix ownership manually."
@@ -63,6 +63,17 @@ if [[ -d "$REPO_NAME/.git" ]]; then
 else
   echo "Cloning fresh: $REPO_URL"
   git clone -b "$REPO_BRANCH" "$REPO_URL" "$REPO_NAME"
+fi
+
+# Always enforce shared access on the repo directory.
+if [[ -e "$REPO_DIR" ]]; then
+  if chmod -R 777 "$REPO_DIR" 2>/dev/null; then
+    :
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    sudo chmod -R 777 "$REPO_DIR"
+  else
+    echo "Warning: unable to set shared permissions on $REPO_DIR (need sudo)."
+  fi
 fi
 
 # ---------------------------
