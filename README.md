@@ -114,6 +114,11 @@ Host generation rules:
 - `--env dev`: all node hosts are `127.0.0.1`
 - `--env prod`: node hosts are `sp26-cs525-1201.cs.illinois.edu`, `sp26-cs525-1202.cs.illinois.edu`, ...
 
+Port generation rules:
+
+- `--env dev`: ports increment per node from `--base-port` (e.g., 50051, 50052, ...)
+- `--env prod`: all nodes use the same `--base-port` (e.g., 50051 on each host)
+
 You can optionally pass `--host <value>` to override and use one host for all generated nodes.
 
 A checked-in 3-node sample is provided at `config.crown.sample.json`.

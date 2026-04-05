@@ -14,15 +14,15 @@ This creates:
 - `build/prod_configs/config.craq.json`
 - `build/prod_configs/config.crown.json`
 
-## 2) Start one server per prod VM (matching ports)
+## 2) Start one server per prod VM (shared port)
 
-Example for 5 nodes (`1201`..`1205`) on ports `50051`..`50055`:
+Example for 5 nodes (`1201`..`1205`), all listening on `50051`:
 
-`for i in 1 2 3 4 5; do h="sp26-cs525-120${i}.cs.illinois.edu"; p=$((50050+i)); ssh <user>@$h "cd /path/to/crown && nohup ./build/server --port $p > server_$p.log 2>&1 &"; done`
+`for i in 1 2 3 4 5; do h="sp26-cs525-120${i}.cs.illinois.edu"; p=50051; ssh <user>@$h "cd /path/to/crown && nohup ./build/server --port $p > server_$p.log 2>&1 &"; done`
 
 ## 3) Optional connectivity check
 
-`for i in 1 2 3 4 5; do h="sp26-cs525-120${i}.cs.illinois.edu"; p=$((50050+i)); nc -vz $h $p; done`
+`for i in 1 2 3 4 5; do h="sp26-cs525-120${i}.cs.illinois.edu"; p=50051; nc -vz $h $p; done`
 
 ## 4) Start client interactive loop (first run: configure=true)
 
@@ -62,5 +62,6 @@ CRAQ:
 
 - Replace `<user>` with your NetID/login on the VMs.
 - Replace `/path/to/crown` with the repo path on each VM.
-- Keep `node_count`, host list, and port mapping consistent.
+- Keep `node_count`, host list, and base port consistent.
+- For prod configs, all nodes use the same base port.
 - If you change node count, regenerate configs and update loop ranges accordingly.

@@ -35,6 +35,14 @@ def build_hosts(node_count: int, env_name: str, host_override: str | None = None
     return [host_for_index(i, env_name) for i in range(node_count)]
 
 
+def build_ports(node_count: int, base_port: int, env_name: str) -> list[int]:
+    # In dev/local, each node runs on one machine so ports must be unique.
+    if env_name == "dev":
+        return [base_port + i for i in range(node_count)]
+    # In prod, each node is typically on a different VM, so one shared port is enough.
+    return [base_port for _ in range(node_count)]
+
+
 def build_crown_config(
     node_count: int,
     base_port: int,
@@ -42,7 +50,8 @@ def build_crown_config(
     host_override: str | None = None,
 ) -> dict:
     hosts = build_hosts(node_count, env_name, host_override)
-    endpoints = [endpoint(hosts[i], base_port + i) for i in range(node_count)]
+    ports = build_ports(node_count, base_port, env_name)
+    endpoints = [endpoint(hosts[i], ports[i]) for i in range(node_count)]
 
     nodes = []
     for i in range(node_count):
@@ -53,7 +62,7 @@ def build_crown_config(
             {
                 "id": i,
                 "host": hosts[i],
-                "port": base_port + i,
+                "port": ports[i],
                 "is_head": False,
                 "is_tail": False,
                 "predecessor": endpoints[predecessor_index],
@@ -75,7 +84,8 @@ def build_linear_config(
     host_override: str | None = None,
 ) -> dict:
     hosts = build_hosts(node_count, env_name, host_override)
-    endpoints = [endpoint(hosts[i], base_port + i) for i in range(node_count)]
+    ports = build_ports(node_count, base_port, env_name)
+    endpoints = [endpoint(hosts[i], ports[i]) for i in range(node_count)]
 
     nodes = []
     for i in range(node_count):
@@ -86,7 +96,7 @@ def build_linear_config(
             {
                 "id": i,
                 "host": hosts[i],
-                "port": base_port + i,
+                "port": ports[i],
                 "is_head": i == 0,
                 "is_tail": i == node_count - 1,
                 "predecessor": predecessor,
@@ -107,12 +117,13 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.base_port < 1 or args.base_port > 65535:
         raise ValueError("base_port must be in [1, 65535]")
 
-    last_port = args.base_port + args.node_count - 1
-    if last_port > 65535:
-        raise ValueError(
-            f"port range exceeds 65535: base_port={args.base_port}, "
-            f"node_count={args.node_count}"
-        )
+    if args.env == "dev":
+        last_port = args.base_port + args.node_count - 1
+        if last_port > 65535:
+            raise ValueError(
+                f"port range exceeds 65535: base_port={args.base_port}, "
+                f"node_count={args.node_count}"
+            )
 
     if args.host is not None and not args.host.strip():
         raise ValueError("host override must be non-empty when provided")
@@ -127,7 +138,10 @@ def parse_args() -> argparse.Namespace:
         "--base-port",
         type=int,
         default=50051,
-        help="Starting port for node 0 (default: 50051)",
+        help=(
+            "Base port. In dev, ports increase per node (base, base+1, ...). "
+            "In prod, all nodes use this same port (default: 50051)."
+        ),
     )
     parser.add_argument(
         "--env",
@@ -135,7 +149,8 @@ def parse_args() -> argparse.Namespace:
         default="dev",
         help=(
             "Host environment: dev=127.0.0.1 for all nodes, "
-            "prod=sp26-cs525-1201.cs.illinois.edu, 1202, ..."
+            "prod=sp26-cs525-1201.cs.illinois.edu, 1202, ...; "
+            "port behavior: dev increments, prod uses shared base-port"
         ),
     )
     parser.add_argument(
@@ -191,10 +206,14 @@ def main() -> int:
         written_paths.append(path)
 
     host_desc = args.host if args.host else args.env
+    ports_desc = (
+        f"{args.base_port}-{args.base_port + args.node_count - 1}" if args.env == "dev"
+        else f"{args.base_port} (shared)"
+    )
     print(
         "Wrote mode configs: "
         f"{', '.join(str(p) for p in written_paths)} "
-        f"(nodes={args.node_count}, ports={args.base_port}-{args.base_port + args.node_count - 1}, hosts={host_desc})"
+        f"(nodes={args.node_count}, ports={ports_desc}, hosts={host_desc})"
     )
     return 0
 
