@@ -7,7 +7,7 @@ A C++ implementation of three chain replication variants:
 
 Inter-node communication uses gRPC and Protocol Buffers. Topology config is pushed to nodes at runtime by a client — nodes themselves are config-agnostic at startup.
 
-For CHAIN and CROWN in this version, `WriteResponse` means the head accepted the write (assigned a version), not that the write is already committed. Commit happens later when `Ack` returns from the tail.
+For CHAIN and CROWN in this version, `WriteResponse` means the head accepted the write (assigned a version), not that the write is already committed. Commit happens later when the tail commits and sends `Ack` directly to the client.
 
 This prototype intentionally avoids mutexes/condition variables in replication helpers and assumes serialized writes from a single active client.
 
@@ -174,8 +174,8 @@ What it checks:
 - The head assigns a monotonic per-key version and records that version as dirty.
 - The head immediately returns `WriteResponse { success=true, version=... }` to indicate accepted-by-head.
 - Dirty versions propagate node-by-node using `Propagate` (CHAIN: successor along the chain, CROWN: clockwise toward the key tail).
-- The key tail marks the version clean/committed and initiates upstream `Ack`.
-- Upstream nodes mark clean on `Ack`; the key head logs final commit when `Ack` arrives.
+- The key tail marks the version clean/committed and sends `Ack` directly to the client.
+- CHAIN and CROWN do not use inter-node `Ack` propagation in this version. CRAQ still uses upstream inter-node `Ack` propagation.
 - Only the read tail for a key serves client `Read` RPCs (CHAIN: configured tail, CROWN: key tail).
 - Reads return the latest clean/committed value/version only.
 - Client writes sent to non-head nodes fail with a clear error.

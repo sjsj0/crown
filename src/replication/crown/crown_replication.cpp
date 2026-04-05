@@ -59,29 +59,6 @@ void forward_propagate_clockwise_async(std::shared_ptr<chain::ChainNode::Stub> s
     }).detach();
 }
 
-void forward_ack_counter_clockwise_async(std::shared_ptr<chain::ChainNode::Stub> predecessor,
-                                         chain::AckRequest req,
-                                         const std::string& from_node) {
-    std::thread([predecessor = std::move(predecessor),
-                 req = std::move(req),
-                 from_node]() mutable {
-        if (!predecessor) {
-            cerr << "[CROWN] Async ACK skipped from " << from_node
-                 << ": no predecessor stub\n";
-            return;
-        }
-
-        google::protobuf::Empty ignored;
-        grpc::ClientContext ctx;
-        grpc::Status status = predecessor->Ack(&ctx, req, &ignored);
-        if (!status.ok()) {
-            cerr << "[CROWN] Async ACK failed from " << from_node
-                 << " key='" << req.key() << "' version=" << req.version()
-                 << ": " << status.error_message() << "\n";
-        }
-    }).detach();
-}
-
 void notify_client_ack_async(chain::AckRequest req,
                              const std::string& from_node) {
     std::thread([req = std::move(req), from_node]() mutable {
@@ -120,7 +97,7 @@ chain::WriteResponse CROWNReplication::handle_write(const chain::WriteRequest& r
 
     cout << "[CROWN] Head accepted write key='" << req.key()
         << "' assigned version=" << version
-        << " (response means accepted by head; commit happens later when ACK returns)\n";
+        << " (response means accepted by head; commit happens later at key-tail)\n";
 
     chain::WriteResponse resp;
     resp.set_success(true);
@@ -195,19 +172,14 @@ void CROWNReplication::handle_propagate(const chain::PropagateRequest& req, Node
         support_.mark_version_clean(req.key(), req.version());
 
         cout << "[CROWN] Key-tail committed key='" << req.key()
-             << "' version=" << req.version() << " and scheduling ACK counter-clockwise\n";
+             << " version=" << req.version() << " and notifying client directly\n";
 
-        if (!node.is_head_for(req.key())) {
-            auto pred = support_.predecessor_stub();
-
-            chain::AckRequest ack;
-            ack.set_key(req.key());
-            ack.set_version(req.version());
-            ack.set_client_addr(req.client_addr());
-            ack.set_request_id(req.request_id());
-
-            forward_ack_counter_clockwise_async(pred, std::move(ack), crown_node_label(node));
-        }
+        chain::AckRequest ack;
+        ack.set_key(req.key());
+        ack.set_version(req.version());
+        ack.set_client_addr(req.client_addr());
+        ack.set_request_id(req.request_id());
+        notify_client_ack_async(std::move(ack), crown_node_label(node));
         return;
     }
 
@@ -221,30 +193,9 @@ void CROWNReplication::handle_propagate(const chain::PropagateRequest& req, Node
 }
 
 void CROWNReplication::handle_ack(const chain::AckRequest& req, Node& node) {
-    log_key_ownership(node, req.key(), "handle_ack");
-
-    support_.mark_version_clean(req.key(), req.version());
-    cout << "[CROWN] Node " << crown_node_label(node)
-         << " marked CLEAN key='" << req.key() << "' version=" << req.version() << "\n";
-
-    if (node.is_head_for(req.key())) {
-        cout << "[CROWN] Key-head finalized commit request_id=" << req.request_id()
-             << " key='" << req.key() << "' version=" << req.version()
-             << " client_addr='" << req.client_addr() << "'\n";
-
-        chain::AckRequest client_ack = req;
-        notify_client_ack_async(std::move(client_ack), crown_node_label(node));
-
-        return;
-    }
-
-    auto pred = support_.predecessor_stub();
-    chain::AckRequest fwd = req;
-    forward_ack_counter_clockwise_async(pred, std::move(fwd), crown_node_label(node));
-
-    cout << "[CROWN] Node " << crown_node_label(node)
-         << " forwarded ACK counter-clockwise key='" << req.key()
-         << "' version=" << req.version() << "\n";
+    throw runtime_error(
+        "CROWN Ack RPC is disabled: only CRAQ uses inter-node ACK propagation"
+    );
 }
 
 void CROWNReplication::on_config_change(Node& node) {

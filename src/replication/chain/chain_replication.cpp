@@ -44,29 +44,6 @@ void forward_propagate_async(std::shared_ptr<chain::ChainNode::Stub> successor,
     }).detach();
 }
 
-void forward_ack_async(std::shared_ptr<chain::ChainNode::Stub> predecessor,
-                       chain::AckRequest req,
-                       const std::string& from_node) {
-    std::thread([predecessor = std::move(predecessor),
-                 req = std::move(req),
-                 from_node]() mutable {
-        if (!predecessor) {
-            cerr << "[Chain] Async ACK skipped from " << from_node
-                 << ": no predecessor stub\n";
-            return;
-        }
-
-        google::protobuf::Empty ignored;
-        grpc::ClientContext ctx;
-        grpc::Status status = predecessor->Ack(&ctx, req, &ignored);
-        if (!status.ok()) {
-            cerr << "[Chain] Async ACK failed from " << from_node
-                 << " key='" << req.key() << "' version=" << req.version()
-                 << ": " << status.error_message() << "\n";
-        }
-    }).detach();
-}
-
 void notify_client_ack_async(chain::AckRequest req,
                              const std::string& from_node) {
     std::thread([req = std::move(req), from_node]() mutable {
@@ -103,7 +80,7 @@ chain::WriteResponse ChainReplication::handle_write(const chain::WriteRequest& r
 
     cout << "[Chain] Head " << chain_node_label(node)
         << " accepted write key='" << req.key() << "' version=" << version
-        << " (response means accepted by head; commit happens later when ACK comes back)\n";
+        << " (response means accepted by head; commit happens later at tail)\n";
 
     chain::WriteResponse resp;
     resp.set_success(true);
@@ -169,19 +146,14 @@ void ChainReplication::handle_propagate(const chain::PropagateRequest& req, Node
         support_.mark_version_clean(req.key(), req.version());
 
         cout << "[Chain] Tail committed key='" << req.key() << "' version=" << req.version()
-             << " and will send ACK asynchronously\n";
+             << " and will notify client asynchronously\n";
 
-        if (!node.is_head()) {
-            auto pred = support_.predecessor_stub();
-
-            chain::AckRequest ack;
-            ack.set_key(req.key());
-            ack.set_version(req.version());
-            ack.set_client_addr(req.client_addr());
-            ack.set_request_id(req.request_id());
-
-            forward_ack_async(pred, std::move(ack), chain_node_label(node));
-        }
+        chain::AckRequest ack;
+        ack.set_key(req.key());
+        ack.set_version(req.version());
+        ack.set_client_addr(req.client_addr());
+        ack.set_request_id(req.request_id());
+        notify_client_ack_async(std::move(ack), chain_node_label(node));
         return;
     }
 
@@ -195,29 +167,9 @@ void ChainReplication::handle_propagate(const chain::PropagateRequest& req, Node
 }
 
 void ChainReplication::handle_ack(const chain::AckRequest& req, Node& node) {
-    cout << "[Chain] Node " << chain_node_label(node)
-         << " received ACK key='" << req.key() << "' version=" << req.version() << "\n";
-
-    support_.mark_version_clean(req.key(), req.version());
-
-    if (node.is_head()) {
-        cout << "[Chain] Head finalized commit request_id=" << req.request_id()
-             << " key='" << req.key() << "' version=" << req.version()
-             << " client_addr='" << req.client_addr() << "'\n";
-
-        chain::AckRequest client_ack = req;
-        notify_client_ack_async(std::move(client_ack), chain_node_label(node));
-
-        return;
-    }
-
-    auto pred = support_.predecessor_stub();
-    chain::AckRequest fwd = req;
-    forward_ack_async(pred, std::move(fwd), chain_node_label(node));
-
-    cout << "[Chain] Node " << chain_node_label(node)
-         << " forwarded ACK asynchronously key='" << req.key()
-         << "' version=" << req.version() << "\n";
+    throw runtime_error(
+        "CHAIN Ack RPC is disabled: only CRAQ uses inter-node ACK propagation"
+    );
 }
 
 void ChainReplication::on_config_change(Node& node) {
