@@ -34,12 +34,50 @@
 #include <limits>
 #include <memory>
 
+#include <unistd.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+
 #include <grpcpp/grpcpp.h>
 #include <nlohmann/json.hpp>
 #include "chain.grpc.pb.h"
 
 using namespace std;
 using json = nlohmann::json;
+
+// ============================================================
+// Helpers
+// ============================================================
+
+static string get_local_ip() {
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) != 0) {
+        return "127.0.0.1";  // fallback
+    }
+
+    struct addrinfo hints = {};
+    hints.ai_family = AF_INET;  // IPv4
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo* result = nullptr;
+    if (getaddrinfo(hostname, nullptr, &hints, &result) != 0) {
+        return "127.0.0.1";  // fallback
+    }
+
+    string ip = "127.0.0.1";  // default fallback
+    for (struct addrinfo* rp = result; rp != nullptr; rp = rp->ai_next) {
+        if (rp->ai_family == AF_INET) {
+            struct sockaddr_in* sa = (struct sockaddr_in*)rp->ai_addr;
+            char ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &(sa->sin_addr), ip_str, INET_ADDRSTRLEN);
+            ip = ip_str;
+            break;  // use the first IPv4 address
+        }
+    }
+
+    freeaddrinfo(result);
+    return ip;
+}
 
 // ============================================================
 // Pending write map — keyed by request_id
@@ -1073,7 +1111,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const string client_addr = "127.0.0.1:" + to_string(ack_port);
+    const string client_addr = get_local_ip() + ":" + to_string(ack_port);
 
     // --- Start Ack server in background thread -----------------
     ClientAckServiceImpl ack_service;
