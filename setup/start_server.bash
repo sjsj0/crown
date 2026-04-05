@@ -170,7 +170,7 @@ fi
 # 4) Run server in tmux
 # ---------------------------
 NODE_HOST="${NODE_HOST:-0.0.0.0}"
-NODE_PORT="${NODE_PORT:-5001}"
+NODE_PORT="${NODE_PORT:-50051}"
 SERVER_LOG_RAW="${SERVER_LOG:-true}"
 case "${SERVER_LOG_RAW,,}" in
   1|true|yes|y|on) SERVER_LOG="true" ;;
