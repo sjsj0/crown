@@ -437,7 +437,7 @@ def launch_case(cfg: RunnerConfig, mode: str, op: str, run_idx: int) -> None:
         scp_cmd = [
             "scp",
             *cfg.ssh_opts,
-            f"{cfg.ssh_user}@{host}:{remote_log_file}",
+            f"{cfg.ssh_user}@{host}:{cfg.remote_repo_dir}/{remote_log_file}",
             str(local_client_log),
         ]
 
@@ -484,7 +484,7 @@ def launch_case(cfg: RunnerConfig, mode: str, op: str, run_idx: int) -> None:
         scp_cmd = [
             "scp",
             *cfg.ssh_opts,
-            f"{cfg.ssh_user}@{launch.host}:{launch.remote_log_file}",
+            f"{cfg.ssh_user}@{launch.host}:{cfg.remote_repo_dir}/{launch.remote_log_file}",
             str(launch.local_client_log),
         ]
         try:
