@@ -143,6 +143,21 @@ def run_cmd(args: Sequence[str], quiet: bool = False) -> None:
         raise RunnerError(f"command failed ({exc.returncode}): {format_shell_cmd(args)}") from exc
 
 
+def restart_servers(root_dir: Path) -> None:
+    """Kill servers and restart them for a clean state between benchmark runs."""
+    log("Restarting servers (kill + rerun)...")
+    setup_script = root_dir / "setup" / "vm_setup.bash"
+    try:
+        subprocess.run([str(setup_script), "kill"], check=False, capture_output=True, timeout=60)
+        log("Servers killed.")
+        subprocess.run([str(setup_script), "rerun"], check=True, timeout=300)
+        log("Servers restarted successfully.")
+    except subprocess.TimeoutExpired as exc:
+        raise RunnerError(f"server restart timed out: {exc}") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RunnerError(f"server restart failed: {exc}") from exc
+
+
 def parse_args(root_dir: Path) -> argparse.Namespace:
     work_dir_default = env_str("WORK_DIR", str(root_dir / "build" / "distributed_throughput_runs"))
 
@@ -528,8 +543,15 @@ def main() -> int:
     log(f"  work_dir={cfg.work_dir}")
 
     run_idx = 0
+    first_run = True
     for mode in cfg.modes:
         for op in cfg.ops:
+            # Restart servers between runs (but not before the first run)
+            if not first_run:
+                if not cfg.dry_run:
+                    restart_servers(root_dir)
+            first_run = False
+
             try:
                 launch_case(cfg, mode, op, run_idx)
             except RunnerError:
