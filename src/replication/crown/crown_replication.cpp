@@ -5,6 +5,9 @@
 #include <string>
 #include <thread>
 #include <limits>
+#include <condition_variable>
+#include <queue>
+#include <vector>
 
 #include "chain.pb.h"
 #include "node/node.h"
@@ -20,6 +23,89 @@ string crown_node_label(const Node& node) {
         return node.id();
     }
     return node.self_addr().to_string();
+}
+
+struct PropagateTask {
+    std::shared_ptr<chain::ChainNode::Stub> successor;
+    chain::PropagateRequest req;
+    std::string from_node;
+};
+
+class PropagateDispatcher {
+public:
+    explicit PropagateDispatcher(const std::string& tag)
+        : tag_(tag) {
+        size_t workers = std::thread::hardware_concurrency();
+        if (workers == 0) workers = 4;
+        workers = std::min<size_t>(workers, 8);
+
+        workers_.reserve(workers);
+        for (size_t i = 0; i < workers; ++i) {
+            workers_.emplace_back([this]() { worker_loop(); });
+        }
+    }
+
+    ~PropagateDispatcher() {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) worker.join();
+        }
+    }
+
+    void enqueue(std::shared_ptr<chain::ChainNode::Stub> successor,
+                 chain::PropagateRequest req,
+                 std::string from_node) {
+        if (!successor) {
+            cerr << tag_ << " Async PROPAGATE skipped from " << from_node
+                 << ": no successor stub\n";
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            queue_.push(PropagateTask{std::move(successor), std::move(req), std::move(from_node)});
+        }
+        cv_.notify_one();
+    }
+
+private:
+    void worker_loop() {
+        while (true) {
+            PropagateTask task;
+            {
+                std::unique_lock<std::mutex> lk(mtx_);
+                cv_.wait(lk, [this]() { return stop_ || !queue_.empty(); });
+                if (stop_ && queue_.empty()) return;
+                task = std::move(queue_.front());
+                queue_.pop();
+            }
+
+            google::protobuf::Empty ignored;
+            grpc::ClientContext ctx;
+            grpc::Status status = task.successor->Propagate(&ctx, task.req, &ignored);
+            if (!status.ok()) {
+                cerr << tag_ << " Async PROPAGATE failed from " << task.from_node
+                     << " key='" << task.req.key() << "' version=" << task.req.version()
+                     << ": " << status.error_message() << "\n";
+            }
+        }
+    }
+
+    std::string tag_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::queue<PropagateTask> queue_;
+    std::vector<std::thread> workers_;
+    bool stop_ = false;
+};
+
+PropagateDispatcher& crown_propagate_dispatcher() {
+    static PropagateDispatcher dispatcher("[CROWN]");
+    return dispatcher;
 }
 
 int parse_origin_index_or_throw(const std::string& origin_id, int ring_size) {
@@ -63,24 +149,7 @@ bool is_request_tail_node(const Node& node, const chain::PropagateRequest& req) 
 void forward_propagate_clockwise_async(std::shared_ptr<chain::ChainNode::Stub> successor,
                                        chain::PropagateRequest req,
                                        const std::string& from_node) {
-    std::thread([successor = std::move(successor),
-                 req = std::move(req),
-                 from_node]() mutable {
-        if (!successor) {
-            cerr << "[CROWN] Async PROPAGATE skipped from " << from_node
-                 << ": no successor stub\n";
-            return;
-        }
-
-        google::protobuf::Empty ignored;
-        grpc::ClientContext ctx;
-        grpc::Status status = successor->Propagate(&ctx, req, &ignored);
-        if (!status.ok()) {
-            cerr << "[CROWN] Async PROPAGATE failed from " << from_node
-                 << " key='" << req.key() << "' version=" << req.version()
-                 << ": " << status.error_message() << "\n";
-        }
-    }).detach();
+    crown_propagate_dispatcher().enqueue(std::move(successor), std::move(req), from_node);
 }
 
 } // namespace
