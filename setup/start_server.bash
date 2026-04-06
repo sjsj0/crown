@@ -190,8 +190,17 @@ OUT_FILE="$RUN_DIR/server_${NODE_PORT}.out"
 SESSION_NAME="${TMUX_SESSION_NAME:-crown}"
 TMUX_SOCKET="${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}"
 TMUX_SOCKET_DIR="$(dirname "$TMUX_SOCKET")"
+
+# Ensure socket directory exists with proper permissions
 mkdir -p "$TMUX_SOCKET_DIR"
-chmod 1777 "$TMUX_SOCKET_DIR" 2>/dev/null || true
+chmod 1777 "$TMUX_SOCKET_DIR" 2>/dev/null || sudo chmod 1777 "$TMUX_SOCKET_DIR" 2>/dev/null || true
+
+# Remove any stale socket with bad permissions before attempting to use tmux
+if [[ -S "$TMUX_SOCKET" ]]; then
+  echo "Removing stale tmux socket due to permission issues..."
+  rm -f "$TMUX_SOCKET" 2>/dev/null || sudo rm -f "$TMUX_SOCKET" 2>/dev/null || true
+fi
+
 TMUX_CMD=(tmux -S "$TMUX_SOCKET")
 
 echo "Shared paths:"
