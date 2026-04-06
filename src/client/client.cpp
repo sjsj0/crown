@@ -748,6 +748,11 @@ struct Topology {
     }
 };
 
+static NodeStub* resolve_read_target(Topology& topo,
+                                     const string& key,
+                                     int node_id,
+                                     bool verbose);
+
 struct PreparedBenchmarkWrite {
     NodeStub* target_head = nullptr;
     string key;
@@ -806,6 +811,47 @@ static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
 
     const size_t idx = static_cast<size_t>(operation_index % topo.nodes.size());
     return topo.nodes[idx].id;
+}
+
+struct PreparedBenchmarkRead {
+    NodeStub* target = nullptr;
+    string key;
+};
+
+static vector<PreparedBenchmarkRead> benchmark_prepare_read_batch(
+    Topology& topo,
+    const BenchmarkRunConfig& cfg) {
+    const vector<string> keys = benchmark_build_keyset(cfg.key_prefix, static_cast<size_t>(cfg.key_count));
+
+    vector<PreparedBenchmarkRead> prepared;
+    prepared.reserve(static_cast<size_t>(
+        (cfg.total_ops + static_cast<uint64_t>(cfg.num_clients) - 1)
+        / static_cast<uint64_t>(cfg.num_clients)));
+
+    uint64_t op_index = 0;
+    while (true) {
+        const uint64_t global_op = static_cast<uint64_t>(cfg.client_index)
+            + static_cast<uint64_t>(cfg.num_clients) * op_index;
+        if (global_op >= cfg.total_ops) break;
+
+        PreparedBenchmarkRead next;
+        next.key = benchmark_select_key_round_robin(keys, global_op);
+
+        int node_id = -1;
+        if (topo.mode == chain::ReplicationMode::CRAQ) {
+            node_id = benchmark_select_craq_node_id(topo, global_op, cfg.craq_node_id);
+        }
+
+        next.target = resolve_read_target(topo, next.key, node_id, false);
+        if (!next.target) {
+            throw runtime_error("bench-read prepare failed: no target for key='" + next.key + "'");
+        }
+
+        prepared.push_back(std::move(next));
+        ++op_index;
+    }
+
+    return prepared;
 }
 
 static Topology build_topology(const json& config, chain::ReplicationMode mode) {
@@ -910,53 +956,8 @@ static bool do_write(Topology& topo, const string& key, const string& value,
 }
 
 static bool do_read(Topology& topo, const string& key, int node_id = -1, bool verbose = true) {
-    // Resolve the target node for this key.
-    // CHAIN: single static tail.
-    // CRAQ: specified node_id or random.
-    // CROWN: tail index = (head index - 1 + node_count) % node_count.
-    NodeStub* target = nullptr;
-    if (topo.mode == chain::ReplicationMode::CROWN) {
-        target = topo.crown_tail_for(key);
-        if (!target) {
-            if (verbose) {
-                cerr << "[Read] No CROWN tail found for key='" << key << "' "
-                     << "(token=" << Topology::hash_key(key) << ")\n";
-            }
-            return false;
-        }
-    } else if (topo.mode == chain::ReplicationMode::CRAQ) {
-        if (node_id != -1) {
-            // Find node with specified id
-            for (auto& ns : topo.nodes) {
-                if (ns.id == node_id) {
-                    target = &ns;
-                    break;
-                }
-            }
-            if (!target) {
-                if (verbose) cerr << "[Read] Node with id " << node_id << " not found.\n";
-                return false;
-            }
-        } else {
-            // Random pick
-            if (topo.nodes.empty()) {
-                if (verbose) cerr << "[Read] No nodes in topology.\n";
-                return false;
-            }
-            static std::random_device rd;
-            static std::mt19937 gen(rd());
-            std::uniform_int_distribution<> dis(0, topo.nodes.size() - 1);
-            int random_index = dis(gen);
-            target = &topo.nodes[random_index];
-        }
-    } else {
-        // CHAIN: use tail
-        target = topo.tail;
-        if (!target) {
-            if (verbose) cerr << "[Read] No tail node in topology.\n";
-            return false;
-        }
-    }
+    NodeStub* target = resolve_read_target(topo, key, node_id, verbose);
+    if (!target) return false;
 
     chain::ReadRequest  req;
     chain::ReadResponse resp;
@@ -982,6 +983,60 @@ static bool do_read(Topology& topo, const string& key, int node_id = -1, bool ve
                  << " (via " << target->endpoint << ")\n";
     }
     return true;
+}
+
+static NodeStub* resolve_read_target(Topology& topo,
+                                     const string& key,
+                                     int node_id,
+                                     bool verbose) {
+    // Resolve the target node for this key.
+    // CHAIN: single static tail.
+    // CRAQ: specified node_id or random.
+    // CROWN: tail index = (head index - 1 + node_count) % node_count.
+    NodeStub* target = nullptr;
+    if (topo.mode == chain::ReplicationMode::CROWN) {
+        target = topo.crown_tail_for(key);
+        if (!target) {
+            if (verbose) {
+                cerr << "[Read] No CROWN tail found for key='" << key << "' "
+                     << "(token=" << Topology::hash_key(key) << ")\n";
+            }
+            return nullptr;
+        }
+    } else if (topo.mode == chain::ReplicationMode::CRAQ) {
+        if (node_id != -1) {
+            // Find node with specified id
+            for (auto& ns : topo.nodes) {
+                if (ns.id == node_id) {
+                    target = &ns;
+                    break;
+                }
+            }
+            if (!target) {
+                if (verbose) cerr << "[Read] Node with id " << node_id << " not found.\n";
+                return nullptr;
+            }
+        } else {
+            // Random pick
+            if (topo.nodes.empty()) {
+                if (verbose) cerr << "[Read] No nodes in topology.\n";
+                return nullptr;
+            }
+            static std::random_device rd;
+            static std::mt19937 gen(rd());
+            std::uniform_int_distribution<> dis(0, topo.nodes.size() - 1);
+            int random_index = dis(gen);
+            target = &topo.nodes[random_index];
+        }
+    } else {
+        // CHAIN: use tail
+        target = topo.tail;
+        if (!target) {
+            if (verbose) cerr << "[Read] No tail node in topology.\n";
+            return nullptr;
+        }
+    }
+    return target;
 }
 
 static ThroughputMetricsSummary run_bench_write(Topology& topo,
@@ -1083,23 +1138,69 @@ static ThroughputMetricsSummary run_bench_read(Topology& topo,
     auto state = make_shared<ThroughputMetricsState>();
     benchmark_attach_metrics_state(state);
 
+    const vector<PreparedBenchmarkRead> prepared_reads = benchmark_prepare_read_batch(topo, cfg);
+
+    struct AsyncReadCall {
+        chain::ReadRequest request;
+        chain::ReadResponse response;
+        grpc::ClientContext ctx;
+        grpc::Status status;
+        unique_ptr<grpc::ClientAsyncResponseReader<chain::ReadResponse>> rpc;
+    };
+
     benchmark_start_metrics_window(*state);
+    const auto issue_start = SteadyClock::now();
 
-    uint64_t op_index = 0;
-    while (true) {
-        const uint64_t global_op = static_cast<uint64_t>(cfg.client_index)
-            + static_cast<uint64_t>(cfg.num_clients) * op_index;
-        if (global_op >= cfg.total_ops) break;
+    grpc::CompletionQueue cq;
+    size_t issued = 0;
+    for (const auto& prepared : prepared_reads) {
+        benchmark_note_read_sent();
 
-        const string& key = benchmark_select_key_round_robin(keys, global_op);
+        auto* call = new AsyncReadCall();
+        call->request.set_key(prepared.key);
 
-        int node_id = -1;
-        if (topo.mode == chain::ReplicationMode::CRAQ) {
-            node_id = benchmark_select_craq_node_id(topo, global_op, cfg.craq_node_id);
+        call->rpc = prepared.target->stub->AsyncRead(&call->ctx, call->request, &cq);
+        if (!call->rpc) {
+            benchmark_note_read_failure();
+            delete call;
+            continue;
         }
-        (void)do_read(topo, key, node_id, false);
-        ++op_index;
+
+        call->rpc->Finish(&call->response, &call->status, call);
+        ++issued;
     }
+
+    const auto issue_end = SteadyClock::now();
+    const double issue_duration_sec =
+        chrono::duration_cast<chrono::duration<double>>(issue_end - issue_start).count();
+    const double issue_rps = (issue_duration_sec > 0.0)
+        ? (static_cast<double>(issued) / issue_duration_sec)
+        : 0.0;
+    cout << fixed << setprecision(3)
+         << "BENCH_READ_ISSUE"
+         << " client_index=" << cfg.client_index
+         << " num_clients=" << cfg.num_clients
+         << " ops_issued=" << issued
+         << " issue_duration_s=" << issue_duration_sec
+         << " issue_rps=" << issue_rps
+         << "\n";
+
+    for (size_t completed = 0; completed < issued; ++completed) {
+        void* tag = nullptr;
+        bool ok = false;
+        if (!cq.Next(&tag, &ok) || tag == nullptr) {
+            throw runtime_error("bench-read async completion queue closed unexpectedly");
+        }
+
+        auto* call = static_cast<AsyncReadCall*>(tag);
+        if (!ok || !call->status.ok()) {
+            benchmark_note_read_failure();
+        } else {
+            benchmark_note_read_success();
+        }
+        delete call;
+    }
+    cq.Shutdown();
 
     benchmark_stop_metrics_window(*state);
     const ThroughputMetricsSummary summary = benchmark_build_summary(*state);
