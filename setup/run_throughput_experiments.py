@@ -158,6 +158,19 @@ def restart_servers(root_dir: Path) -> None:
         raise RunnerError(f"server restart failed: {exc}") from exc
 
 
+def startup_servers(root_dir: Path) -> None:
+    """Start servers for the first time (rerun without kill)."""
+    log("Starting servers (rerun)...")
+    setup_script = root_dir / "setup" / "vm_setup.bash"
+    try:
+        subprocess.run([str(setup_script), "rerun"], check=True, timeout=300)
+        log("Servers started successfully.")
+    except subprocess.TimeoutExpired as exc:
+        raise RunnerError(f"server startup timed out: {exc}") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RunnerError(f"server startup failed: {exc}") from exc
+
+
 def parse_args(root_dir: Path) -> argparse.Namespace:
     work_dir_default = env_str("WORK_DIR", str(root_dir / "build" / "distributed_throughput_runs"))
 
@@ -546,11 +559,14 @@ def main() -> int:
     first_run = True
     for mode in cfg.modes:
         for op in cfg.ops:
-            # Restart servers between runs (but not before the first run)
-            if not first_run:
+            # Start/restart servers before each run
+            if first_run:
+                if not cfg.dry_run:
+                    startup_servers(root_dir)
+                first_run = False
+            else:
                 if not cfg.dry_run:
                     restart_servers(root_dir)
-            first_run = False
 
             try:
                 launch_case(cfg, mode, op, run_idx)
