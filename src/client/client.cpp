@@ -462,19 +462,22 @@ static bool parse_run_mode_args(int argc,
             auto try_parse_hot_pct = [&](int* out_pct) -> bool {
                 const string short_prefix = "hot=";
                 const string long_prefix = "crown_hot_head_pct=";
+                const string alias_prefix = "write_hot_head_pct=";
 
                 string value_text;
                 if (token.rfind(short_prefix, 0) == 0) {
                     value_text = token.substr(short_prefix.size());
                 } else if (token.rfind(long_prefix, 0) == 0) {
                     value_text = token.substr(long_prefix.size());
+                } else if (token.rfind(alias_prefix, 0) == 0) {
+                    value_text = token.substr(alias_prefix.size());
                 } else {
                     return false;
                 }
 
                 int parsed = 0;
                 if (!parse_int_text(value_text, parsed) || parsed < 0 || parsed > 100) {
-                    err = "crown_hot_head_pct must be in [0, 100]";
+                    err = "write_hot_head_pct must be in [0, 100]";
                     return false;
                 }
                 *out_pct = parsed;
@@ -865,8 +868,7 @@ static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
     const BenchmarkRunConfig& cfg) {
     const vector<string> keys = benchmark_build_keyset(cfg.key_prefix, static_cast<size_t>(cfg.key_count));
 
-    const bool crown_hotspot_enabled =
-        topo.mode == chain::ReplicationMode::CROWN && cfg.crown_hot_head_pct > 0;
+    const bool write_hotspot_enabled = cfg.crown_hot_head_pct > 0;
 
     int hot_head_id = -1;
     vector<size_t> hot_key_indices;
@@ -875,27 +877,39 @@ static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
     size_t cold_cursor = 0;
     uint64_t planned_hot_ops = 0;
 
-    if (crown_hotspot_enabled) {
-        NodeStub* hot_head = topo.crown_head_for(keys.front());
+    if (write_hotspot_enabled) {
+        NodeStub* hot_head = nullptr;
+        if (topo.mode == chain::ReplicationMode::CROWN) {
+            hot_head = topo.crown_head_for(keys.front());
+        } else {
+            hot_head = topo.head;
+        }
         if (!hot_head) {
-            throw runtime_error("bench-write prepare failed: unable to resolve CROWN hotspot head");
+            throw runtime_error("bench-write prepare failed: unable to resolve hotspot head");
         }
         hot_head_id = hot_head->id;
 
         hot_key_indices.reserve(keys.size());
         cold_key_indices.reserve(keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            NodeStub* key_head = topo.crown_head_for(keys[i]);
-            if (!key_head) continue;
-            if (key_head->id == hot_head_id) {
+
+        if (topo.mode == chain::ReplicationMode::CROWN) {
+            for (size_t i = 0; i < keys.size(); ++i) {
+                NodeStub* key_head = topo.crown_head_for(keys[i]);
+                if (!key_head) continue;
+                if (key_head->id == hot_head_id) {
+                    hot_key_indices.push_back(i);
+                } else {
+                    cold_key_indices.push_back(i);
+                }
+            }
+        } else {
+            for (size_t i = 0; i < keys.size(); ++i) {
                 hot_key_indices.push_back(i);
-            } else {
-                cold_key_indices.push_back(i);
             }
         }
 
         if (hot_key_indices.empty()) {
-            throw runtime_error("bench-write prepare failed: no keys map to selected CROWN hotspot head");
+            throw runtime_error("bench-write prepare failed: no keys map to selected hotspot head");
         }
     }
 
@@ -912,7 +926,7 @@ static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
 
         PreparedBenchmarkWrite next;
 
-        if (crown_hotspot_enabled) {
+        if (write_hotspot_enabled) {
             const bool want_hot =
                 (cfg.crown_hot_head_pct >= 100)
                     ? true
@@ -930,7 +944,7 @@ static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
             } else if (!cold_key_indices.empty()) {
                 key_idx = cold_key_indices[cold_cursor++ % cold_key_indices.size()];
             } else {
-                throw runtime_error("bench-write prepare failed: no key candidates for CROWN hotspot mix");
+                throw runtime_error("bench-write prepare failed: no key candidates for hotspot mix");
             }
 
             next.key = keys[key_idx];
@@ -956,13 +970,14 @@ static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
         ++op_index;
     }
 
-    if (crown_hotspot_enabled) {
+    if (write_hotspot_enabled) {
         const double effective_hot_pct = prepared.empty()
             ? 0.0
             : (100.0 * static_cast<double>(planned_hot_ops) / static_cast<double>(prepared.size()));
 
         cout << fixed << setprecision(3)
-             << "BENCH_CROWN_HOTSPOT"
+             << "BENCH_WRITE_HOTSPOT"
+             << " mode=" << mode_name(topo.mode)
              << " client_index=" << cfg.client_index
              << " num_clients=" << cfg.num_clients
              << " hot_head_id=" << hot_head_id
@@ -1619,8 +1634,8 @@ int main(int argc, char** argv) {
              << " key_count=" << bench_cfg.key_count
              << " client_index=" << bench_cfg.client_index
              << " num_clients=" << bench_cfg.num_clients;
-        if (is_write && mode == chain::ReplicationMode::CROWN) {
-            cout << " crown_hot_head_pct=" << bench_cfg.crown_hot_head_pct;
+        if (is_write) {
+            cout << " write_hot_head_pct=" << bench_cfg.crown_hot_head_pct;
         }
         if (!is_write) {
             cout << " read_hot_key_pct=" << bench_cfg.read_hot_key_pct;

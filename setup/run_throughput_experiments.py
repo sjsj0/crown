@@ -31,7 +31,7 @@ class RunnerConfig:
     read_op_count: int
     key_count: int
     craq_read_node_id: int
-    crown_hot_head_pct: int
+    write_hot_head_pct: int
     read_hot_key_pct: int
 
     ssh_user: str
@@ -165,10 +165,15 @@ def parse_args(root_dir: Path) -> argparse.Namespace:
     p.add_argument("--key-count", type=int, default=env_int("KEY_COUNT", 64))
     p.add_argument("--craq-read-node-id", type=int, default=env_int("CRAQ_READ_NODE_ID", -1))
     p.add_argument(
+        "--write-hot-head-pct",
         "--crown-hot-head-pct",
+        dest="write_hot_head_pct",
         type=int,
-        default=env_int("CROWN_HOT_HEAD_PCT", 0),
-        help="For bench-write, target this percent of writes to a single CROWN head node (0-100)",
+        default=env_int("WRITE_HOT_HEAD_PCT", env_int("CROWN_HOT_HEAD_PCT", 0)),
+        help=(
+            "For bench-write, target this percent of writes to a selected hot head (0-100). "
+            "For CHAIN/CRAQ, effective hot-head share is always 100 because all writes use one head."
+        ),
     )
     p.add_argument(
         "--read-hot-key-pct",
@@ -233,8 +238,8 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
         raise RunnerError("--read-op-count must be > 0")
     if args.key_count <= 0:
         raise RunnerError("--key-count must be > 0")
-    if args.crown_hot_head_pct < 0 or args.crown_hot_head_pct > 100:
-        raise RunnerError("--crown-hot-head-pct must be in [0, 100]")
+    if args.write_hot_head_pct < 0 or args.write_hot_head_pct > 100:
+        raise RunnerError("--write-hot-head-pct must be in [0, 100]")
     if args.read_hot_key_pct < 0 or args.read_hot_key_pct > 100:
         raise RunnerError("--read-hot-key-pct must be in [0, 100]")
     if not (1 <= args.ack_base_port <= 65535):
@@ -295,7 +300,7 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
         read_op_count=args.read_op_count,
         key_count=args.key_count,
         craq_read_node_id=args.craq_read_node_id,
-        crown_hot_head_pct=args.crown_hot_head_pct,
+        write_hot_head_pct=args.write_hot_head_pct,
         read_hot_key_pct=args.read_hot_key_pct,
         ssh_user=ssh_user,
         ssh_opts=ssh_opts,
@@ -355,7 +360,7 @@ def build_remote_client_command(
                 str(num_clients),
                 key_prefix,
                 value_prefix,
-                f"hot={cfg.crown_hot_head_pct}",
+                f"hot={cfg.write_hot_head_pct}",
             ]
         )
     else:
@@ -518,7 +523,7 @@ def main() -> int:
     log(f"  write_op_count={cfg.write_op_count}")
     log(f"  read_op_count={cfg.read_op_count}")
     log(f"  key_count={cfg.key_count}")
-    log(f"  crown_hot_head_pct={cfg.crown_hot_head_pct}")
+    log(f"  write_hot_head_pct={cfg.write_hot_head_pct}")
     log(f"  read_hot_key_pct={cfg.read_hot_key_pct}")
     log(f"  work_dir={cfg.work_dir}")
 
