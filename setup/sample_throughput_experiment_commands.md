@@ -88,6 +88,36 @@ python3 setup/run_throughput_experiments.py \
   --work-dir build/prod_crown_only
 ```
 
+### CROWN hot-head write skew (example: 60% to one head)
+
+```bash
+python3 setup/run_throughput_experiments.py \
+  --hosts "$(cat setup/prod_hosts.csv)" \
+  --ssh-user ritwikg3 \
+  --remote-repo-dir /home/crown \
+  --modes crown \
+  --ops write \
+  --write-op-count 50000 \
+  --key-count 64 \
+  --crown-hot-head-pct 60 \
+  --work-dir build/prod_crown_hot_60
+```
+
+### Read hot-key skew (example: 80% to one key)
+
+```bash
+python3 setup/run_throughput_experiments.py \
+  --hosts "$(cat setup/prod_hosts.csv)" \
+  --ssh-user ritwikg3 \
+  --remote-repo-dir /home/crown \
+  --modes chain craq crown \
+  --ops read \
+  --read-op-count 50000 \
+  --key-count 64 \
+  --read-hot-key-pct 80 \
+  --work-dir build/prod_read_hot_80
+```
+
 ## Expected Outputs
 
 For any `--work-dir <DIR>`:
@@ -107,6 +137,8 @@ For any `--work-dir <DIR>`:
 - `--write-op-count`: Total distributed write operations per write case.
 - `--read-op-count`: Total distributed read operations per read case.
 - `--key-count`: Number of keys in keyspace.
+- `--crown-hot-head-pct`: For CROWN write runs, percentage of writes targeted to one head node (`0` to `100`).
+- `--read-hot-key-pct`: For read runs, percentage of reads targeted to one hot key (`0` to `100`).
 - `--remote-config-template`: Remote config path template (default: `build/prod_configs/config.{mode}.json`).
 - `--work-dir`: Local output directory for logs and summary.
 - `--dry-run`: Print planned SSH/SCP commands without executing.

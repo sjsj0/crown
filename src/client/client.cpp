@@ -322,6 +322,8 @@ struct BenchmarkRunConfig {
     int craq_node_id = -1;
     string key_prefix = "bench-key-";
     string value_prefix = "bench-value-";
+    int crown_hot_head_pct = 0;
+    int read_hot_key_pct = 0;
 };
 
 static bool parse_int_text(const string& s, int& out) {
@@ -386,8 +388,8 @@ static void benchmark_wait_for_pending_acks() {
 static void print_usage(const char* bin) {
     cerr << "Usage:\n"
          << "  " << bin << " <config.json> <true/false> [ack_port]\n"
-         << "  " << bin << " <config.json> <true/false> [ack_port] bench-write <total_ops> <key_count> <client_index> <num_clients> [key_prefix] [value_prefix]\n"
-         << "  " << bin << " <config.json> <true/false> [ack_port] bench-read  <total_ops> <key_count> <client_index> <num_clients> [craq_node_id] [key_prefix]\n";
+         << "  " << bin << " <config.json> <true/false> [ack_port] bench-write <total_ops> <key_count> <client_index> <num_clients> [key_prefix] [value_prefix] [hot=<0-100>]\n"
+         << "  " << bin << " <config.json> <true/false> [ack_port] bench-read  <total_ops> <key_count> <client_index> <num_clients> [craq_node_id] [key_prefix] [hot=<0-100>]\n";
 }
 
 static bool parse_run_mode_args(int argc,
@@ -450,9 +452,64 @@ static bool parse_run_mode_args(int argc,
     }
 
     if (is_write) {
-        if (argi < argc) bench_cfg.key_prefix = argv[argi++];
-        if (argi < argc) bench_cfg.value_prefix = argv[argi++];
+        bool key_prefix_set = false;
+        bool value_prefix_set = false;
+        bool hot_pct_set = false;
+
+        for (; argi < argc; ++argi) {
+            const string token = argv[argi];
+
+            auto try_parse_hot_pct = [&](int* out_pct) -> bool {
+                const string short_prefix = "hot=";
+                const string long_prefix = "crown_hot_head_pct=";
+
+                string value_text;
+                if (token.rfind(short_prefix, 0) == 0) {
+                    value_text = token.substr(short_prefix.size());
+                } else if (token.rfind(long_prefix, 0) == 0) {
+                    value_text = token.substr(long_prefix.size());
+                } else {
+                    return false;
+                }
+
+                int parsed = 0;
+                if (!parse_int_text(value_text, parsed) || parsed < 0 || parsed > 100) {
+                    err = "crown_hot_head_pct must be in [0, 100]";
+                    return false;
+                }
+                *out_pct = parsed;
+                return true;
+            };
+
+            if (!hot_pct_set) {
+                int parsed_hot_pct = 0;
+                if (try_parse_hot_pct(&parsed_hot_pct)) {
+                    bench_cfg.crown_hot_head_pct = parsed_hot_pct;
+                    hot_pct_set = true;
+                    continue;
+                }
+                if (!err.empty()) return false;
+            }
+
+            if (!key_prefix_set) {
+                bench_cfg.key_prefix = token;
+                key_prefix_set = true;
+                continue;
+            }
+
+            if (!value_prefix_set) {
+                bench_cfg.value_prefix = token;
+                value_prefix_set = true;
+                continue;
+            }
+
+            err = "too many arguments for benchmark write mode";
+            return false;
+        }
     } else {
+        bool key_prefix_set = false;
+        bool hot_pct_set = false;
+
         if (argi < argc) {
             int maybe_node_id = -1;
             if (parse_int_text(argv[argi], maybe_node_id)) {
@@ -460,7 +517,51 @@ static bool parse_run_mode_args(int argc,
                 ++argi;
             }
         }
-        if (argi < argc) bench_cfg.key_prefix = argv[argi++];
+
+        for (; argi < argc; ++argi) {
+            const string token = argv[argi];
+
+            auto try_parse_hot_pct = [&](int* out_pct) -> bool {
+                const string short_prefix = "hot=";
+                const string long_prefix = "read_hot_key_pct=";
+
+                string value_text;
+                if (token.rfind(short_prefix, 0) == 0) {
+                    value_text = token.substr(short_prefix.size());
+                } else if (token.rfind(long_prefix, 0) == 0) {
+                    value_text = token.substr(long_prefix.size());
+                } else {
+                    return false;
+                }
+
+                int parsed = 0;
+                if (!parse_int_text(value_text, parsed) || parsed < 0 || parsed > 100) {
+                    err = "read_hot_key_pct must be in [0, 100]";
+                    return false;
+                }
+                *out_pct = parsed;
+                return true;
+            };
+
+            if (!hot_pct_set) {
+                int parsed_hot_pct = 0;
+                if (try_parse_hot_pct(&parsed_hot_pct)) {
+                    bench_cfg.read_hot_key_pct = parsed_hot_pct;
+                    hot_pct_set = true;
+                    continue;
+                }
+                if (!err.empty()) return false;
+            }
+
+            if (!key_prefix_set) {
+                bench_cfg.key_prefix = token;
+                key_prefix_set = true;
+                continue;
+            }
+
+            err = "too many arguments for benchmark read mode";
+            return false;
+        }
     }
 
     if (argi != argc) {
@@ -764,6 +865,40 @@ static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
     const BenchmarkRunConfig& cfg) {
     const vector<string> keys = benchmark_build_keyset(cfg.key_prefix, static_cast<size_t>(cfg.key_count));
 
+    const bool crown_hotspot_enabled =
+        topo.mode == chain::ReplicationMode::CROWN && cfg.crown_hot_head_pct > 0;
+
+    int hot_head_id = -1;
+    vector<size_t> hot_key_indices;
+    vector<size_t> cold_key_indices;
+    size_t hot_cursor = 0;
+    size_t cold_cursor = 0;
+    uint64_t planned_hot_ops = 0;
+
+    if (crown_hotspot_enabled) {
+        NodeStub* hot_head = topo.crown_head_for(keys.front());
+        if (!hot_head) {
+            throw runtime_error("bench-write prepare failed: unable to resolve CROWN hotspot head");
+        }
+        hot_head_id = hot_head->id;
+
+        hot_key_indices.reserve(keys.size());
+        cold_key_indices.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            NodeStub* key_head = topo.crown_head_for(keys[i]);
+            if (!key_head) continue;
+            if (key_head->id == hot_head_id) {
+                hot_key_indices.push_back(i);
+            } else {
+                cold_key_indices.push_back(i);
+            }
+        }
+
+        if (hot_key_indices.empty()) {
+            throw runtime_error("bench-write prepare failed: no keys map to selected CROWN hotspot head");
+        }
+    }
+
     vector<PreparedBenchmarkWrite> prepared;
     prepared.reserve(static_cast<size_t>(
         (cfg.total_ops + static_cast<uint64_t>(cfg.num_clients) - 1)
@@ -776,7 +911,33 @@ static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
         if (global_op >= cfg.total_ops) break;
 
         PreparedBenchmarkWrite next;
-        next.key = benchmark_select_key_round_robin(keys, global_op);
+
+        if (crown_hotspot_enabled) {
+            const bool want_hot =
+                (cfg.crown_hot_head_pct >= 100)
+                    ? true
+                    : ((global_op % 100ULL) < static_cast<uint64_t>(cfg.crown_hot_head_pct));
+
+            size_t key_idx = 0;
+            if (want_hot && !hot_key_indices.empty()) {
+                key_idx = hot_key_indices[hot_cursor++ % hot_key_indices.size()];
+                ++planned_hot_ops;
+            } else if (!want_hot && !cold_key_indices.empty()) {
+                key_idx = cold_key_indices[cold_cursor++ % cold_key_indices.size()];
+            } else if (!hot_key_indices.empty()) {
+                key_idx = hot_key_indices[hot_cursor++ % hot_key_indices.size()];
+                ++planned_hot_ops;
+            } else if (!cold_key_indices.empty()) {
+                key_idx = cold_key_indices[cold_cursor++ % cold_key_indices.size()];
+            } else {
+                throw runtime_error("bench-write prepare failed: no key candidates for CROWN hotspot mix");
+            }
+
+            next.key = keys[key_idx];
+        } else {
+            next.key = benchmark_select_key_round_robin(keys, global_op);
+        }
+
         next.value = cfg.value_prefix + to_string(cfg.client_index) + "-" + to_string(op_index);
 
         if (topo.mode == chain::ReplicationMode::CROWN) {
@@ -793,6 +954,23 @@ static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
 
         prepared.push_back(std::move(next));
         ++op_index;
+    }
+
+    if (crown_hotspot_enabled) {
+        const double effective_hot_pct = prepared.empty()
+            ? 0.0
+            : (100.0 * static_cast<double>(planned_hot_ops) / static_cast<double>(prepared.size()));
+
+        cout << fixed << setprecision(3)
+             << "BENCH_CROWN_HOTSPOT"
+             << " client_index=" << cfg.client_index
+             << " num_clients=" << cfg.num_clients
+             << " hot_head_id=" << hot_head_id
+             << " requested_hot_pct=" << cfg.crown_hot_head_pct
+             << " effective_hot_pct=" << effective_hot_pct
+             << " hot_key_count=" << hot_key_indices.size()
+             << " cold_key_count=" << cold_key_indices.size()
+             << "\n";
     }
 
     return prepared;
@@ -823,6 +1001,20 @@ static vector<PreparedBenchmarkRead> benchmark_prepare_read_batch(
     const BenchmarkRunConfig& cfg) {
     const vector<string> keys = benchmark_build_keyset(cfg.key_prefix, static_cast<size_t>(cfg.key_count));
 
+    const bool read_hotspot_enabled = cfg.read_hot_key_pct > 0;
+    const size_t hot_key_idx = 0;
+    vector<size_t> cold_key_indices;
+    size_t cold_cursor = 0;
+    uint64_t planned_hot_ops = 0;
+
+    if (read_hotspot_enabled) {
+        cold_key_indices.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (i == hot_key_idx) continue;
+            cold_key_indices.push_back(i);
+        }
+    }
+
     vector<PreparedBenchmarkRead> prepared;
     prepared.reserve(static_cast<size_t>(
         (cfg.total_ops + static_cast<uint64_t>(cfg.num_clients) - 1)
@@ -835,7 +1027,22 @@ static vector<PreparedBenchmarkRead> benchmark_prepare_read_batch(
         if (global_op >= cfg.total_ops) break;
 
         PreparedBenchmarkRead next;
-        next.key = benchmark_select_key_round_robin(keys, global_op);
+        if (read_hotspot_enabled) {
+            const bool want_hot =
+                (cfg.read_hot_key_pct >= 100)
+                    ? true
+                    : ((global_op % 100ULL) < static_cast<uint64_t>(cfg.read_hot_key_pct));
+
+            if (want_hot || cold_key_indices.empty()) {
+                next.key = keys[hot_key_idx];
+                ++planned_hot_ops;
+            } else {
+                const size_t cold_key_idx = cold_key_indices[cold_cursor++ % cold_key_indices.size()];
+                next.key = keys[cold_key_idx];
+            }
+        } else {
+            next.key = benchmark_select_key_round_robin(keys, global_op);
+        }
 
         int node_id = -1;
         if (topo.mode == chain::ReplicationMode::CRAQ) {
@@ -849,6 +1056,21 @@ static vector<PreparedBenchmarkRead> benchmark_prepare_read_batch(
 
         prepared.push_back(std::move(next));
         ++op_index;
+    }
+
+    if (read_hotspot_enabled) {
+        const double effective_hot_pct = prepared.empty()
+            ? 0.0
+            : (100.0 * static_cast<double>(planned_hot_ops) / static_cast<double>(prepared.size()));
+
+        cout << fixed << setprecision(3)
+             << "BENCH_READ_HOTSPOT"
+             << " client_index=" << cfg.client_index
+             << " num_clients=" << cfg.num_clients
+             << " hot_key='" << keys[hot_key_idx] << "'"
+             << " requested_hot_pct=" << cfg.read_hot_key_pct
+             << " effective_hot_pct=" << effective_hot_pct
+             << "\n";
     }
 
     return prepared;
@@ -1397,6 +1619,12 @@ int main(int argc, char** argv) {
              << " key_count=" << bench_cfg.key_count
              << " client_index=" << bench_cfg.client_index
              << " num_clients=" << bench_cfg.num_clients;
+        if (is_write && mode == chain::ReplicationMode::CROWN) {
+            cout << " crown_hot_head_pct=" << bench_cfg.crown_hot_head_pct;
+        }
+        if (!is_write) {
+            cout << " read_hot_key_pct=" << bench_cfg.read_hot_key_pct;
+        }
         if (!is_write && mode == chain::ReplicationMode::CRAQ) {
             cout << " craq_node_id=" << bench_cfg.craq_node_id;
         }
