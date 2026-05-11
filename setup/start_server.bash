@@ -201,6 +201,8 @@ fi
 # ---------------------------
 NODE_HOST="${NODE_HOST:-0.0.0.0}"
 NODE_PORT="${NODE_PORT:-50051}"
+NODE_EXTERNAL_HOST="${NODE_EXTERNAL_HOST:-}"
+NODE_JOIN="${NODE_JOIN:-}"
 SERVER_LOG_RAW="${SERVER_LOG:-true}"
 case "${SERVER_LOG_RAW,,}" in
   1|true|yes|y|on) SERVER_LOG="true" ;;
@@ -251,6 +253,8 @@ fi
 pkill -u "$DEPLOY_USER" -f "server --host .* --port $NODE_PORT" >/dev/null 2>&1 || true
 
 SERVER_CMD="cd '$PROJECT_DIR' && exec '$NODE_BIN' --host '$NODE_HOST' --port '$NODE_PORT' --server-log '$SERVER_LOG'"
+[[ -n "$NODE_EXTERNAL_HOST" ]] && SERVER_CMD+=" --external-host '$NODE_EXTERNAL_HOST'"
+[[ -n "$NODE_JOIN" ]] && SERVER_CMD+=" --join '$NODE_JOIN'"
 echo "Run command: $SERVER_CMD"
 echo "Starting $NODE_BIN --host $NODE_HOST --port $NODE_PORT --server-log $SERVER_LOG"
 printf '[launch] %s\n' "$SERVER_CMD" | tee -a "$LOG_FILE" >> "$OUT_FILE"
