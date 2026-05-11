@@ -46,6 +46,7 @@ namespace {
 struct Options {
     string config_path       = "config.json";
     string bind_host         = "0.0.0.0";
+    string external_host     = "sp26-cs525-1220.cs.illinois.edu";     // address that nodes use to reach this server
     int    bind_port         = 50050;
     int    ping_interval_ms  = 1000;
     int    ping_timeout_ms   = 1000;
@@ -56,6 +57,7 @@ struct Options {
 void print_usage(const char* bin) {
     cerr << "Usage: " << bin
          << " [--config <path>] [--host <host>] [--port <port>]"
+            " [--external-host <host>]"
             " [--ping-interval-ms <n>] [--ping-timeout-ms <n>]"
             " [--failure-threshold <n>] [--log]\n";
 }
@@ -82,6 +84,7 @@ bool parse_args(int argc, char** argv, Options& opt, string& err) {
         else if (a == "--log") { opt.verbose = true; }
         else if (a == "--config") { const char* v = need_value("--config"); if (!v) return false; opt.config_path = v; }
         else if (a == "--host")   { const char* v = need_value("--host");   if (!v) return false; opt.bind_host = v; }
+        else if (a == "--external-host") { const char* v = need_value("--external-host"); if (!v) return false; opt.external_host = v; }
         else if (a == "--port")   { const char* v = need_value("--port");   if (!v) return false; if (!parse_int_arg(v, opt.bind_port)) { err = "invalid --port"; return false; } }
         else if (a == "--ping-interval-ms")  { const char* v = need_value("--ping-interval-ms");  if (!v) return false; if (!parse_int_arg(v, opt.ping_interval_ms)  || opt.ping_interval_ms  <= 0) { err = "invalid --ping-interval-ms"; return false; } }
         else if (a == "--ping-timeout-ms")   { const char* v = need_value("--ping-timeout-ms");   if (!v) return false; if (!parse_int_arg(v, opt.ping_timeout_ms)   || opt.ping_timeout_ms <= 0) { err = "invalid --ping-timeout-ms"; return false; } }
