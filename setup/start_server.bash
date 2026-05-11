@@ -224,6 +224,10 @@ TMUX_SOCKET="${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}"
 TMUX_SOCKET_DIR="$(dirname "$TMUX_SOCKET")"
 mkdir -p "$TMUX_SOCKET_DIR"
 chmod 1777 "$TMUX_SOCKET_DIR" 2>/dev/null || true
+# Remove stale socket owned by a different user (causes "Operation not permitted").
+if [[ -S "$TMUX_SOCKET" ]] && ! tmux -S "$TMUX_SOCKET" list-sessions 2>/dev/null; then
+  rm -f "$TMUX_SOCKET" 2>/dev/null || sudo rm -f "$TMUX_SOCKET" 2>/dev/null || true
+fi
 TMUX_CMD=(tmux -S "$TMUX_SOCKET")
 
 echo "Shared paths:"
