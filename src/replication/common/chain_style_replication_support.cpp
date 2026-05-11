@@ -508,6 +508,9 @@ void ChainStyleReplicationSupport::send_inflight_check(uint64_t reconfig_id, int
 }
 
 void ChainStyleReplicationSupport::predecessor_ack_worker_loop() {
+    static constexpr int kMaxAttempts = 3;
+    static constexpr int kBackoffsMs[] = {20, 100};
+
     while (pred_ack_worker_running_.load(memory_order_acquire)) {
         chain::AckRequest req;
         {
@@ -523,6 +526,40 @@ void ChainStyleReplicationSupport::predecessor_ack_worker_loop() {
             pred_ack_queue_.pop_front();
         }
 
-        enqueue_predecessor_ack(req);
+        auto pred = predecessor_stub();
+        if (!pred) {
+            cerr << "[Support] Predecessor ACK skipped: no predecessor stub"
+                 << " key='" << req.key() << "' version=" << req.version()
+                 << " request_id=" << req.request_id() << "\n";
+            continue;
+        }
+
+        bool delivered = false;
+        for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+            google::protobuf::Empty ignored;
+            grpc::ClientContext ctx;
+            grpc::Status status = pred->Ack(&ctx, req, &ignored);
+            if (status.ok()) {
+                delivered = true;
+                break;
+            }
+
+            cerr << "[Support] Predecessor ACK attempt " << (attempt + 1)
+                 << " failed key='" << req.key()
+                 << "' version=" << req.version()
+                 << " request_id=" << req.request_id()
+                 << ": " << status.error_message() << "\n";
+
+            if (attempt + 1 < kMaxAttempts) {
+                this_thread::sleep_for(chrono::milliseconds(kBackoffsMs[attempt]));
+            }
+        }
+
+        if (!delivered) {
+            cerr << "[Support] Predecessor ACK dropped after " << kMaxAttempts
+                 << " attempts key='" << req.key()
+                 << "' version=" << req.version()
+                 << " request_id=" << req.request_id() << "\n";
+        }
     }
 }
