@@ -14,6 +14,8 @@ public:
 
     void on_config_change(Node& node) override;
 
+    ChainStyleReplicationSupport* support() override { return &support_; }
+
 private:
     ChainStyleReplicationSupport support_;
 };

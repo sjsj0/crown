@@ -163,36 +163,58 @@ void ChainStyleReplicationSupport::mark_version_committed_if_newer(const std::st
 }
 
 void ChainStyleReplicationSupport::on_config_change(const Node& node) {
-    lock_guard<mutex> lk(stub_mtx_);
-    predecessor_channel_.reset();
-    successor_channel_.reset();
-    tail_channel_.reset();
-    predecessor_stub_.reset();
-    successor_stub_.reset();
-    tail_stub_.reset();
+    std::shared_ptr<chain::ChainNode::Stub> new_successor_stub;
+    {
+        lock_guard<mutex> lk(stub_mtx_);
+        predecessor_channel_.reset();
+        successor_channel_.reset();
+        tail_channel_.reset();
+        predecessor_stub_.reset();
+        successor_stub_.reset();
+        tail_stub_.reset();
 
-    if (node.predecessor().has_value()) {
-        predecessor_channel_ = grpc::CreateChannel(
-            node.predecessor()->to_string(),
-            grpc::InsecureChannelCredentials());
-        auto pred_stub = chain::ChainNode::NewStub(predecessor_channel_);
-        predecessor_stub_ = std::shared_ptr<chain::ChainNode::Stub>(std::move(pred_stub));
+        if (node.predecessor().has_value()) {
+            predecessor_channel_ = grpc::CreateChannel(
+                node.predecessor()->to_string(),
+                grpc::InsecureChannelCredentials());
+            auto pred_stub = chain::ChainNode::NewStub(predecessor_channel_);
+            predecessor_stub_ = std::shared_ptr<chain::ChainNode::Stub>(std::move(pred_stub));
+        }
+
+        if (node.successor().has_value()) {
+            successor_channel_ = grpc::CreateChannel(
+                node.successor()->to_string(),
+                grpc::InsecureChannelCredentials());
+            auto succ_stub = chain::ChainNode::NewStub(successor_channel_);
+            successor_stub_ = std::shared_ptr<chain::ChainNode::Stub>(std::move(succ_stub));
+            new_successor_stub = successor_stub_;
+        }
+
+        if (node.config().tail.has_value()) {
+            tail_channel_ = grpc::CreateChannel(
+                node.config().tail->to_string(),
+                grpc::InsecureChannelCredentials());
+            auto tail_stub = chain::ChainNode::NewStub(tail_channel_);
+            tail_stub_ = std::shared_ptr<chain::ChainNode::Stub>(std::move(tail_stub));
+        }
     }
 
-    if (node.successor().has_value()) {
-        successor_channel_ = grpc::CreateChannel(
-            node.successor()->to_string(),
-            grpc::InsecureChannelCredentials());
-        auto succ_stub = chain::ChainNode::NewStub(successor_channel_);
-        successor_stub_ = std::shared_ptr<chain::ChainNode::Stub>(std::move(succ_stub));
-    }
-
-    if (node.config().tail.has_value()) {
-        tail_channel_ = grpc::CreateChannel(
-            node.config().tail->to_string(),
-            grpc::InsecureChannelCredentials());
-        auto tail_stub = chain::ChainNode::NewStub(tail_channel_);
-        tail_stub_ = std::shared_ptr<chain::ChainNode::Stub>(std::move(tail_stub));
+    // Refresh successor stubs for any queued propagate tasks (handles
+    // failure-case where the old successor is dead and pending writes must
+    // be redirected to the new successor).
+    if (new_successor_stub) {
+        lock_guard<mutex> qlk(prop_queue_mtx_);
+        std::queue<PropagateTask> refreshed;
+        while (!prop_queue_.empty()) {
+            PropagateTask task = std::move(prop_queue_.front());
+            prop_queue_.pop();
+            task.successor = new_successor_stub;
+            refreshed.push(std::move(task));
+        }
+        prop_queue_ = std::move(refreshed);
+        if (!prop_queue_.empty()) {
+            prop_queue_cv_.notify_all();
+        }
     }
 }
 
@@ -420,6 +442,69 @@ void ChainStyleReplicationSupport::retry_scheduler_loop() {
             prop_queue_cv_.notify_all();
         }
     }
+}
+
+chain::DataDump ChainStyleReplicationSupport::dump_committed_state() const {
+    chain::DataDump dump;
+    lock_guard<mutex> lk(state_mtx_);
+    for (const auto& [key, state] : by_key_) {
+        if (state.committed_version == 0) continue;
+        auto* entry = dump.add_entries();
+        entry->set_key(key);
+        entry->set_value(state.committed_value);
+        entry->set_version(state.committed_version);
+    }
+    return dump;
+}
+
+void ChainStyleReplicationSupport::load_from_dump(const chain::DataDump& dump) {
+    lock_guard<mutex> lk(state_mtx_);
+    by_key_.clear();
+    for (const auto& entry : dump.entries()) {
+        KeyState& state = by_key_[entry.key()];
+        state.next_version = entry.version();
+        state.latest_seen_version = entry.version();
+        state.latest_seen_value = entry.value();
+        state.committed_version = entry.version();
+        state.committed_value = entry.value();
+    }
+}
+
+void ChainStyleReplicationSupport::send_inflight_check(uint64_t reconfig_id, int32_t origin_node_id) {
+    auto succ = successor_stub();
+    if (!succ) {
+        cerr << "[Support] Cannot send InflightCheck: no successor stub\n";
+        return;
+    }
+
+    // Fire async with retry — InflightCheck is rare (only during reconfig) so
+    // a detached thread with bounded retries is the simplest implementation.
+    thread([succ, reconfig_id, origin_node_id]() {
+        static constexpr int kMaxAttempts = 4;
+        static constexpr int kBackoffs[] = {2, 5, 10};
+
+        chain::InflightCheckRequest req;
+        req.set_reconfig_id(reconfig_id);
+        req.set_origin_node_id(origin_node_id);
+
+        for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+            google::protobuf::Empty ignored;
+            grpc::ClientContext ctx;
+            grpc::Status status = succ->InflightCheck(&ctx, req, &ignored);
+            if (status.ok()) return;
+
+            cerr << "[Support] InflightCheck attempt " << (attempt + 1)
+                 << " failed reconfig_id=" << reconfig_id
+                 << " origin=" << origin_node_id
+                 << ": " << status.error_message() << "\n";
+
+            if (attempt < kMaxAttempts - 1) {
+                this_thread::sleep_for(chrono::seconds(kBackoffs[attempt]));
+            }
+        }
+        cerr << "[Support] InflightCheck dropped after " << kMaxAttempts
+             << " attempts reconfig_id=" << reconfig_id << "\n";
+    }).detach();
 }
 
 void ChainStyleReplicationSupport::predecessor_ack_worker_loop() {

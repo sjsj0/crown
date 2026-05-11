@@ -16,6 +16,7 @@ namespace chain {
 }
 
 class Node;
+class ChainStyleReplicationSupport;
 
 using namespace std;
 
@@ -85,4 +86,8 @@ public:
     // Called after the server applies a new NodeConfig to the Node.
     // Strategies can use this to re-establish stubs to new neighbours.
     virtual void on_config_change(Node& node) {}
+
+    // Access to the shared support state — used by the reconfigure protocol
+    // to send inflight checks, dump committed state, and load bootstrap data.
+    virtual ChainStyleReplicationSupport* support() = 0;
 };

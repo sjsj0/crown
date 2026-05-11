@@ -10,14 +10,19 @@
 //   4. It serves MetadataStore.GetCluster so clients can fetch the current
 //      topology + per-node liveness instead of reading a config file.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -289,28 +294,36 @@ public:
 
     // Apply one ping result for node `idx`. Logs DOWN/UP transitions.
     void record_ping_result(size_t idx, bool ok, int failure_threshold, bool verbose) {
-        lock_guard<mutex> lk(mtx_);
-        NodeEntry& n = nodes_[idx];
-        if (ok) {
-            n.consecutive_misses = 0;
-            if (!n.alive) {
-                n.alive = true;
-                cout << "[MetadataStore] node " << n.node_id << " (" << n.endpoint()
-                     << ") is UP again\n" << flush;
-            }
-        } else {
-            ++n.consecutive_misses;
-            if (verbose) {
-                cout << "[MetadataStore] node " << n.node_id << " (" << n.endpoint()
-                     << ") missed ping #" << n.consecutive_misses << "\n" << flush;
-            }
-            if (n.alive && n.consecutive_misses >= failure_threshold) {
-                n.alive = false;
-                cout << "[MetadataStore] node " << n.node_id << " (" << n.endpoint()
-                     << ") declared DOWN after " << n.consecutive_misses
-                     << " missed pings\n" << flush;
+        std::function<void(int)> cb_to_fire;
+        int failed_node_id = -1;
+        {
+            lock_guard<mutex> lk(mtx_);
+            if (idx >= nodes_.size()) return;
+            NodeEntry& n = nodes_[idx];
+            if (ok) {
+                n.consecutive_misses = 0;
+                if (!n.alive) {
+                    n.alive = true;
+                    cout << "[MetadataStore] node " << n.node_id << " (" << n.endpoint()
+                         << ") is UP again\n" << flush;
+                }
+            } else {
+                ++n.consecutive_misses;
+                if (verbose) {
+                    cout << "[MetadataStore] node " << n.node_id << " (" << n.endpoint()
+                         << ") missed ping #" << n.consecutive_misses << "\n" << flush;
+                }
+                if (n.alive && n.consecutive_misses >= failure_threshold) {
+                    n.alive = false;
+                    cout << "[MetadataStore] node " << n.node_id << " (" << n.endpoint()
+                         << ") declared DOWN after " << n.consecutive_misses
+                         << " missed pings\n" << flush;
+                    cb_to_fire = failure_cb_;
+                    failed_node_id = n.node_id;
+                }
             }
         }
+        if (cb_to_fire) cb_to_fire(failed_node_id);
     }
 
     chain::ClusterState snapshot() const {
@@ -331,10 +344,31 @@ public:
         return cs;
     }
 
+    // Snapshot of nodes for reconfig orchestrator use.
+    vector<NodeEntry> get_nodes_copy() const {
+        lock_guard<mutex> lk(mtx_);
+        return nodes_;
+    }
+
+    chain::ReplicationMode mode() const { return mode_; }
+
+    // Atomically replace topology after reconfiguration. Resets liveness for new nodes.
+    void replace_nodes(vector<NodeEntry> new_nodes) {
+        lock_guard<mutex> lk(mtx_);
+        nodes_ = std::move(new_nodes);
+    }
+
+    // Install a callback to be invoked when a node transitions alive->down.
+    void set_failure_callback(std::function<void(int)> cb) {
+        lock_guard<mutex> lk(mtx_);
+        failure_cb_ = std::move(cb);
+    }
+
 private:
-    mutable mutex          mtx_;
-    chain::ReplicationMode mode_;
-    vector<NodeEntry>      nodes_;
+    mutable mutex            mtx_;
+    chain::ReplicationMode   mode_;
+    vector<NodeEntry>        nodes_;
+    std::function<void(int)> failure_cb_;
 };
 
 // ============================================================
@@ -362,12 +396,433 @@ void detector_loop(MetadataState* state, size_t idx, Options opt) {
 }
 
 // ============================================================
+// Reconfigure orchestrator
+// ============================================================
+//
+// Drives the freeze → inflight-check → (data fetch) → push-config sequence.
+// One reconfig active at a time. Metrics logged with [Reconfig N] prefix.
+
+struct ReconfigContext {
+    enum class Kind { Add, Failure };
+    Kind kind;
+    uint64_t id;
+
+    // Add case
+    std::string new_node_host;
+    int         new_node_port = 0;
+    int         new_node_id   = -1;
+
+    // Failure case
+    int         failed_node_id = -1;
+
+    // Phase timing
+    std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point phase_start;
+};
+
+class ReconfigOrchestrator {
+public:
+    ReconfigOrchestrator(MetadataState* state,
+                         const std::string& metadata_host,
+                         int metadata_port)
+        : state_(state),
+          metadata_host_(metadata_host),
+          metadata_port_(metadata_port) {}
+
+    // Returns false if a reconfig is already in progress.
+    bool start_add(const string& new_host, int new_port, int* assigned_id_out) {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (active_) return false;
+            active_ = true;
+        }
+
+        auto ctx = std::make_shared<ReconfigContext>();
+        ctx->kind = ReconfigContext::Kind::Add;
+        ctx->id = ++next_id_;
+        ctx->new_node_host = new_host;
+        ctx->new_node_port = new_port;
+
+        // Assign new node id = max existing id + 1 (always append at end)
+        auto nodes = state_->get_nodes_copy();
+        int max_id = -1;
+        for (const auto& n : nodes) max_id = std::max(max_id, n.node_id);
+        ctx->new_node_id = max_id + 1;
+        if (assigned_id_out) *assigned_id_out = ctx->new_node_id;
+
+        std::thread([this, ctx]() { run_reconfig(ctx); }).detach();
+        return true;
+    }
+
+    bool start_failure(int failed_node_id) {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (active_) return false;
+            active_ = true;
+        }
+
+        auto ctx = std::make_shared<ReconfigContext>();
+        ctx->kind = ReconfigContext::Kind::Failure;
+        ctx->id = ++next_id_;
+        ctx->failed_node_id = failed_node_id;
+
+        std::thread([this, ctx]() { run_reconfig(ctx); }).detach();
+        return true;
+    }
+
+    void on_inflight_ack(uint64_t reconfig_id, int node_id) {
+        std::lock_guard<std::mutex> lk(ack_mtx_);
+        if (reconfig_id != current_id_) return;
+        pending_acks_.erase(node_id);
+        ack_cv_.notify_all();
+    }
+
+    void on_data_ready(uint64_t reconfig_id) {
+        std::lock_guard<std::mutex> lk(ack_mtx_);
+        if (reconfig_id != current_id_) return;
+        data_ready_ = true;
+        ack_cv_.notify_all();
+    }
+
+private:
+    void run_reconfig(std::shared_ptr<ReconfigContext> ctx) {
+        const bool is_add = (ctx->kind == ReconfigContext::Kind::Add);
+        const char* kind_str = is_add ? "add" : "failure";
+        ctx->start_time = std::chrono::steady_clock::now();
+        const string mode_str = mode_name(state_->mode());
+
+        cout << "[Reconfig " << ctx->id << "] Started ("
+             << kind_str << " " << mode_str;
+        if (is_add) cout << " node " << ctx->new_node_id;
+        else cout << " failed_node=" << ctx->failed_node_id;
+        cout << ")\n" << flush;
+
+        // ----- Phase 1: Freeze -----
+        ctx->phase_start = std::chrono::steady_clock::now();
+        auto nodes = state_->get_nodes_copy();
+        vector<NodeEntry> survivors;
+        for (auto& n : nodes) {
+            if (!is_add && n.node_id == ctx->failed_node_id) continue;
+            survivors.push_back(n);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(ack_mtx_);
+            current_id_ = ctx->id;
+            pending_acks_.clear();
+            data_ready_ = false;
+        }
+
+        const int freeze_failures = freeze_all(survivors, ctx->id);
+        const auto freeze_ms = ms_since(ctx->phase_start);
+        cout << "[Reconfig " << ctx->id << "] Freeze sent to " << survivors.size()
+             << " nodes (" << freeze_ms << "ms";
+        if (freeze_failures > 0) cout << ", " << freeze_failures << " failed";
+        cout << ")\n" << flush;
+
+        // ----- Phase 2: Inflight check -----
+        ctx->phase_start = std::chrono::steady_clock::now();
+        const auto mode = state_->mode();
+        {
+            std::lock_guard<std::mutex> lk(ack_mtx_);
+            if (mode == chain::ReplicationMode::CROWN) {
+                for (const auto& n : survivors) pending_acks_.insert(n.node_id);
+            } else {
+                // CHAIN/CRAQ: only tail terminates the inflight token
+                for (const auto& n : survivors) {
+                    if (n.is_tail) pending_acks_.insert(n.node_id);
+                }
+            }
+        }
+
+        // Wait up to 30s for all InflightAcks
+        bool inflight_ok;
+        {
+            std::unique_lock<std::mutex> lk(ack_mtx_);
+            inflight_ok = ack_cv_.wait_for(lk, std::chrono::seconds(30), [this] {
+                return pending_acks_.empty();
+            });
+        }
+        const auto inflight_ms = ms_since(ctx->phase_start);
+
+        if (!inflight_ok) {
+            cerr << "[Reconfig " << ctx->id << "] Aborted (reason: inflight timeout after "
+                 << inflight_ms << "ms)\n" << flush;
+            // Best-effort unfreeze by re-pushing existing config
+            unfreeze_via_reconfigure(survivors, mode);
+            finish_reconfig();
+            return;
+        }
+        cout << "[Reconfig " << ctx->id << "] All InflightAcks received ("
+             << inflight_ms << "ms)\n" << flush;
+
+        // ----- Phase 3: Data fetch (Add only) -----
+        if (is_add) {
+            ctx->phase_start = std::chrono::steady_clock::now();
+            if (survivors.empty()) {
+                cerr << "[Reconfig " << ctx->id << "] Aborted: no source node available\n" << flush;
+                finish_reconfig();
+                return;
+            }
+            const NodeEntry& source = survivors[0];
+            if (!send_bootstrap(ctx->new_node_host, ctx->new_node_port,
+                                source.host, source.port,
+                                ctx->id, ctx->new_node_id)) {
+                cerr << "[Reconfig " << ctx->id << "] Aborted: BootstrapFromSource RPC failed\n" << flush;
+                unfreeze_via_reconfigure(survivors, mode);
+                finish_reconfig();
+                return;
+            }
+            // Wait for DataReady
+            bool data_ok;
+            {
+                std::unique_lock<std::mutex> lk(ack_mtx_);
+                data_ok = ack_cv_.wait_for(lk, std::chrono::seconds(60), [this] {
+                    return data_ready_;
+                });
+            }
+            const auto fetch_ms = ms_since(ctx->phase_start);
+            if (!data_ok) {
+                cerr << "[Reconfig " << ctx->id << "] Aborted: data-fetch timeout after "
+                     << fetch_ms << "ms\n" << flush;
+                unfreeze_via_reconfigure(survivors, mode);
+                finish_reconfig();
+                return;
+            }
+            cout << "[Reconfig " << ctx->id << "] Data fetch complete ("
+                 << fetch_ms << "ms)\n" << flush;
+        }
+
+        // ----- Phase 4: Build + push new config -----
+        ctx->phase_start = std::chrono::steady_clock::now();
+        vector<NodeEntry> new_topology = build_new_topology(survivors, ctx, mode, is_add);
+        const int cfg_failures = push_topology(new_topology, mode);
+        const auto cfg_ms = ms_since(ctx->phase_start);
+        cout << "[Reconfig " << ctx->id << "] New config pushed to " << new_topology.size()
+             << " nodes (" << cfg_ms << "ms";
+        if (cfg_failures > 0) cout << ", " << cfg_failures << " failed";
+        cout << ")\n" << flush;
+
+        // Commit the new topology atomically
+        state_->replace_nodes(new_topology);
+
+        const auto total_ms = ms_since(ctx->start_time);
+        cout << "[Reconfig " << ctx->id << "] Complete (total: " << total_ms << "ms)\n" << flush;
+        finish_reconfig();
+    }
+
+    void finish_reconfig() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        active_ = false;
+    }
+
+    // Send Freeze RPC to all nodes in parallel.
+    int freeze_all(const vector<NodeEntry>& nodes, uint64_t reconfig_id) {
+        std::atomic<int> failures{0};
+        vector<std::thread> threads;
+        for (const auto& n : nodes) {
+            threads.emplace_back([&, n]() {
+                const string ep = n.endpoint();
+                auto channel = grpc::CreateChannel(ep, grpc::InsecureChannelCredentials());
+                auto stub = chain::ChainNode::NewStub(channel);
+                chain::FreezeRequest req;
+                req.set_reconfig_id(reconfig_id);
+                req.mutable_metadata_addr()->set_host(metadata_host_);
+                req.mutable_metadata_addr()->set_port(metadata_port_);
+                google::protobuf::Empty resp;
+                grpc::ClientContext ctx;
+                ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                grpc::Status st = stub->Freeze(&ctx, req, &resp);
+                if (!st.ok()) {
+                    cerr << "[Reconfig " << reconfig_id << "] Freeze RPC failed for node "
+                         << n.node_id << ": " << st.error_message() << "\n";
+                    failures.fetch_add(1);
+                }
+            });
+        }
+        for (auto& t : threads) t.join();
+        return failures.load();
+    }
+
+    // Send BootstrapFromSource to the new node.
+    bool send_bootstrap(const string& new_host, int new_port,
+                        const string& source_host, int source_port,
+                        uint64_t reconfig_id, int new_node_id) {
+        const string target = new_host + ":" + std::to_string(new_port);
+        auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
+        auto stub = chain::ChainNode::NewStub(channel);
+        chain::BootstrapRequest req;
+        req.set_reconfig_id(reconfig_id);
+        req.mutable_source_addr()->set_host(source_host);
+        req.mutable_source_addr()->set_port(source_port);
+        req.set_new_node_id(new_node_id);
+        google::protobuf::Empty resp;
+        grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+        grpc::Status st = stub->BootstrapFromSource(&ctx, req, &resp);
+        if (!st.ok()) {
+            cerr << "[Reconfig " << reconfig_id << "] BootstrapFromSource failed: "
+                 << st.error_message() << "\n";
+            return false;
+        }
+        return true;
+    }
+
+    // Compute the new topology after add or failure.
+    vector<NodeEntry> build_new_topology(const vector<NodeEntry>& survivors,
+                                         std::shared_ptr<ReconfigContext> ctx,
+                                         chain::ReplicationMode mode,
+                                         bool is_add) {
+        vector<NodeEntry> out = survivors;
+
+        if (is_add) {
+            NodeEntry n;
+            n.node_id = ctx->new_node_id;
+            n.host    = ctx->new_node_host;
+            n.port    = ctx->new_node_port;
+            n.alive   = true;
+            out.push_back(n);
+        }
+
+        // Sort by node_id for deterministic ordering
+        std::sort(out.begin(), out.end(),
+                  [](const NodeEntry& a, const NodeEntry& b) { return a.node_id < b.node_id; });
+
+        const size_t N = out.size();
+        if (N == 0) return out;
+
+        if (mode == chain::ReplicationMode::CROWN) {
+            // Ring: each node has predecessor and successor; no fixed head/tail
+            for (size_t i = 0; i < N; ++i) {
+                size_t prev_i = (i + N - 1) % N;
+                size_t next_i = (i + 1) % N;
+                out[i].is_head = false;
+                out[i].is_tail = false;
+                out[i].has_pred = true;
+                out[i].pred_host = out[prev_i].host;
+                out[i].pred_port = out[prev_i].port;
+                out[i].has_succ = true;
+                out[i].succ_host = out[next_i].host;
+                out[i].succ_port = out[next_i].port;
+            }
+        } else {
+            // CHAIN/CRAQ: linear chain. First is head, last is tail.
+            for (size_t i = 0; i < N; ++i) {
+                out[i].is_head = (i == 0);
+                out[i].is_tail = (i == N - 1);
+                if (i == 0) {
+                    out[i].has_pred = false;
+                } else {
+                    out[i].has_pred = true;
+                    out[i].pred_host = out[i - 1].host;
+                    out[i].pred_port = out[i - 1].port;
+                }
+                if (i == N - 1) {
+                    out[i].has_succ = false;
+                } else {
+                    out[i].has_succ = true;
+                    out[i].succ_host = out[i + 1].host;
+                    out[i].succ_port = out[i + 1].port;
+                }
+            }
+        }
+        return out;
+    }
+
+    // Push Configure to all nodes in the new topology in parallel.
+    int push_topology(const vector<NodeEntry>& topology, chain::ReplicationMode mode) {
+        std::atomic<int> failures{0};
+        const int crown_count = (mode == chain::ReplicationMode::CROWN)
+                                  ? static_cast<int>(topology.size()) : 0;
+
+        // For CRAQ, find tail address
+        string craq_tail_addr;
+        if (mode == chain::ReplicationMode::CRAQ) {
+            for (const auto& n : topology) {
+                if (n.is_tail) {
+                    craq_tail_addr = n.endpoint();
+                    break;
+                }
+            }
+        }
+
+        vector<std::thread> threads;
+        for (const auto& n : topology) {
+            threads.emplace_back([&, n]() {
+                chain::NodeConfig cfg;
+                cfg.set_node_id(n.node_id);
+                cfg.set_mode(mode);
+                cfg.set_is_head(n.is_head);
+                cfg.set_is_tail(n.is_tail);
+                cfg.mutable_self_addr()->set_host(n.host);
+                cfg.mutable_self_addr()->set_port(n.port);
+                if (n.has_pred) {
+                    cfg.mutable_predecessor()->set_host(n.pred_host);
+                    cfg.mutable_predecessor()->set_port(n.pred_port);
+                }
+                if (n.has_succ) {
+                    cfg.mutable_successor()->set_host(n.succ_host);
+                    cfg.mutable_successor()->set_port(n.succ_port);
+                }
+                if (mode == chain::ReplicationMode::CROWN) {
+                    for (int i = 0; i < crown_count; ++i) (void)cfg.add_head_ranges();
+                }
+                if (mode == chain::ReplicationMode::CRAQ && !craq_tail_addr.empty()) {
+                    cfg.mutable_tail()->set_host(craq_tail_addr.substr(0, craq_tail_addr.rfind(':')));
+                    cfg.mutable_tail()->set_port(std::stoi(craq_tail_addr.substr(craq_tail_addr.rfind(':') + 1)));
+                }
+
+                auto channel = grpc::CreateChannel(n.endpoint(), grpc::InsecureChannelCredentials());
+                auto stub = chain::ChainNode::NewStub(channel);
+                google::protobuf::Empty resp;
+                grpc::ClientContext ctx;
+                ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                grpc::Status st = stub->Configure(&ctx, cfg, &resp);
+                if (!st.ok()) {
+                    cerr << "[Reconfig] Configure failed for node " << n.node_id
+                         << ": " << st.error_message() << "\n";
+                    failures.fetch_add(1);
+                }
+            });
+        }
+        for (auto& t : threads) t.join();
+        return failures.load();
+    }
+
+    // Used on abort paths: push the surviving topology to unfreeze
+    void unfreeze_via_reconfigure(const vector<NodeEntry>& nodes, chain::ReplicationMode mode) {
+        cerr << "[Reconfig] Attempting unfreeze by re-pushing existing config\n";
+        push_topology(nodes, mode);
+    }
+
+    static int64_t ms_since(std::chrono::steady_clock::time_point t) {
+        auto now = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<std::chrono::milliseconds>(now - t).count();
+    }
+
+    MetadataState* state_;
+    std::string    metadata_host_;
+    int            metadata_port_;
+    std::mutex     mtx_;
+    bool           active_ = false;
+    std::atomic<uint64_t> next_id_{0};
+
+    // Ack tracking (used by RPCs to signal phase completion)
+    std::mutex             ack_mtx_;
+    std::condition_variable ack_cv_;
+    uint64_t                current_id_ = 0;
+    std::set<int>           pending_acks_;
+    bool                    data_ready_ = false;
+};
+
+// ============================================================
 // MetadataStore gRPC service
 // ============================================================
 
 class MetadataStoreServiceImpl final : public chain::MetadataStore::Service {
 public:
-    explicit MetadataStoreServiceImpl(MetadataState& state) : state_(state) {}
+    MetadataStoreServiceImpl(MetadataState& state, ReconfigOrchestrator& orch)
+        : state_(state), orch_(orch) {}
 
     grpc::Status GetCluster(grpc::ServerContext*           /*ctx*/,
                             const google::protobuf::Empty* /*req*/,
@@ -376,8 +831,37 @@ public:
         return grpc::Status::OK;
     }
 
+    grpc::Status Join(grpc::ServerContext*       /*ctx*/,
+                      const chain::JoinRequest*  req,
+                      chain::JoinResponse*       resp) override {
+        int assigned = -1;
+        if (!orch_.start_add(req->addr().host(), req->addr().port(), &assigned)) {
+            resp->set_accepted(false);
+            resp->set_error("reconfig already in progress");
+            return grpc::Status::OK;
+        }
+        resp->set_accepted(true);
+        resp->set_assigned_node_id(assigned);
+        return grpc::Status::OK;
+    }
+
+    grpc::Status InflightAck(grpc::ServerContext*               /*ctx*/,
+                             const chain::InflightAckRequest*   req,
+                             google::protobuf::Empty*           /*resp*/) override {
+        orch_.on_inflight_ack(req->reconfig_id(), req->node_id());
+        return grpc::Status::OK;
+    }
+
+    grpc::Status DataReady(grpc::ServerContext*             /*ctx*/,
+                           const chain::DataReadyRequest*   req,
+                           google::protobuf::Empty*         /*resp*/) override {
+        orch_.on_data_ready(req->reconfig_id());
+        return grpc::Status::OK;
+    }
+
 private:
-    MetadataState& state_;
+    MetadataState&        state_;
+    ReconfigOrchestrator& orch_;
 };
 
 // ============================================================
@@ -516,8 +1000,21 @@ int main(int argc, char** argv) {
          << " timeout=" << opt.ping_timeout_ms << "ms"
          << " threshold=" << opt.failure_threshold << ")\n";
 
-    // --- Serve MetadataStore.GetCluster ---
-    MetadataStoreServiceImpl service(state);
+    // --- Build reconfigure orchestrator ---
+    // Use a routable host (not 0.0.0.0) for nodes to send InflightAck back.
+    const string meta_addr_for_nodes = (opt.bind_host == "0.0.0.0") ? "127.0.0.1" : opt.bind_host;
+    ReconfigOrchestrator orchestrator(&state, meta_addr_for_nodes, opt.bind_port);
+
+    // Wire automatic failure-triggered reconfig
+    state.set_failure_callback([&orchestrator](int failed_node_id) {
+        if (!orchestrator.start_failure(failed_node_id)) {
+            cerr << "[Reconfig] Failure for node " << failed_node_id
+                 << " detected, but reconfig already in progress\n";
+        }
+    });
+
+    // --- Serve MetadataStore.GetCluster + reconfig RPCs ---
+    MetadataStoreServiceImpl service(state, orchestrator);
     const string bind_addr = opt.bind_host + ":" + to_string(opt.bind_port);
     grpc::ServerBuilder builder;
     builder.AddListeningPort(bind_addr, grpc::InsecureServerCredentials());

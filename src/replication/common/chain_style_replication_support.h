@@ -88,6 +88,19 @@ public:
     void start_ack_workers();
     void stop_ack_workers();
 
+    // ============================================================
+    // Reconfigure protocol helpers
+    // ============================================================
+
+    // Dump committed (key, value, version) entries for bootstrap of a new node.
+    chain::DataDump dump_committed_state() const;
+
+    // Load entries into local state (used by new node after FetchData).
+    void load_from_dump(const chain::DataDump& dump);
+
+    // Send InflightCheck to successor with async retry. Used for ring/chain drain.
+    void send_inflight_check(uint64_t reconfig_id, int32_t origin_node_id);
+
 private:
     std::shared_ptr<chain::ChainNode::Stub> get_or_create_client_stub(const std::string& client_addr);
 

@@ -145,6 +145,60 @@ message ClusterState {
 }
 
 // ============================================================
+// Reconfigure protocol — add node + failure handling
+// ============================================================
+
+message FreezeRequest {
+    uint64      reconfig_id    = 1;
+    NodeAddress metadata_addr  = 2; // where the node should send InflightAck
+}
+
+message InflightCheckRequest {
+    uint64 reconfig_id    = 1;
+    int32  origin_node_id = 2; // CROWN: when origin == self, token has fully circled
+}
+
+message FetchDataRequest {
+    uint64 reconfig_id = 1;
+}
+
+message DataDumpEntry {
+    string key     = 1;
+    string value   = 2;
+    uint64 version = 3;
+}
+
+message DataDump {
+    repeated DataDumpEntry entries = 1;
+}
+
+message BootstrapRequest {
+    uint64      reconfig_id = 1;
+    NodeAddress source_addr = 2; // existing node to fetch data from
+    int32       new_node_id = 3; // assigned id for the joining node
+}
+
+message JoinRequest {
+    NodeAddress addr = 1;
+}
+
+message JoinResponse {
+    bool   accepted         = 1;
+    int32  assigned_node_id = 2;
+    string error            = 3;
+}
+
+message InflightAckRequest {
+    uint64 reconfig_id = 1;
+    int32  node_id     = 2;
+}
+
+message DataReadyRequest {
+    uint64 reconfig_id = 1;
+    int32  new_node_id = 2;
+}
+
+// ============================================================
 // Services
 // ============================================================
 
@@ -163,9 +217,20 @@ service ChainNode {
 
     // metadata_server -> Node liveness probe
     rpc Ping         (PingRequest)         returns (PingResponse);
+
+    // Reconfigure protocol — metadata_server -> Node, Node -> Node
+    rpc Freeze              (FreezeRequest)        returns (google.protobuf.Empty);
+    rpc InflightCheck       (InflightCheckRequest) returns (google.protobuf.Empty);
+    rpc FetchData           (FetchDataRequest)     returns (DataDump);
+    rpc BootstrapFromSource (BootstrapRequest)     returns (google.protobuf.Empty);
 }
 
 service MetadataStore {
     // Clients fetch the current topology + liveness from here.
     rpc GetCluster (google.protobuf.Empty) returns (ClusterState);
+
+    // Reconfigure protocol — Node -> metadata_server
+    rpc Join         (JoinRequest)        returns (JoinResponse);
+    rpc InflightAck  (InflightAckRequest) returns (google.protobuf.Empty);
+    rpc DataReady    (DataReadyRequest)   returns (google.protobuf.Empty);
 }

@@ -30,6 +30,8 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
+#include <condition_variable>
 #include <atomic>
 #include <random>
 #include <chrono>
@@ -671,7 +673,9 @@ struct NodeStub {
     int                                id = 0;
     string                             endpoint;
     shared_ptr<grpc::Channel>          channel;
-    unique_ptr<chain::ChainNode::Stub> stub;
+    // shared_ptr so callers can copy the handle out from under the topology
+    // lock and use it safely even if the topology is refreshed mid-RPC.
+    shared_ptr<chain::ChainNode::Stub> stub;
 };
 
 struct Topology {
@@ -980,15 +984,102 @@ static Topology build_topology(const chain::ClusterState& cs) {
 }
 
 // ============================================================
+// Topology refresh — single-flight + throttle to prevent storms
+// ============================================================
+//
+// When a Write/Read RPC fails with FAILED_PRECONDITION (frozen) or
+// UNAVAILABLE (dead node), the client refreshes its topology view.
+// Concurrent benchmark workers all see failures at once during reconfig;
+// without protection they would all hammer the metadata server.
+//
+//   Single-flight: only one thread does the actual GetCluster RPC.
+//   Other concurrent callers wait on a condition variable and reuse the
+//   refreshed topology.
+//
+//   Throttle: refreshes within kRefreshMinIntervalMs of the last refresh
+//   are coalesced — return immediately with the existing topology.
+//
+// The topology is mutated in-place under g_topo_mtx. RPC handlers must
+// copy out the stub shared_ptr under shared_lock(g_topo_mtx) before
+// releasing the lock — that way the stub stays valid even if the
+// topology is replaced mid-RPC.
+
+static std::shared_mutex             g_topo_mtx;
+static std::mutex                    g_refresh_state_mtx;
+static std::condition_variable       g_refresh_cv;
+static bool                          g_refresh_active = false;
+static std::chrono::steady_clock::time_point g_last_refresh
+        = std::chrono::steady_clock::time_point::min();
+static std::string                   g_metadata_addr_cached;
+
+static constexpr int kRefreshMinIntervalMs = 500;
+
+// Single-flight + throttled refresh. Returns true if topology was refreshed
+// (or was already fresh); false on hard fetch failure.
+static bool refresh_topology(Topology& topo) {
+    using namespace std::chrono;
+    std::unique_lock<std::mutex> rlk(g_refresh_state_mtx);
+
+    // Another thread is currently refreshing — wait for it and reuse the result.
+    if (g_refresh_active) {
+        g_refresh_cv.wait(rlk, []{ return !g_refresh_active; });
+        return true;
+    }
+
+    // Throttle: if a refresh completed recently, don't issue another one.
+    if (duration_cast<milliseconds>(steady_clock::now() - g_last_refresh).count()
+        < kRefreshMinIntervalMs) {
+        return true;
+    }
+
+    g_refresh_active = true;
+    rlk.unlock();
+
+    // Do the actual fetch outside any lock.
+    chain::ClusterState cluster;
+    string err;
+    bool ok = fetch_cluster_state(g_metadata_addr_cached, cluster, err);
+
+    if (ok) {
+        Topology new_topo = build_topology(cluster);
+        std::unique_lock<std::shared_mutex> tlk(g_topo_mtx);
+        topo = std::move(new_topo);
+        tlk.unlock();
+        cout << "[Client] Topology refreshed: " << cluster.nodes_size() << " nodes\n";
+    } else {
+        cerr << "[Client] Topology refresh failed: " << err << "\n";
+    }
+
+    rlk.lock();
+    g_last_refresh = steady_clock::now();
+    g_refresh_active = false;
+    rlk.unlock();
+    g_refresh_cv.notify_all();
+
+    return ok;
+}
+
+// Returns true if the status indicates the client should refresh topology
+// and retry (rather than fail immediately).
+static bool should_refresh_on_status(const grpc::Status& status) {
+    if (status.error_code() == grpc::StatusCode::UNAVAILABLE) return true;
+    if (status.error_code() == grpc::StatusCode::FAILED_PRECONDITION) {
+        // "node frozen" — reconfig in progress; refresh after retries
+        return status.error_message().find("frozen") != string::npos;
+    }
+    return false;
+}
+
+// ============================================================
 // Interactive commands
 // ============================================================
 
-// Non-blocking: adds to pending map, fires RPC, returns immediately.
-static bool do_write(Topology& topo, const string& key, const string& value,
-                     const string& client_addr, bool verbose = true) {
-    // Resolve the head node for this key.
-    // CHAIN / CRAQ: single static head.
-    // CROWN: head index = hash(key) % node_count.
+// Resolve the head stub for `key` under a shared lock. Returns a copied
+// shared_ptr<Stub> that stays valid even if the topology is replaced
+// after we release the lock.
+static shared_ptr<chain::ChainNode::Stub>
+resolve_head_stub(Topology& topo, const string& key, string* endpoint_out, bool verbose) {
+    std::shared_lock<std::shared_mutex> rlk(g_topo_mtx);
     NodeStub* target_head = nullptr;
     if (topo.mode == chain::ReplicationMode::CROWN) {
         target_head = topo.crown_head_for(key);
@@ -997,16 +1088,22 @@ static bool do_write(Topology& topo, const string& key, const string& value,
                 cerr << "[Write] No CROWN head found for key='" << key << "' "
                      << "(token=" << Topology::hash_key(key) << ")\n";
             }
-            return false;
+            return nullptr;
         }
     } else {
         target_head = topo.head;
         if (!target_head) {
             if (verbose) cerr << "[Write] No head node in topology.\n";
-            return false;
+            return nullptr;
         }
     }
+    if (endpoint_out) *endpoint_out = target_head->endpoint;
+    return target_head->stub;
+}
 
+// Non-blocking: adds to pending map, fires RPC, returns immediately.
+static bool do_write(Topology& topo, const string& key, const string& value,
+                     const string& client_addr, bool verbose = true) {
     uint64_t request_id = add_pending(key, value);
     benchmark_note_write_issued(request_id);
 
@@ -1017,10 +1114,39 @@ static bool do_write(Topology& topo, const string& key, const string& value,
     req.set_client_addr(client_addr);
     req.set_request_id(request_id);
 
-    // Fire and forget — ack comes asynchronously from the tail.
+    // Retry loop: re-resolve head each attempt (in case topology refreshed).
+    // Refresh on FAILED_PRECONDITION (frozen) or UNAVAILABLE (dead head).
     chain::WriteResponse resp;
-    grpc::ClientContext  ctx;
-    grpc::Status status = target_head->stub->Write(&ctx, req, &resp);
+    grpc::Status status;
+    string target_endpoint;
+    {
+        static constexpr int kMaxAttempts = 8;
+        static constexpr int kBackoffMs[] = {200, 500, 1000, 2000, 3000, 5000, 5000};
+
+        for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+            auto stub_copy = resolve_head_stub(topo, key, &target_endpoint, verbose && attempt == 0);
+            if (!stub_copy) {
+                status = grpc::Status(grpc::StatusCode::UNAVAILABLE, "no head in topology");
+                break;
+            }
+
+            grpc::ClientContext ctx;
+            status = stub_copy->Write(&ctx, req, &resp);
+            if (status.ok()) break;
+
+            const bool need_refresh = should_refresh_on_status(status);
+            if (!need_refresh || attempt == kMaxAttempts - 1) break;
+
+            if (verbose) {
+                cerr << "[Write] " << status.error_message()
+                     << " (attempt " << (attempt + 1) << "/" << kMaxAttempts
+                     << ") — refreshing topology and retrying\n";
+            }
+            // Single-flight refresh: concurrent callers coalesce into one fetch.
+            refresh_topology(topo);
+            std::this_thread::sleep_for(std::chrono::milliseconds(kBackoffMs[attempt]));
+        }
+    }
 
     if (!status.ok() || !resp.success()) {
         benchmark_note_write_rpc_failure();
@@ -1037,22 +1163,50 @@ static bool do_write(Topology& topo, const string& key, const string& value,
 
     if (verbose) {
         cout << "[Write] Sent request_id=" << request_id
-             << " key='" << key << "' to head (" << target_head->endpoint << ")\n";
+             << " key='" << key << "' to head (" << target_endpoint << ")\n";
     }
     return true;
 }
 
 static bool do_read(Topology& topo, const string& key, int node_id = -1, bool verbose = true) {
-    NodeStub* target = resolve_read_target(topo, key, node_id, verbose);
-    if (!target) return false;
-
     chain::ReadRequest  req;
     chain::ReadResponse resp;
-    grpc::ClientContext ctx;
     req.set_key(key);
 
     benchmark_note_read_sent();
-    grpc::Status status = target->stub->Read(&ctx, req, &resp);
+
+    // Resolve target + stub under topology lock, then call RPC with the copy.
+    // Refresh + retry on UNAVAILABLE (e.g., dead tail after reconfig).
+    grpc::Status status;
+    static constexpr int kMaxAttempts = 4;
+    static constexpr int kBackoffMs[] = {200, 500, 1500};
+
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        shared_ptr<chain::ChainNode::Stub> stub_copy;
+        {
+            std::shared_lock<std::shared_mutex> rlk(g_topo_mtx);
+            NodeStub* target = resolve_read_target(topo, key, node_id, verbose && attempt == 0);
+            if (!target) {
+                benchmark_note_read_failure();
+                return false;
+            }
+            stub_copy = target->stub;
+        }
+
+        grpc::ClientContext ctx;
+        status = stub_copy->Read(&ctx, req, &resp);
+        if (status.ok()) break;
+
+        if (!should_refresh_on_status(status) || attempt == kMaxAttempts - 1) break;
+        if (verbose) {
+            cerr << "[Read] " << status.error_message()
+                 << " (attempt " << (attempt + 1) << "/" << kMaxAttempts
+                 << ") — refreshing topology and retrying\n";
+        }
+        refresh_topology(topo);
+        std::this_thread::sleep_for(std::chrono::milliseconds(kBackoffMs[attempt]));
+    }
+
     if (!status.ok()) {
         benchmark_note_read_failure();
         if (verbose) cerr << "[Read] Failed: " << status.error_message() << "\n";
@@ -1066,8 +1220,7 @@ static bool do_read(Topology& topo, const string& key, int node_id = -1, bool ve
         else
             cout << "[Read] key='" << resp.key()
                  << "' value='" << resp.value()
-                 << "' version=" << resp.version()
-                 << " (via " << target->endpoint << ")\n";
+                 << "' version=" << resp.version() << ")\n";
     }
     return true;
 }
@@ -1407,6 +1560,8 @@ int main(int argc, char** argv) {
         ack_thread.join();
         return 1;
     }
+    // Cache for refresh_topology() — it uses the same metadata address.
+    g_metadata_addr_cached = metadata_addr;
     const chain::ReplicationMode mode = cluster.mode();
     cout << "[Client] Topology from " << metadata_addr
          << ": mode=" << mode_name(mode) << " nodes=" << cluster.nodes_size() << "\n\n";
