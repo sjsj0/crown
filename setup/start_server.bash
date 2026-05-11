@@ -15,6 +15,19 @@ REPO_NAME="${REPO_NAME:-$(basename "${REPO_URL%.git}")}"
 PROJECT_SUBDIR="${PROJECT_SUBDIR:-.}"
 PROJECT_MODE="${PROJECT_MODE:-crown}"  # 'crown' for main src, 'craq' for standalone
 
+# Run mode (default does all three):
+#   BUILD_ONLY=true  -> clone/pull + build, then exit (do NOT start a server)
+#   START_ONLY=true  -> skip clone/pull + build, just (re)start the existing binary
+BUILD_ONLY_RAW="${BUILD_ONLY:-false}"
+START_ONLY_RAW="${START_ONLY:-false}"
+case "${BUILD_ONLY_RAW,,}" in 1|true|yes|y|on) BUILD_ONLY=true ;; *) BUILD_ONLY=false ;; esac
+case "${START_ONLY_RAW,,}" in 1|true|yes|y|on) START_ONLY=true ;; *) START_ONLY=false ;; esac
+if [[ "$BUILD_ONLY" == true && "$START_ONLY" == true ]]; then
+  echo "ERROR: BUILD_ONLY and START_ONLY are mutually exclusive."
+  exit 1
+fi
+
+if [[ "$START_ONLY" != true ]]; then
 if [[ ! -d "$REMOTE_BASE_DIR" ]]; then
   if mkdir -p "$REMOTE_BASE_DIR" 2>/dev/null; then
     :
@@ -79,6 +92,7 @@ if [[ -e "$REPO_DIR" ]]; then
     echo "Warning: unable to set shared permissions on $REPO_DIR (need sudo)."
   fi
 fi
+fi  # end: if [[ "$START_ONLY" != true ]] (clone/refresh repo)
 
 # ---------------------------
 # 2) Resolve project path based on mode
@@ -112,7 +126,12 @@ cd "$PROJECT_DIR"
 # ---------------------------
 # 2.5) Preflight tool checks
 # ---------------------------
-for tool in git cmake g++ tmux; do
+if [[ "$START_ONLY" == true ]]; then
+  preflight_tools=(tmux)
+else
+  preflight_tools=(git cmake g++ tmux)
+fi
+for tool in "${preflight_tools[@]}"; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "ERROR: $tool is not installed on this VM. Run: ./vm_setup.bash setup"
     exit 1
@@ -122,6 +141,7 @@ done
 # ---------------------------
 # 3) Configure + build
 # ---------------------------
+if [[ "$START_ONLY" != true ]]; then
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 
 # Shared deployments can leave build/_deps owned by a different user.
@@ -156,6 +176,12 @@ echo "Building with $CPU_COUNT parallel jobs..."
 cmake --build build -j "$CPU_COUNT"
 
 echo "Build completed."
+fi  # end: if [[ "$START_ONLY" != true ]] (configure + build)
+
+if [[ "$BUILD_ONLY" == true ]]; then
+  echo "BUILD_ONLY: clone + build complete; not starting a server on this host."
+  exit 0
+fi
 
 NODE_BIN=""
 if [[ -x "build/server" ]]; then
@@ -165,8 +191,8 @@ elif [[ -x "build/Debug/server" ]]; then
 fi
 
 if [[ -z "$NODE_BIN" ]]; then
-  echo "ERROR: server binary not found after build."
-  echo "       Looked for build/server (and build/Debug/server)."
+  echo "ERROR: server binary not found (looked for build/server, build/Debug/server)."
+  echo "       Build it first: ./vm_setup.bash build"
   exit 1
 fi
 

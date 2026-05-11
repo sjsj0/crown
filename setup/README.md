@@ -19,30 +19,33 @@ line, trailing comma allowed, `#` comments ignored):
   in `.env`) also runs the metadata store.
 - `client_hosts.csv` — VMs that run **only** the `client` binary (benchmark drivers).
 
-The repo is cloned + built on the **union** of both files; server/metadata
-processes start only on the relevant subset.
+The repo is cloned + built (by `build`) on `prod_hosts.csv ∪ client_hosts.csv ∪
+$METADATA_HOST`; `build` does not start anything. Server/metadata processes are
+started only by `start` — node servers on `prod_hosts.csv`, the metadata server
+on `$METADATA_HOST`.
 
 **Usage:**
 ```bash
-./vm_setup.bash setup                 # install deps on prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST
-./vm_setup.bash build                 # clone/build the repo (+ start a node server) on prod_hosts.csv ∪ client_hosts.csv
-./vm_setup.bash start                 # start a server node on each prod_hosts.csv VM, THEN the metadata_server on $METADATA_HOST
-./vm_setup.bash start-servers         # start a server node on each prod_hosts.csv VM only (skip the metadata_server)
-./vm_setup.bash start-metadata        # start the metadata_server on $METADATA_HOST only
-./vm_setup.bash rerun                 # pull + rebuild + restart node servers on prod_hosts.csv ∪ client_hosts.csv
-./vm_setup.bash rerun --skip-build    # ...same, but skip the cmake build (pull + restart only)
-./vm_setup.bash kill                  # stop servers + metadata on prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST
+./vm_setup.bash setup            # install build deps on prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST
+./vm_setup.bash build            # clone + build the repo on prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST (no processes started)
+./vm_setup.bash start            # (re)start a server node on each prod_hosts.csv VM, THEN the metadata_server on $METADATA_HOST
+./vm_setup.bash start-servers    # (re)start a server node on each prod_hosts.csv VM only (skip the metadata_server)
+./vm_setup.bash start-metadata   # (re)start the metadata_server on $METADATA_HOST only
+./vm_setup.bash rerun            # kill, then start again (node servers on prod_hosts.csv + metadata_server on $METADATA_HOST)
+./vm_setup.bash kill             # stop servers + metadata on prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST
 ```
 
-Typical bring-up order: `setup` → `build` → `start`. `start` launches a server
-node on every `prod_hosts.csv` VM and then brings up the `metadata_server` on
-`$METADATA_HOST` (it pushes Configure to every node, then runs the ping-ack
-detector) — no separate `start-metadata` step needed. If `METADATA_HOST` is
-unset, `start` warns and skips the metadata step. Clients then point at
-`$METADATA_HOST:$METADATA_PORT`. Use `start-servers` when you want the node
-servers without (re)starting the metadata server, and `start-metadata` to
-(re)start just the metadata server — e.g. to switch modes with a different
-`METADATA_CONFIG`.
+Typical bring-up order: `setup` → `build` → `start`. `build` clones + builds the
+repo on every VM (incl. `$METADATA_HOST`) and starts nothing. `start` then (re)starts
+a server node on every `prod_hosts.csv` VM from the already-built `build/server`
+binary and brings up the `metadata_server` on `$METADATA_HOST` (it pushes Configure
+to every node, then runs the ping-ack detector) — no separate `start-metadata`
+step needed; if `METADATA_HOST` is unset it warns and skips that step. Clients then
+point at `$METADATA_HOST:$METADATA_PORT`. Use `start-servers` for the node servers
+without (re)starting the metadata server, `start-metadata` to (re)start just the
+metadata server (e.g. to switch modes with a different `METADATA_CONFIG`), and
+`rerun` to kill everything and bring the servers + metadata back up. `start` /
+`rerun` / `start-metadata` do **not** build — run `build` first.
 
 ### 2. `setup.bash` (Dependency Installation)
 One-time setup of system dependencies on each VM.
@@ -157,8 +160,8 @@ Because the metadata server defines the replication mode, run one mode at a time
 
 **Usage:**
 ```bash
-# 1) bring up the cluster + metadata server (one command: servers, then metadata)
-./setup/vm_setup.bash start
+# 1) bring up the cluster + metadata server (after `setup` + `build`):
+./setup/vm_setup.bash start          # node servers on prod hosts, then metadata_server on $METADATA_HOST
 #    (to switch modes later, restart just the metadata server with a different config:
 #     METADATA_CONFIG=build/prod_configs/config.craq.json ./setup/vm_setup.bash start-metadata)
 

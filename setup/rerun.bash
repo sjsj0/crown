@@ -1,23 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# rerun: pull latest $REPO_BRANCH, rebuild, then restart the server node in tmux.
-# Pass --skip-build to skip the cmake build (still pulls + restarts) -- useful
-# when the binary is already current and you just want a fast restart.
-
-usage() {
-  echo "Usage: $(basename "${BASH_SOURCE[0]}")  [--skip-build]"
-  echo "  Pull latest \$REPO_BRANCH, rebuild (skipped with --skip-build), then restart the server node."
-}
-
-SKIP_BUILD=false
-for arg in "$@"; do
-  case "$arg" in
-    --skip-build) SKIP_BUILD=true ;;
-    -h|--help) usage; exit 0 ;;
-    *) echo "ERROR: unknown argument: $arg" >&2; usage >&2; exit 2 ;;
-  esac
-done
+# rerun: kill the existing server node on this VM and start it again (using the
+# binary that's already built). Does NOT pull or rebuild -- run
+# `./vm_setup.bash build` first if you want fresh code.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/.env" ]]; then
@@ -27,33 +13,11 @@ fi
 
 DEPLOY_USER="${SSH_USER:-$(whoami)}"
 REPO_URL="${REPO_URL:-}"
-REPO_BRANCH="${REPO_BRANCH:-main}"
 REMOTE_BASE_DIR="${REMOTE_BASE_DIR:-/home}"
 REPO_NAME="${REPO_NAME:-$(basename "${REPO_URL%.git}")}"
 PROJECT_SUBDIR="${PROJECT_SUBDIR:-.}"
-BUILD_TYPE="${BUILD_TYPE:-Release}"
-
-REPO_DIR="$REMOTE_BASE_DIR/$REPO_NAME"
-
-# ---------------------------
-# 1) Pull latest
-# ---------------------------
-if [[ -d "$REPO_DIR/.git" ]]; then
-  echo "Pulling latest branch '$REPO_BRANCH' in $REPO_DIR"
-  # Shared $REPO_DIR is often owned by whichever user first cloned it; mark it
-  # trusted so git doesn't abort with "dubious ownership".
-  git config --global --add safe.directory "$REPO_DIR" >/dev/null 2>&1 || true
-  git -C "$REPO_DIR" fetch --all --prune
-  git -C "$REPO_DIR" checkout -f "$REPO_BRANCH"
-  git -C "$REPO_DIR" pull --ff-only origin "$REPO_BRANCH"
-else
-  echo "Warning: $REPO_DIR/.git not found; skipping git pull (run './vm_setup.bash build' first)."
-fi
-
-# ---------------------------
-# 2) Locate project directory
-# ---------------------------
 PROJECT_DIR="$REMOTE_BASE_DIR/$REPO_NAME/$PROJECT_SUBDIR"
+
 PROJECT_DIR_CANDIDATES=(
   "$PROJECT_DIR"
   "$REMOTE_BASE_DIR/$REPO_NAME"
@@ -81,46 +45,9 @@ if [[ -z "$FOUND_PROJECT_DIR" ]]; then
 fi
 
 PROJECT_DIR="$FOUND_PROJECT_DIR"
+
 cd "$PROJECT_DIR"
 
-# ---------------------------
-# 3) Build (unless --skip-build)
-# ---------------------------
-if [[ "$SKIP_BUILD" == "true" ]]; then
-  echo "--skip-build: not rebuilding; restarting the existing binary."
-else
-  for tool in cmake g++; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-      echo "ERROR: $tool is not installed on this VM. Run: ./vm_setup.bash setup"
-      exit 1
-    fi
-  done
-
-  # Shared deployments can leave build/_deps owned by a different user;
-  # normalize perms and clear stale FetchContent cache before configuring.
-  if [[ -d "build" ]]; then
-    chmod -R u+rwX,go+rwX build 2>/dev/null || true
-    if [[ -d "build/_deps" || -f "build/CMakeCache.txt" || -d "build/CMakeFiles" ]]; then
-      echo "Clearing stale CMake/FetchContent state..."
-      rm -rf build/_deps build/CMakeCache.txt build/CMakeFiles 2>/dev/null || true
-    fi
-  fi
-
-  echo "Configuring with CMake (type=$BUILD_TYPE)..."
-  cmake -S . -B build -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
-
-  CPU_COUNT=2
-  if command -v nproc >/dev/null 2>&1; then
-    CPU_COUNT="$(nproc)"
-  fi
-  echo "Building with $CPU_COUNT parallel jobs..."
-  cmake --build build -j "$CPU_COUNT"
-  echo "Build completed."
-fi
-
-# ---------------------------
-# 4) Locate server binary
-# ---------------------------
 NODE_BIN=""
 for candidate in \
   "build/server" \
@@ -136,11 +63,7 @@ do
 done
 
 if [[ -z "$NODE_BIN" ]]; then
-  if [[ "$SKIP_BUILD" == "true" ]]; then
-    echo "ERROR: server binary not found (--skip-build was set; re-run without it to build first)."
-  else
-    echo "ERROR: server binary not found after build."
-  fi
+  echo "ERROR: server binary not found. Build it first: ./vm_setup.bash build"
   echo "Project dir: $PROJECT_DIR"
   echo "Looked for:"
   echo "  - build/server"
@@ -155,9 +78,6 @@ if [[ -z "$NODE_BIN" ]]; then
   exit 1
 fi
 
-# ---------------------------
-# 5) Restart server in tmux
-# ---------------------------
 NODE_HOST="${NODE_HOST:-0.0.0.0}"
 NODE_PORT="${NODE_PORT:-5001}"
 SERVER_LOG_RAW="${SERVER_LOG:-true}"

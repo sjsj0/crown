@@ -87,18 +87,21 @@ cd "/mnt/d/UIUC/Spring '26/CS 525 - Advanced Distributed System/crown"
 python3 setup/generate_mode_configs.py 3 --base-port 50051 --env prod --output-dir build/prod_configs --prefix config
 
 ./setup/vm_setup.bash setup    # one-time per VM: install build deps
-./setup/vm_setup.bash build    # clone/pull + build the repo on every VM
-# start the server nodes AND the metadata_server in one shot:
+./setup/vm_setup.bash build    # clone + build the repo on prod ∪ client ∪ metadata VMs (no processes started)
+# (re)start the server nodes AND the metadata_server, all from the already-built binaries:
 METADATA_CONFIG=build/prod_configs/config.crown.json ./setup/vm_setup.bash start
 ```
 
-`start` SSHes into each host in `setup/prod_hosts.csv`, launches `./build/server --port $NODE_PORT` (default 50051) there in tmux session `crown_node_<port>` (log `run/shared/server_<port>.log`), and **then** brings up `./build/metadata_server` on `$METADATA_HOST` (tmux session `crown_metadata_<port>`, log `run/shared/metadata_<port>.log`) using `$METADATA_CONFIG`. The metadata host's script clones+builds the repo itself, so it doesn't need a prior `build` there. If `METADATA_HOST` is unset in `.env`, `start` warns and skips the metadata step.
+Action scopes:
+- **`setup`** → install build deps on `prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST`.
+- **`build`** (and `deploy`) → `git clone`/`pull` + `cmake build` on `prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST`. **Nothing is started** — it just produces `build/server`, `build/metadata_server`, `build/client` on every VM.
+- **`start`** → (re)start `./build/server --port $NODE_PORT` (default 50051, tmux `crown`, log `run/shared/server_<port>.log`) on each `prod_hosts.csv` VM — *no build* — then (re)start `./build/metadata_server` on `$METADATA_HOST` (tmux `crown_metadata_<port>`, log `run/shared/metadata_<port>.log`) with `$METADATA_CONFIG`. Client-only VMs are not touched. If `METADATA_HOST` is unset, `start` warns and skips the metadata step. (Each (re)start kills the previous instance first.)
 
 Variants:
-- `./setup/vm_setup.bash start-servers` — node servers only, skip the metadata server.
+- `./setup/vm_setup.bash start-servers` — node servers only (prod hosts), skip the metadata server.
 - `METADATA_CONFIG=build/prod_configs/config.craq.json ./setup/vm_setup.bash start-metadata` — (re)start just the metadata server, e.g. to switch modes.
-- `./setup/vm_setup.bash rerun` — `git pull` + rebuild + restart the node servers on all prod/client VMs (after code changes). Add `--skip-build` to skip the cmake build (pull + restart only — fast restart when the binary is already current).
-- `./setup/vm_setup.bash kill` — stop all servers + metadata.
+- `./setup/vm_setup.bash rerun` — kill everything (prod ∪ client ∪ metadata), then `start` again (node servers on prod + metadata on `$METADATA_HOST`). No build — run `build` first if you want fresh code.
+- `./setup/vm_setup.bash kill` — stop all servers + metadata on `prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST`.
 
 Check / attach on a VM:
 
@@ -109,21 +112,21 @@ tmux -S /tmp/crown-shared/tmux.sock attach -t crown_node_50051
 ```
 
 ⚠️ Pre-flight for `setup/.env`:
-- `METADATA_HOST` must be a host you can SSH into and that `vm_setup.bash setup` has run on (for build deps). It does **not** need to be in `prod_hosts.csv`/`client_hosts.csv` — `start-metadata` clones+builds the repo there on its own — but if it isn't, run `setup` on it first. Current `.env` has `METADATA_HOST=sp26-cs525-1220...`, which is in neither CSV; either add it to a CSV (so `setup`/`build`/`kill` cover it) or just make sure you've run `setup` against it.
+- `setup` / `build` / `kill` now also cover `$METADATA_HOST` even if it's not in `prod_hosts.csv` / `client_hosts.csv` — so it gets build deps + the repo + teardown like everything else. It still needs to be SSH-reachable. Current `.env` has `METADATA_HOST=sp26-cs525-1220...`.
+- `start` / `start-metadata` do **not** build — run `build` first (it includes the metadata host).
 - `METADATA_CONFIG` must point at a config that exists on the metadata VM. Default `config.json` is the one committed at the repo root; for a specific mode, generate `build/prod_configs/config.*.json` (above) and pass `METADATA_CONFIG=...` inline as shown.
 
 ### 4b) Full script reference
 
 ```bash
-./setup/vm_setup.bash setup            # install deps on prod_hosts ∪ client_hosts
-./setup/vm_setup.bash build            # clone/pull + build on prod_hosts ∪ client_hosts
-./setup/vm_setup.bash start            # server node on each prod_hosts VM, THEN metadata_server on $METADATA_HOST
-./setup/vm_setup.bash start-servers    # server nodes only (skip the metadata_server)
+./setup/vm_setup.bash setup            # install deps on prod ∪ client ∪ $METADATA_HOST
+./setup/vm_setup.bash build            # clone + build on prod ∪ client ∪ $METADATA_HOST (no processes started)
+./setup/vm_setup.bash start            # (re)start node servers on prod, THEN metadata_server on $METADATA_HOST (no build)
+./setup/vm_setup.bash start-servers    # (re)start node servers on prod only (skip the metadata_server)
 # (re)start just the metadata server; METADATA_CONFIG picks the mode (must exist on that VM)
 METADATA_CONFIG=build/prod_configs/config.crown.json ./setup/vm_setup.bash start-metadata
-./setup/vm_setup.bash rerun            # git pull + rebuild + restart node servers (prod ∪ client)
-./setup/vm_setup.bash rerun --skip-build  # ...same, but skip the cmake build (pull + restart only)
-./setup/vm_setup.bash kill             # stop servers + metadata on prod_hosts ∪ client_hosts ∪ $METADATA_HOST
+./setup/vm_setup.bash rerun            # kill (prod ∪ client ∪ metadata), then start again (prod servers + metadata)
+./setup/vm_setup.bash kill             # stop servers + metadata on prod ∪ client ∪ $METADATA_HOST
 ```
 
 Manual equivalents (5 nodes 1201..1205, shared port 50051):
