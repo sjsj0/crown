@@ -5,7 +5,7 @@ A C++ implementation of three chain replication variants:
 - **CRAQ** (Chain Replication with Apportioned Queries) — reads from any node with version consistency
 - **CROWN** — circular topology where key ownership is computed by `hash(key) % node_count`
 
-Inter-node communication uses gRPC and Protocol Buffers. Topology config is pushed to nodes at runtime by a client — nodes themselves are config-agnostic at startup.
+Inter-node communication uses gRPC and Protocol Buffers. Nodes start config-agnostic; a standalone **`metadata_server`** is the single source of truth for cluster topology. It reads `config.json`, validates it, pushes each node its `NodeConfig` via the `Configure` RPC, runs a **ping-ack failure detector** (it pings every node on an interval; after N missed acks a node is logged as DOWN), and serves `MetadataStore.GetCluster`. The `client` binary fetches its routing tables from `MetadataStore.GetCluster` — it never reads config files.
 
 For CHAIN and CROWN in this version, `WriteResponse` means the head accepted the write (assigned a version), not that the write is already committed. Commit happens later when the tail commits and sends `Ack` directly to the client.
 
@@ -49,8 +49,8 @@ cmake --build build
 
 This will:
 1. Run `protoc` to generate `chain.pb.h/cc` and `chain.grpc.pb.h/cc` from `proto/chain.proto`
-2. Compile `server.cpp`, `client.cpp`, and `kv_client.cpp`
-3. Output binaries at `build/server`, `build/client`, and `build/kv_client`
+2. Compile `server.cpp`, `metadata_server.cpp`, and `client.cpp`
+3. Output binaries at `build/server`, `build/metadata_server`, and `build/client`
 
 To symlink `compile_commands.json` for clangd/IDE support:
 ```bash
@@ -63,7 +63,7 @@ ln -s build/compile_commands.json compile_commands.json
 
 ### 1. Start node servers
 
-Each node is a server process that starts config-agnostic and waits for the client to push its topology. Start one process per node, each on a different port:
+Each node is a server process that starts config-agnostic and waits for the metadata server to push its topology. Start one process per node, each on a different port:
 
 ```bash
 ./build/server --port 50051 &
@@ -71,17 +71,15 @@ Each node is a server process that starts config-agnostic and waits for the clie
 ./build/server --port 50053 &
 ```
 
-### 2. Push topology config
+### 2. Start the metadata server
 
-Write a `config.json` describing the chain (see format below), then run the client to configure all nodes:
+Write a `config.json` describing the chain (see format below), then start the metadata server. It validates the config, pushes each node its `NodeConfig` via the `Configure` RPC, then keeps running: it pings every node (`--ping-interval-ms`, default 1000) and logs a node DOWN after `--failure-threshold` (default 3) missed acks, and serves `MetadataStore.GetCluster`.
 
 ```bash
-./build/client config.json
+./build/metadata_server --config config.json --host 0.0.0.0 --port 50050 --log
 ```
 
-The client loops through every node in the config file and sends each one its `NodeConfig` via the `Configure` RPC.
-
-`src/client/client.cpp` is intentionally limited to topology/config push and was not changed for replication write/commit behavior.
+Useful flags: `--ping-interval-ms`, `--ping-timeout-ms`, `--failure-threshold`. The metadata server is the only component that reads `config.json`.
 
 ### Generate mode configs automatically
 
@@ -123,29 +121,38 @@ You can optionally pass `--host <value>` to override and use one host for all ge
 
 A checked-in 3-node sample is provided at `config.crown.sample.json`.
 
-### 3. Run key/value workload client
+### 3. Run the workload client
 
-`kv_client` uses the same `config.json` for routing and then sends actual `Write` / `Read` RPCs.
-
-Write:
+The `client` binary takes the metadata server's `host:port` as its first argument; it calls `MetadataStore.GetCluster` to learn the topology, then drops into an interactive `read`/`write` REPL (or runs a benchmark):
 
 ```bash
-./build/kv_client write config.json user:1 hello
+./build/client localhost:50050
+# then type:
+#   write user:1 hello
+#   read  user:1
+#   quit
 ```
 
-Read:
+Pipe commands on stdin for one-shot use:
 
 ```bash
-./build/kv_client read config.json user:1
+printf 'write user:1 hello\nread user:1\n' | ./build/client localhost:50050
 ```
 
-Routing rules used by `kv_client`:
+Benchmark mode:
+
+```bash
+./build/client localhost:50050 61000 bench-write 5000 64 0 1
+./build/client localhost:50050 61000 bench-read  5000 64 0 1
+```
+
+(The optional second positional is the ack-listener port; default `60000`.)
+
+Routing the client applies (using the topology from the metadata server):
 
 - CHAIN: writes -> global head, reads -> global tail.
 - CROWN: `head_index = hash(key) % N`; writes -> node with `id=head_index`; reads -> predecessor of that head.
 - CRAQ: currently writes -> head, reads -> tail (temporary baseline).
-
-The client prints the contacted node endpoint and returned version.
 
 For `write`, `WriteResponse.version` is the head-assigned version number for the accepted write. It is not by itself proof of commit.
 
@@ -159,14 +166,13 @@ bash setup/crown_smoke_test.sh
 
 What it checks:
 
-- launches 3 local servers and pushes a generated CROWN config
-- writes keys mapped to different heads and reads from corresponding tails
+- launches 3 local servers and a `metadata_server` that pushes a generated CROWN config
+- writes keys mapped to different heads and reads from corresponding tails (via the `client` REPL)
 - same key always routes to the same head/tail
 - different keys distribute across different heads/tails
-- wrong-node write/read requests fail with clear errors
 - ring wrap-around path works
 - concurrent writes to the same key produce strictly increasing contiguous versions
-- cleans up server processes on exit
+- cleans up server + metadata processes on exit
 
 ### CHAIN/CROWN write and commit semantics in this repo
 
@@ -278,9 +284,11 @@ crown/
 │   ├── node/
 │   │   └── node.cpp                        # Node identity and topology (no store)
 │   ├── server/
-│   │   └── server.cpp                      # Entry point, gRPC service, RPC handlers
+│   │   └── server.cpp                      # Node entry point: gRPC service, RPC handlers (incl. Ping)
+│   ├── metadata/
+│   │   └── metadata_server.cpp             # Reads config.json, configures nodes, ping-ack detector, GetCluster
 │   ├── client/
-│   │   └── client.cpp                      # Reads config.json, configures all nodes
+│   │   └── client.cpp                      # Benchmark / interactive client; topology from MetadataStore.GetCluster
 │   └── replication/
 │       ├── replication_strategy.h          # Abstract interface for all strategies
 │       ├── replication_strategy.cpp

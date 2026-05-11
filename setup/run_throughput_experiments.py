@@ -38,13 +38,12 @@ class RunnerConfig:
     ssh_opts: List[str]
     remote_repo_dir: str
     remote_client_bin: str
-    remote_config_template: str
+    metadata_addr: str
     remote_log_dir: str
 
     key_prefix_base: str
     value_prefix_base: str
     ack_base_port: int
-    reconfigure_each_run: bool
 
     dry_run: bool
     fail_fast: bool
@@ -182,9 +181,11 @@ def parse_args(root_dir: Path) -> argparse.Namespace:
     p.add_argument("--remote-repo-dir", default=env_str("REMOTE_REPO_DIR", ""))
     p.add_argument("--remote-client-bin", default=env_str("REMOTE_CLIENT_BIN", "build/client"))
     p.add_argument(
-        "--remote-config-template",
-        default=env_str("REMOTE_CONFIG_TEMPLATE", "build/prod_configs/config.{mode}.json"),
-        help="Remote config path template, e.g. build/prod_configs/config.{mode}.json",
+        "--metadata",
+        default=env_str("METADATA_ADDR", ""),
+        help="metadata_server endpoint host:port the clients fetch topology from "
+             "(defaults to $METADATA_HOST:$METADATA_PORT). The metadata server must "
+             "already be running — start it with: ./setup/vm_setup.bash start-metadata",
     )
     p.add_argument("--remote-log-dir", default=env_str("REMOTE_LOG_DIR", "build/prod_bench_logs"))
 
@@ -192,11 +193,6 @@ def parse_args(root_dir: Path) -> argparse.Namespace:
     p.add_argument("--value-prefix-base", default=env_str("VALUE_PREFIX_BASE", "bench-value"))
     p.add_argument("--ack-base-port", type=int, default=env_int("ACK_BASE_PORT", 61000))
 
-    p.add_argument(
-        "--reconfigure-each-run",
-        type=argparse_bool,
-        default=parse_bool(env_str("RECONFIGURE_EACH_RUN", "1"), "RECONFIGURE_EACH_RUN"),
-    )
     p.add_argument(
         "--fail-fast",
         type=argparse_bool,
@@ -250,9 +246,26 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
             raise RunnerError(f"hosts file not found: {hosts_file}")
         raw_hosts.extend(parse_hosts_text(hosts_file.read_text(encoding="utf-8")))
 
+    # Default to the client-only inventory if nothing was specified.
+    if not raw_hosts:
+        default_hosts_file = root_dir / "setup" / "client_hosts.csv"
+        if default_hosts_file.is_file():
+            raw_hosts.extend(parse_hosts_text(default_hosts_file.read_text(encoding="utf-8")))
+
     hosts = unique_preserve_order(raw_hosts)
     if not hosts:
-        raise RunnerError("no hosts provided; use --hosts and/or --hosts-file")
+        raise RunnerError("no hosts provided; use --hosts / --hosts-file or populate setup/client_hosts.csv")
+
+    metadata_addr = args.metadata.strip()
+    if not metadata_addr:
+        meta_host = env_str("METADATA_HOST", "").strip()
+        meta_port = env_str("METADATA_PORT", "50050").strip() or "50050"
+        if meta_host:
+            metadata_addr = f"{meta_host}:{meta_port}"
+    if not metadata_addr:
+        raise RunnerError("metadata endpoint not set; pass --metadata HOST:PORT or set METADATA_HOST in setup/.env")
+    if ":" not in metadata_addr:
+        raise RunnerError(f"--metadata must be host:port, got: {metadata_addr}")
 
     ssh_user = args.ssh_user.strip()
     if not ssh_user:
@@ -301,12 +314,11 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
         ssh_opts=ssh_opts,
         remote_repo_dir=remote_repo_dir,
         remote_client_bin=args.remote_client_bin,
-        remote_config_template=args.remote_config_template,
+        metadata_addr=metadata_addr,
         remote_log_dir=args.remote_log_dir,
         key_prefix_base=args.key_prefix_base,
         value_prefix_base=args.value_prefix_base,
         ack_base_port=args.ack_base_port,
-        reconfigure_each_run=args.reconfigure_each_run,
         dry_run=args.dry_run,
         fail_fast=args.fail_fast,
     )
@@ -330,18 +342,16 @@ def build_remote_client_command(
     client_index: int,
     num_clients: int,
     ack_port: int,
-    should_configure: bool,
-) -> tuple[List[str], str, str]:
-    configure_flag = "true" if should_configure else "false"
-    config_path = cfg.remote_config_template.format(mode=mode)
-
+) -> tuple[List[str], str]:
+    # The client fetches topology (and the actual replication mode) from the
+    # metadata server. The `mode` here is only a label for prefixes / filenames;
+    # make sure the running metadata server is configured with that mode.
     key_prefix = f"{cfg.key_prefix_base}-{mode}-{op}-"
     value_prefix = f"{cfg.value_prefix_base}-{mode}-{op}-"
 
     cmd = [
         cfg.remote_client_bin,
-        config_path,
-        configure_flag,
+        cfg.metadata_addr,
         str(ack_port),
     ]
 
@@ -373,7 +383,7 @@ def build_remote_client_command(
         )
 
     remote_log_file = f"{cfg.remote_log_dir}/{mode}_{op}_c{num_clients}_i{client_index}.log"
-    return cmd, config_path, remote_log_file
+    return cmd, remote_log_file
 
 
 def launch_case(cfg: RunnerConfig, mode: str, op: str, run_idx: int) -> None:
@@ -384,17 +394,15 @@ def launch_case(cfg: RunnerConfig, mode: str, op: str, run_idx: int) -> None:
     launches: List[ActiveLaunch] = []
 
     for client_index, host in enumerate(cfg.hosts):
-        should_configure = cfg.reconfigure_each_run and client_index == 0
         ack_port = cfg.ack_base_port + run_idx * 100 + client_index
 
-        client_cmd, config_path, remote_log_file = build_remote_client_command(
+        client_cmd, remote_log_file = build_remote_client_command(
             cfg,
             mode=mode,
             op=op,
             client_index=client_index,
             num_clients=num_clients,
             ack_port=ack_port,
-            should_configure=should_configure,
         )
 
         host_tag = host.replace("/", "_").replace(":", "_")
@@ -408,10 +416,6 @@ def launch_case(cfg: RunnerConfig, mode: str, op: str, run_idx: int) -> None:
                 (
                     f"if [[ ! -x {shell_quote(cfg.remote_client_bin)} ]]; then "
                     f"echo 'missing client binary: {cfg.remote_client_bin}' >&2; exit 10; fi"
-                ),
-                (
-                    f"if [[ ! -f {shell_quote(config_path)} ]]; then "
-                    f"echo 'missing config file: {config_path}' >&2; exit 11; fi"
                 ),
                 f"mkdir -p {shell_quote(cfg.remote_log_dir)}",
                 (
@@ -513,6 +517,7 @@ def main() -> int:
 
     log("Distributed benchmark configuration")
     log(f"  hosts={cfg.hosts}")
+    log(f"  metadata={cfg.metadata_addr}")
     log(f"  modes={cfg.modes}")
     log(f"  ops={cfg.ops}")
     log(f"  write_op_count={cfg.write_op_count}")

@@ -6,19 +6,21 @@ echo "=== Server stop (user: $DEPLOY_USER on $(hostname -f 2>/dev/null || hostna
 TMUX_SOCKET="${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}"
 TMUX_CMD=(tmux -S "$TMUX_SOCKET")
 
-# Stop shared tmux sessions
+# Stop shared tmux sessions (server nodes, the metadata store, and the legacy
+# single 'crown' session name used by start_server.bash).
 if command -v tmux >/dev/null 2>&1; then
   while IFS= read -r session_name; do
     [[ -n "$session_name" ]] || continue
-    if [[ "$session_name" =~ ^crown_node_ ]]; then
+    if [[ "$session_name" =~ ^crown_node_ || "$session_name" =~ ^crown_metadata_ || "$session_name" == "crown" ]]; then
       echo "Killing tmux session: $session_name"
       "${TMUX_CMD[@]}" kill-session -t "$session_name" >/dev/null 2>&1 || true
     fi
   done < <("${TMUX_CMD[@]}" list-sessions -F "#{session_name}" 2>/dev/null || true)
 fi
 
-# Stop server processes for this user
-echo "Killing server processes for user $DEPLOY_USER"
+# Stop server + metadata_server processes for this user.
+echo "Killing server / metadata_server processes for user $DEPLOY_USER"
+pkill -u "$DEPLOY_USER" -f 'metadata_server' >/dev/null 2>&1 || true
 pkill -u "$DEPLOY_USER" -f 'server' >/dev/null 2>&1 || true
 
 # Remove pid files in shared run directories

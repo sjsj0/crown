@@ -22,6 +22,11 @@ REMOTE_BASE_DIR="${REMOTE_BASE_DIR:-/home}"
 REPO_NAME="${REPO_NAME:-$(basename "${REPO_URL%.git}")}"
 PROJECT_SUBDIR="${PROJECT_SUBDIR:-.}"
 
+# Metadata store placement (single source of truth for topology + liveness).
+METADATA_HOST="${METADATA_HOST:-}"
+METADATA_PORT="${METADATA_PORT:-50050}"
+METADATA_CONFIG="${METADATA_CONFIG:-config.json}"
+
 # Optional: local key used just to reach the VMs. If you've already run
 # `ssh-copy-id` or have an agent, you can omit this in .env.
 SSH_OPTS=(-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
@@ -29,60 +34,109 @@ if [[ -n "${SSH_KEY_LOCAL:-}" && -f "${SSH_KEY_LOCAL:-/dev/null}" ]]; then
   SSH_OPTS=(-i "$SSH_KEY_LOCAL" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
 fi
 
-# Which local script to send and run remotely
+# --- host inventory ---------------------------------------------------------
+# prod_hosts.csv  : VMs that run server nodes (one of them also runs metadata).
+# client_hosts.csv: VMs that run only the client binary (benchmark drivers).
+# The repo is built on the UNION of both; servers/metadata only start on the
+# relevant subset.
+read_hosts_csv() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  # Strip comments (#...), CR, leading field before first comma, surrounding
+  # whitespace; drop blank lines.
+  sed -e 's/#.*$//' -e 's/\r//' "$file" \
+    | awk -F',' '{ gsub(/^[ \t]+|[ \t]+$/, "", $1); if ($1 != "") print $1 }'
+}
+
+mapfile -t prod_hosts   < <(read_hosts_csv "$SCRIPT_DIR/prod_hosts.csv")
+mapfile -t client_hosts < <(read_hosts_csv "$SCRIPT_DIR/client_hosts.csv")
+mapfile -t all_hosts    < <(printf '%s\n' "${prod_hosts[@]}" "${client_hosts[@]}" | awk 'NF' | sort -u)
+
+usage() {
+  echo "Usage: $0 <setup|start|start-servers|start-metadata|build|deploy|rerun|kill>"
+  echo "  setup|build|deploy|rerun : run on prod_hosts.csv ∪ client_hosts.csv"
+  echo "  start                    : start a server node on each prod_hosts.csv VM, then the metadata_server on \$METADATA_HOST"
+  echo "  start-servers            : start a server node on each prod_hosts.csv VM only (skip the metadata_server)"
+  echo "  start-metadata           : start the metadata_server on \$METADATA_HOST only"
+  echo "  kill                     : stop everything on prod_hosts.csv ∪ client_hosts.csv ∪ \$METADATA_HOST"
+}
+
+# --- remote deploy helper ---------------------------------------------------
+# Copies a local script to a host and runs it there with the deployment env.
+# Usage: deploy_to_host <local_script_path> <host> <label>
+deploy_to_host() {
+  local local_script="$1" host="$2" label="$3"
+  [[ -f "$local_script" ]] || { echo "Error: $local_script not found"; exit 1; }
+  local script_name remote_script server
+  script_name="$(basename "$local_script")"
+  remote_script="/home/${SSH_USER}/${script_name}"
+  server="${SSH_USER}@${host}"
+
+  echo "==> $server  ($label)"
+
+  echo "   -> copying $script_name"
+  scp "${SSH_OPTS[@]}" "$local_script" "$server:$remote_script"
+
+  echo "   -> running $remote_script"
+  ssh -t "${SSH_OPTS[@]}" "$server" \
+    "export SSH_USER='$SSH_USER' REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REMOTE_BASE_DIR='$REMOTE_BASE_DIR' REPO_NAME='$REPO_NAME' PROJECT_SUBDIR='$PROJECT_SUBDIR' PROJECT_MODE='${PROJECT_MODE:-crown}' BUILD_TYPE='${BUILD_TYPE:-Release}' NODE_HOST='${NODE_HOST:-0.0.0.0}' NODE_PORT='${NODE_PORT:-50051}' SERVER_LOG='${SERVER_LOG:-true}' TMUX_SESSION_NAME='${TMUX_SESSION_NAME:-}' TMUX_SOCKET='${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}' RUN_SCOPE='${RUN_SCOPE:-shared}' METADATA_HOST='${METADATA_HOST:-}' METADATA_PORT='${METADATA_PORT:-50050}' METADATA_CONFIG='${METADATA_CONFIG:-config.json}'; tr -d '\r' < '$remote_script' | bash -s --"
+}
+
+# Starts the metadata_server on $METADATA_HOST (its own script clones + builds
+# the repo there, so it does not require a prior `build` on that VM).
+start_metadata_server() {
+  if [[ -z "${METADATA_HOST:-}" ]]; then
+    echo "WARNING: METADATA_HOST is not set in .env -- skipping metadata_server."
+    echo "         Set METADATA_HOST in $ENV_FILE, then run: $0 start-metadata"
+    return 0
+  fi
+  echo "-- bringing up metadata_server on METADATA_HOST=$METADATA_HOST (config: $METADATA_CONFIG) --"
+  deploy_to_host "$SCRIPT_DIR/start_metadata.bash" "$METADATA_HOST" "start-metadata"
+}
+
+# --- action -----------------------------------------------------------------
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <setup|start|build|deploy|rerun|kill>"
-  echo "  Example: $0 setup"
+  usage
   exit 1
 fi
 
 ACTION="$1"
 case "$ACTION" in
-  setup) LOCAL_SCRIPT="$SCRIPT_DIR/setup.bash" ;;
-  start|build|deploy) LOCAL_SCRIPT="$SCRIPT_DIR/start_server.bash" ;;
-  rerun) LOCAL_SCRIPT="$SCRIPT_DIR/rerun.bash" ;;
-  kill)  LOCAL_SCRIPT="$SCRIPT_DIR/kill.bash" ;;
-  *) echo "Invalid action: $ACTION"; echo "Usage: $0 <setup|start|build|deploy|rerun|kill>"; exit 1 ;;
+  setup)
+    [[ ${#all_hosts[@]} -gt 0 ]] || { echo "No target hosts (check prod_hosts.csv / client_hosts.csv)."; exit 1; }
+    for host in "${all_hosts[@]}"; do deploy_to_host "$SCRIPT_DIR/setup.bash" "$host" "$ACTION"; done
+    ;;
+  build|deploy)
+    [[ ${#all_hosts[@]} -gt 0 ]] || { echo "No target hosts (check prod_hosts.csv / client_hosts.csv)."; exit 1; }
+    for host in "${all_hosts[@]}"; do deploy_to_host "$SCRIPT_DIR/start_server.bash" "$host" "$ACTION"; done
+    ;;
+  rerun)
+    [[ ${#all_hosts[@]} -gt 0 ]] || { echo "No target hosts (check prod_hosts.csv / client_hosts.csv)."; exit 1; }
+    for host in "${all_hosts[@]}"; do deploy_to_host "$SCRIPT_DIR/rerun.bash" "$host" "$ACTION"; done
+    ;;
+  start|start-servers)
+    [[ ${#prod_hosts[@]} -gt 0 ]] || { echo "No server hosts (check prod_hosts.csv)."; exit 1; }
+    for host in "${prod_hosts[@]}"; do deploy_to_host "$SCRIPT_DIR/start_server.bash" "$host" "start (server node)"; done
+    # `start` also brings up the metadata_server so the cluster is fully
+    # configured in one shot; `start-servers` stops after the node servers.
+    if [[ "$ACTION" == "start" ]]; then
+      start_metadata_server
+    fi
+    ;;
+  start-metadata)
+    : "${METADATA_HOST:?Set METADATA_HOST in .env}"
+    deploy_to_host "$SCRIPT_DIR/start_metadata.bash" "$METADATA_HOST" "$ACTION"
+    ;;
+  kill)
+    # Stop everything on the union of the host files plus the metadata host
+    # (which may live outside both CSVs).
+    mapfile -t kill_hosts < <(printf '%s\n' "${all_hosts[@]}" "${METADATA_HOST:-}" | awk 'NF' | sort -u)
+    [[ ${#kill_hosts[@]} -gt 0 ]] || { echo "No target hosts (check prod_hosts.csv / client_hosts.csv)."; exit 1; }
+    for host in "${kill_hosts[@]}"; do deploy_to_host "$SCRIPT_DIR/kill.bash" "$host" "$ACTION"; done
+    ;;
+  *)
+    echo "Invalid action: $ACTION"
+    usage
+    exit 1
+    ;;
 esac
-[[ -f "$LOCAL_SCRIPT" ]] || { echo "Error: $LOCAL_SCRIPT not found"; exit 1; }
-REMOTE_SCRIPT="/home/${SSH_USER}/$(basename "$LOCAL_SCRIPT")"
-LOCAL_SCRIPT_NAME="$(basename "$LOCAL_SCRIPT")"
-
-# Hosts (without usernames)
-hosts=(
- "sp26-cs525-1201.cs.illinois.edu"
- "sp26-cs525-1202.cs.illinois.edu"
- "sp26-cs525-1203.cs.illinois.edu"
-#  "sp26-cs525-1204.cs.illinois.edu"
-#  "sp26-cs525-1205.cs.illinois.edu"
-#  "sp26-cs525-1206.cs.illinois.edu"
-#  "sp26-cs525-1207.cs.illinois.edu"
-#  "sp26-cs525-1208.cs.illinois.edu"
-#  "sp26-cs525-1209.cs.illinois.edu"
-#  "sp26-cs525-1210.cs.illinois.edu"
-#  "sp26-cs525-1211.cs.illinois.edu"
- "sp26-cs525-1212.cs.illinois.edu"
-#  "sp26-cs525-1213.cs.illinois.edu"
-#  "sp26-cs525-1214.cs.illinois.edu"
-#  "sp26-cs525-1215.cs.illinois.edu"
-#  "sp26-cs525-1216.cs.illinois.edu"
-#  "sp26-cs525-1217.cs.illinois.edu"
-#  "sp26-cs525-1218.cs.illinois.edu"
-#  "sp26-cs525-1219.cs.illinois.edu"
-#  "sp26-cs525-1220.cs.illinois.edu"
-)
-
-# --- loop over servers ---
-for host in "${hosts[@]}"; do
-  server="${SSH_USER}@${host}"
-  echo "==> $server"
-
-  # Copy and run the requested script
-  echo "   -> copying $LOCAL_SCRIPT_NAME"
-  scp "${SSH_OPTS[@]}" "$LOCAL_SCRIPT" "$server:$REMOTE_SCRIPT"
-
-  echo "   -> running $REMOTE_SCRIPT"
-  ssh -t "${SSH_OPTS[@]}" "$server" \
-    "export SSH_USER='$SSH_USER' REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REMOTE_BASE_DIR='$REMOTE_BASE_DIR' REPO_NAME='$REPO_NAME' PROJECT_SUBDIR='$PROJECT_SUBDIR' PROJECT_MODE='${PROJECT_MODE:-crown}' BUILD_TYPE='${BUILD_TYPE:-Release}' NODE_HOST='${NODE_HOST:-0.0.0.0}' NODE_PORT='${NODE_PORT:-50051}' SERVER_LOG='${SERVER_LOG:-true}' TMUX_SESSION_NAME='${TMUX_SESSION_NAME:-}' TMUX_SOCKET='${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}' RUN_SCOPE='${RUN_SCOPE:-shared}'; tr -d '\r' < '$REMOTE_SCRIPT' | bash -s --"
-done
-

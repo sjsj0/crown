@@ -113,8 +113,29 @@ target_link_libraries(server PRIVATE
 )
 
 # ============================================================
+# Metadata store executable
+# ============================================================
+# Single source of truth for cluster topology + liveness. The only component
+# that reads config.json: it validates the config, pushes Configure to every
+# node, runs a ping-ack failure detector, and serves MetadataStore.GetCluster.
+
+add_executable(metadata_server
+    src/metadata/metadata_server.cpp
+)
+target_include_directories(metadata_server PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${PROTO_GEN_DIR}
+)
+target_link_libraries(metadata_server PRIVATE
+    chain_proto
+    nlohmann_json::nlohmann_json
+)
+
+# ============================================================
 # Client executable
 # ============================================================
+# Benchmark / interactive workload driver. Fetches its topology from the
+# metadata store via MetadataStore.GetCluster — it does not read config files.
 
 add_executable(client
     src/client/client.cpp
@@ -125,17 +146,4 @@ target_include_directories(client PRIVATE
 )
 target_link_libraries(client PRIVATE
     chain_proto
-    nlohmann_json::nlohmann_json
-)
-
-add_executable(kv_client
-    src/client/kv_client.cpp
-)
-target_include_directories(kv_client PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${PROTO_GEN_DIR}
-)
-target_link_libraries(kv_client PRIVATE
-    chain_proto
-    nlohmann_json::nlohmann_json
 )

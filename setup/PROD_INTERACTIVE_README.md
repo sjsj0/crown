@@ -24,13 +24,24 @@ Example for 5 nodes (`1201`..`1205`), all listening on `50051`:
 
 `for i in 1 2 3 4 5; do h="sp26-cs525-120${i}.cs.illinois.edu"; p=50051; nc -vz $h $p; done`
 
-## 4) Start client interactive loop (first run: configure=true)
+## 4) Start the metadata server (configures all nodes + monitors liveness)
 
-Pick one mode config (example: CROWN):
+Pick one mode config (example: CROWN). Run this on ONE VM (e.g. `1201`):
 
-`./build/client build/prod_configs/config.crown.json true 61000`
+`./build/metadata_server --config build/prod_configs/config.crown.json --host 0.0.0.0 --port 50050 --log`
 
-## 5) Use interactive commands
+It pushes each node its `NodeConfig` via the `Configure` RPC, then keeps running:
+it pings every node and logs a node DOWN after 3 missed acks, and serves
+`MetadataStore.GetCluster`. (Or use `./setup/vm_setup.bash start-metadata`, which
+runs it on `$METADATA_HOST` from `setup/.env`.)
+
+## 5) Start the client (topology comes from the metadata server)
+
+`./build/client sp26-cs525-1201.cs.illinois.edu:50050 61000`
+
+(First positional = metadata `host:port`; second = ack-listener port, default 60000.)
+
+## 6) Use interactive commands
 
 `write user:1 hello`
 
@@ -40,46 +51,43 @@ Pick one mode config (example: CROWN):
 
 `quit`
 
-## 6) Start interactive loop again without reconfiguring
+## 7) Switch mode by restarting the metadata server with a different config
 
-`./build/client build/prod_configs/config.crown.json false 61000`
+Stop the current `metadata_server`, then e.g. for CHAIN:
 
-## 7) Switch mode by changing config file
+`./build/metadata_server --config build/prod_configs/config.chain.json --host 0.0.0.0 --port 50050 --log`
 
-CHAIN:
+The client picks up the new mode automatically on its next start (it reads
+`mode` from `MetadataStore.GetCluster`).
 
-`./build/client build/prod_configs/config.chain.json true 61000`
+## 8) Stop servers + metadata on prod VMs
 
-CRAQ:
+`for i in 1 2 3 4 5; do h="sp26-cs525-120${i}.cs.illinois.edu"; ssh <user>@$h "pkill -f 'build/metadata_server' ; pkill -f 'build/server --port' || true"; done`
 
-`./build/client build/prod_configs/config.craq.json true 61000`
-
-## 8) Stop servers on prod VMs
-
-`for i in 1 2 3 4 5; do h="sp26-cs525-120${i}.cs.illinois.edu"; ssh <user>@$h "pkill -f './build/server --port' || true"; done`
+(or `./setup/vm_setup.bash kill`)
 
 ## 9) Run distributed throughput tests (single or multiple client VMs)
 
-Run from your controller VM (or from one of the client VMs):
+Run from your controller VM (or from one of the client VMs); the metadata server
+must already be running (step 4).
 
 `cd /home/crown`
 
 ### Single-client run (one client VM)
 
-`python3 setup/run_throughput_experiments.py --hosts sp26-cs525-1201.cs.illinois.edu --ssh-user ritwikg3 --remote-repo-dir /home/crown --modes chain craq crown --ops write read --write-op-count 5000 --read-op-count 5000 --key-count 64 --work-dir build/prod_throughput_single_client`
+`python3 setup/run_throughput_experiments.py --hosts sp26-cs525-1218.cs.illinois.edu --ssh-user ritwikg3 --remote-repo-dir /home/crown --metadata sp26-cs525-1201.cs.illinois.edu:50050 --modes crown --ops write read --write-op-count 5000 --read-op-count 5000 --key-count 64 --work-dir build/prod_throughput_single_client`
 
-### Multi-client simultaneous run (one client process per VM)
+### Multi-client simultaneous run (one client process per VM in client_hosts.csv)
 
-`python3 setup/run_throughput_experiments.py --hosts "$(cat setup/prod_hosts.csv)" --ssh-user ritwikg3 --remote-repo-dir /home/crown --modes chain craq crown --ops write read --write-op-count 50000 --read-op-count 50000 --key-count 64 --work-dir build/prod_throughput_multi_client`
+`python3 setup/run_throughput_experiments.py --ssh-user ritwikg3 --remote-repo-dir /home/crown --metadata sp26-cs525-1201.cs.illinois.edu:50050 --modes crown --ops write read --write-op-count 50000 --read-op-count 50000 --key-count 64 --work-dir build/prod_throughput_multi_client`
 
 Behavior:
 
-- Launches exactly one client process per host in `--hosts`.
+- Launches exactly one client process per host in `--hosts` (defaults to `setup/client_hosts.csv`).
 - Auto-assigns `client_index=0..N-1` in host order.
-- Uses `configure=true` only on the first client in each mode/op case.
-- Collects remote logs to local `--work-dir/logs`.
-- Writes SSH execution logs to local `--work-dir/ssh_logs`.
-- Writes aggregate summary to local `--work-dir/summary.csv`.
+- Each client fetches topology from `--metadata` (no config files on the client side).
+- `--modes` is only a label here — the actual mode is whatever the metadata server is running. Run one mode at a time.
+- Collects remote logs to local `--work-dir/logs`, SSH logs to `--work-dir/ssh_logs`, aggregate summary to `--work-dir/summary.csv`.
 
 ## Notes
 
@@ -87,4 +95,4 @@ Behavior:
 - Replace `/path/to/crown` with the repo path on each VM.
 - Keep `node_count`, host list, and base port consistent.
 - For prod configs, all nodes use the same base port.
-- If you change node count, regenerate configs and update loop ranges accordingly.
+- If you change node count, regenerate configs and restart the metadata server.

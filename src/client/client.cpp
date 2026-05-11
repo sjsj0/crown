@@ -1,4 +1,9 @@
-// client.cpp — configures all nodes then enters an interactive read/write loop.
+// client.cpp — benchmark / interactive workload driver.
+//
+// Topology comes from the metadata store: on startup the client calls
+// MetadataStore.GetCluster on <metadata_host:port> and builds its routing
+// tables from the response. It never reads config files and never configures
+// nodes — that is the metadata_server's job.
 //
 // Write flow (non-blocking):
 //   1. Client assigns a unique request_id, adds it to pending map, fires
@@ -18,12 +23,10 @@
 //   help
 
 #include <iostream>
-#include <fstream>
 #include <string>
 #include <stdexcept>
 #include <sstream>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include <thread>
 #include <mutex>
@@ -39,11 +42,9 @@
 #include <arpa/inet.h>
 
 #include <grpcpp/grpcpp.h>
-#include <nlohmann/json.hpp>
 #include "chain.grpc.pb.h"
 
 using namespace std;
-using json = nlohmann::json;
 
 // ============================================================
 // Helpers
@@ -387,9 +388,9 @@ static void benchmark_wait_for_pending_acks() {
 
 static void print_usage(const char* bin) {
     cerr << "Usage:\n"
-         << "  " << bin << " <config.json> <true/false> [ack_port]\n"
-         << "  " << bin << " <config.json> <true/false> [ack_port] bench-write <total_ops> <key_count> <client_index> <num_clients> [key_prefix] [value_prefix] [hot=<0-100>]\n"
-         << "  " << bin << " <config.json> <true/false> [ack_port] bench-read  <total_ops> <key_count> <client_index> <num_clients> [craq_node_id] [key_prefix] [hot=<0-100>]\n";
+         << "  " << bin << " <metadata_host:port> [ack_port]\n"
+         << "  " << bin << " <metadata_host:port> [ack_port] bench-write <total_ops> <key_count> <client_index> <num_clients> [key_prefix] [value_prefix] [hot=<0-100>]\n"
+         << "  " << bin << " <metadata_host:port> [ack_port] bench-read  <total_ops> <key_count> <client_index> <num_clients> [craq_node_id] [key_prefix] [hot=<0-100>]\n";
 }
 
 static bool parse_run_mode_args(int argc,
@@ -401,7 +402,8 @@ static bool parse_run_mode_args(int argc,
     ack_port = 60000;
     run_mode = ClientRunMode::INTERACTIVE;
 
-    int argi = 3;
+    // argv[1] is <metadata_host:port>; optional ack_port and bench args follow.
+    int argi = 2;
     int maybe_ack_port = 0;
     if (argi < argc && parse_int_text(argv[argi], maybe_ack_port)) {
         ack_port = maybe_ack_port;
@@ -644,157 +646,20 @@ public:
 };
 
 // ============================================================
-// Helpers — build proto messages from JSON
+// Topology source — fetched from the metadata store
 // ============================================================
 
-static chain::ReplicationMode parse_mode(const string& s) {
-    if (s == "chain") return chain::ReplicationMode::CHAIN;
-    if (s == "craq")  return chain::ReplicationMode::CRAQ;
-    if (s == "crown") return chain::ReplicationMode::CROWN;
-    throw invalid_argument("Unknown mode in config: " + s);
-}
-
-static chain::NodeAddress parse_addr(const string& s) {
-    auto colon = s.rfind(':');
-    if (colon == string::npos)
-        throw invalid_argument("Expected host:port, got: " + s);
-    chain::NodeAddress a;
-    a.set_host(s.substr(0, colon));
-    a.set_port(stoi(s.substr(colon + 1)));
-    return a;
-}
-
-static chain::NodeConfig build_node_config(const json& node_json,
-                                            chain::ReplicationMode mode,
-                                            int crown_node_count,
-                                            const string& craq_tail_addr = "") {
-    chain::NodeConfig cfg;
-    cfg.set_node_id(node_json.at("id").get<int>());
-    cfg.set_mode(mode);
-    cfg.set_is_head(node_json.value("is_head", false));
-    cfg.set_is_tail(node_json.value("is_tail", false));
-    if (mode == chain::ReplicationMode::CROWN) {
-        // Keep wire compatibility: use head_ranges count to carry ring size.
-        for (int i = 0; i < crown_node_count; ++i) {
-            (void)cfg.add_head_ranges();
-        }
-    }
-    if (mode == chain::ReplicationMode::CRAQ && !craq_tail_addr.empty()) {
-        *cfg.mutable_tail() = parse_addr(craq_tail_addr);
-    }
-
-    string host = node_json.at("host").get<string>();
-    int    port = node_json.at("port").get<int>();
-    chain::NodeAddress self_addr;
-    self_addr.set_host(host);
-    self_addr.set_port(port);
-    *cfg.mutable_self_addr() = self_addr;
-
-    if (!node_json["predecessor"].is_null())
-        *cfg.mutable_predecessor() = parse_addr(node_json["predecessor"].get<string>());
-    if (!node_json["successor"].is_null())
-        *cfg.mutable_successor()   = parse_addr(node_json["successor"].get<string>());
-    return cfg;
-}
-
-// ============================================================
-// Validation
-// ============================================================
-
-struct CrownNodeView {
-    int id = 0;
-    string endpoint, predecessor, successor;
-};
-
-static bool validate_minimal_config(const json& nodes, string& error) {
-    if (!nodes.is_array() || nodes.empty()) { error = "'nodes' must be a non-empty array"; return false; }
-    for (size_t i = 0; i < nodes.size(); ++i) {
-        const auto& n = nodes[i];
-        try {
-            (void)n.at("id").get<int>();
-            (void)n.at("host").get<string>();
-            (void)n.at("port").get<int>();
-            if (n.contains("predecessor") && !n.at("predecessor").is_null())
-                (void)parse_addr(n.at("predecessor").get<string>());
-            if (n.contains("successor") && !n.at("successor").is_null())
-                (void)parse_addr(n.at("successor").get<string>());
-        } catch (const exception& ex) {
-            error = "invalid node at index " + to_string(i) + ": " + ex.what();
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool validate_crown_topology(const json& nodes, string& error) {
-    vector<CrownNodeView> parsed;
-    unordered_map<string, size_t> by_endpoint;
-    unordered_map<int, size_t> by_id;
-
-    for (size_t i = 0; i < nodes.size(); ++i) {
-        const auto& n = nodes[i];
-        CrownNodeView v;
-        v.id       = n.at("id").get<int>();
-        v.endpoint = n.at("host").get<string>() + ":" + to_string(n.at("port").get<int>());
-
-        if (by_endpoint.count(v.endpoint)) {
-            error = "duplicate endpoint in CROWN config: " + v.endpoint;
-            return false;
-        }
-        if (by_id.count(v.id)) {
-            error = "duplicate CROWN node id: " + to_string(v.id);
-            return false;
-        }
-
-        if (n["predecessor"].is_null() || n["successor"].is_null()) {
-            error = "CROWN node " + v.endpoint + " must have both predecessor and successor";
-            return false;
-        }
-        v.predecessor = n.at("predecessor").get<string>();
-        v.successor   = n.at("successor").get<string>();
-
-        by_endpoint[v.endpoint] = parsed.size();
-        by_id[v.id] = parsed.size();
-        parsed.push_back(std::move(v));
-    }
-
-    for (size_t expected = 0; expected < parsed.size(); ++expected) {
-        if (!by_id.count(static_cast<int>(expected))) {
-            error = "CROWN node ids must be contiguous in [0, "
-                  + to_string(parsed.size() - 1) + "]";
-            return false;
-        }
-    }
-
-    for (const auto& n : parsed) {
-        if (!by_endpoint.count(n.predecessor)) { error = "predecessor " + n.predecessor + " not found"; return false; }
-        if (!by_endpoint.count(n.successor))   { error = "successor "   + n.successor   + " not found"; return false; }
-        if (parsed[by_endpoint[n.predecessor]].successor != n.endpoint ||
-            parsed[by_endpoint[n.successor]].predecessor != n.endpoint) {
-            error = "ring inconsistency at " + n.endpoint; return false;
-        }
-    }
-
-    unordered_set<string> visited;
-    string current = parsed.front().endpoint;
-    for (size_t step = 0; step < parsed.size(); ++step) {
-        if (visited.count(current)) { error = "ring cycle before covering all nodes"; return false; }
-        visited.insert(current);
-        current = parsed[by_endpoint[current]].successor;
-    }
-    if (current != parsed.front().endpoint || visited.size() != parsed.size()) {
-        error = "ring does not close or is disconnected"; return false;
-    }
-    return true;
-}
-
-static bool validate_config_before_configure(const json& config,
-                                             chain::ReplicationMode mode,
-                                             string& error) {
-    if (!config.contains("nodes")) { error = "missing 'nodes'"; return false; }
-    const auto& nodes = config.at("nodes");
-    if (!validate_minimal_config(nodes, error)) return false;
-    if (mode == chain::ReplicationMode::CROWN) return validate_crown_topology(nodes, error);
+static bool fetch_cluster_state(const string& metadata_addr,
+                                chain::ClusterState& out,
+                                string& error) {
+    auto channel = grpc::CreateChannel(metadata_addr, grpc::InsecureChannelCredentials());
+    auto stub    = chain::MetadataStore::NewStub(channel);
+    google::protobuf::Empty req;
+    grpc::ClientContext ctx;
+    ctx.set_deadline(chrono::system_clock::now() + chrono::seconds(5));
+    const grpc::Status st = stub->GetCluster(&ctx, req, &out);
+    if (!st.ok()) { error = st.error_message(); return false; }
+    if (out.nodes_size() == 0) { error = "metadata store returned an empty cluster"; return false; }
     return true;
 }
 
@@ -1076,15 +941,15 @@ static vector<PreparedBenchmarkRead> benchmark_prepare_read_batch(
     return prepared;
 }
 
-static Topology build_topology(const json& config, chain::ReplicationMode mode) {
+static Topology build_topology(const chain::ClusterState& cs) {
     Topology topo;
-    topo.mode = mode;
-    const auto& jnodes = config.at("nodes");
+    topo.mode = cs.mode();
 
-    for (const auto& n : jnodes) {
+    topo.nodes.reserve(static_cast<size_t>(cs.nodes_size()));
+    for (const auto& n : cs.nodes()) {
         NodeStub ns;
-        ns.id       = n.at("id").get<int>();
-        ns.endpoint = n.at("host").get<string>() + ":" + to_string(n.at("port").get<int>());
+        ns.id       = n.node_id();
+        ns.endpoint = n.addr().host() + ":" + to_string(n.addr().port());
         ns.channel  = grpc::CreateChannel(ns.endpoint, grpc::InsecureChannelCredentials());
         ns.stub     = chain::ChainNode::NewStub(ns.channel);
         topo.nodes.push_back(std::move(ns));
@@ -1092,16 +957,16 @@ static Topology build_topology(const json& config, chain::ReplicationMode mode) 
 
     // Chain / CRAQ: identify the single head and tail by flag.
     // CROWN: head/tail are resolved per-key at request time via crown_head_for / crown_tail_for.
-    for (size_t i = 0; i < jnodes.size(); ++i) {
-        if (jnodes[i].value("is_head", false)) topo.head = &topo.nodes[i];
-        if (jnodes[i].value("is_tail", false)) topo.tail = &topo.nodes[i];
+    for (int i = 0; i < cs.nodes_size(); ++i) {
+        if (cs.nodes(i).is_head()) topo.head = &topo.nodes[i];
+        if (cs.nodes(i).is_tail()) topo.tail = &topo.nodes[i];
     }
 
-    if (mode == chain::ReplicationMode::CROWN) {
-        topo.crown_nodes_by_index.assign(jnodes.size(), nullptr);
-        for (size_t i = 0; i < jnodes.size(); ++i) {
-            const int id = jnodes[i].at("id").get<int>();
-            if (id < 0 || id >= static_cast<int>(jnodes.size())) {
+    if (topo.mode == chain::ReplicationMode::CROWN) {
+        topo.crown_nodes_by_index.assign(static_cast<size_t>(cs.nodes_size()), nullptr);
+        for (int i = 0; i < cs.nodes_size(); ++i) {
+            const int id = cs.nodes(i).node_id();
+            if (id < 0 || id >= cs.nodes_size()) {
                 throw invalid_argument("CROWN node id out of range while building topology");
             }
             if (topo.crown_nodes_by_index[id] != nullptr) {
@@ -1499,18 +1364,12 @@ static void run_interactive_loop(Topology& topo, const string& client_addr) {
 // ============================================================
 
 int main(int argc, char** argv) {
-    if (argc < 3) {
+    if (argc < 2) {
         print_usage(argv[0]);
         return 1;
     }
 
-    const string configure_arg = argv[2];
-    if (configure_arg != "true" && configure_arg != "false") {
-        cerr << "Second argument must be 'true' or 'false'.\n";
-        print_usage(argv[0]);
-        return 1;
-    }
-    const bool should_configure = (configure_arg == "true");
+    const string metadata_addr = argv[1];
 
     int ack_port = 60000;
     ClientRunMode run_mode = ClientRunMode::INTERACTIVE;
@@ -1538,75 +1397,22 @@ int main(int argc, char** argv) {
     cout << "[Client] Ack server listening on " << client_addr << "\n";
     thread ack_thread([&] { ack_server->Wait(); });
 
-    // --- Load and validate config ------------------------------
-    ifstream file(argv[1]);
-    if (!file.is_open()) { cerr << "Cannot open config file: " << argv[1] << "\n"; return 1; }
-
-    json config;
-    try { file >> config; }
-    catch (const json::exception& ex) { cerr << "JSON parse error: " << ex.what() << "\n"; return 1; }
-
-    chain::ReplicationMode mode = parse_mode(config.at("mode").get<string>());
-    const int crown_node_count = (mode == chain::ReplicationMode::CROWN)
-        ? static_cast<int>(config.at("nodes").size())
-        : 0;
-
-    string validation_error;
-    if (!validate_config_before_configure(config, mode, validation_error)) {
-        cerr << "[Client] Config validation failed: " << validation_error << "\n";
-        return 1;
-    }
-
-    string craq_tail_addr;
-    if (mode == chain::ReplicationMode::CRAQ) {
-        for (const auto& node_json : config.at("nodes")) {
-            if (node_json.value("is_tail", false)) {
-                craq_tail_addr = node_json.at("host").get<string>() + ":"
-                              + to_string(node_json.at("port").get<int>());
-                break;
-            }
-        }
-        if (craq_tail_addr.empty()) {
-            cerr << "[Client] CRAQ config must include a tail node with is_tail=true\n";
-            return 1;
-        }
-    }
-
-    // --- Configure all nodes -----------------------------------
-    int failures = 0;
-    if (should_configure) {
-        for (const auto& node_json : config.at("nodes")) {
-            string target = node_json.at("host").get<string>() + ":"
-                            + to_string(node_json.at("port").get<int>());
-            chain::NodeConfig cfg = build_node_config(node_json, mode, crown_node_count);
-            auto channel = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
-            auto stub    = chain::ChainNode::NewStub(channel);
-            google::protobuf::Empty resp;
-            grpc::ClientContext     ctx;
-            grpc::Status status = stub->Configure(&ctx, cfg, &resp);
-            if (status.ok())
-                cout << "[Client] Configured node " << cfg.node_id() << " at " << target << "\n";
-            else {
-                cerr << "[Client] Failed to configure node " << cfg.node_id()
-                    << " at " << target << ": " << status.error_message() << "\n";
-                ++failures;
-            }
-        }
-    } else {
-        cout << "[Client] Skipping Configure RPCs for this run.\n";
-    }
-
-    if (failures > 0) {
-        cerr << "[Client] " << failures << " node(s) failed to configure.\n";
+    // --- Fetch topology from the metadata store ----------------
+    chain::ClusterState cluster;
+    string fetch_error;
+    if (!fetch_cluster_state(metadata_addr, cluster, fetch_error)) {
+        cerr << "[Client] Failed to fetch cluster topology from " << metadata_addr
+             << ": " << fetch_error << "\n";
         ack_server->Shutdown();
         ack_thread.join();
         return 1;
     }
-
-    cout << "[Client] All nodes configured successfully.\n\n";
+    const chain::ReplicationMode mode = cluster.mode();
+    cout << "[Client] Topology from " << metadata_addr
+         << ": mode=" << mode_name(mode) << " nodes=" << cluster.nodes_size() << "\n\n";
 
     // --- Run mode ----------------------------------------------
-    Topology topo = build_topology(config, mode);
+    Topology topo = build_topology(cluster);
     if (run_mode == ClientRunMode::INTERACTIVE) {
         run_interactive_loop(topo, client_addr);
     } else {

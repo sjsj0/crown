@@ -13,18 +13,34 @@ For a focused step-by-step guide to run the interactive client against prod host
 ### 1. `vm_setup.bash` (Orchestrator)
 Coordinates deployment across multiple VMs via SSH.
 
-**Changes:**
-- ✅ Uses `SSH_USER` from `.env` (no username argument in command)
-- ✅ Loads configuration from `.env` file in this directory
-- ✅ Supports actions: `setup` | `start` | `build` | `deploy` | `kill`
-- ✅ Forwards all env vars to remote scripts (per-user aware)
+**Host inventory:** the script reads two CSV files in this directory (one host per
+line, trailing comma allowed, `#` comments ignored):
+- `prod_hosts.csv` — VMs that run **server** nodes. One of them (`$METADATA_HOST`
+  in `.env`) also runs the metadata store.
+- `client_hosts.csv` — VMs that run **only** the `client` binary (benchmark drivers).
+
+The repo is cloned + built on the **union** of both files; server/metadata
+processes start only on the relevant subset.
 
 **Usage:**
 ```bash
-./vm_setup.bash setup    # Setup VMs for SSH_USER from .env
-./vm_setup.bash start    # Start nodes for SSH_USER from .env
-./vm_setup.bash kill     # Kill all nodes for SSH_USER from .env
+./vm_setup.bash setup           # install deps on prod_hosts.csv ∪ client_hosts.csv
+./vm_setup.bash build           # clone/build the repo on prod_hosts.csv ∪ client_hosts.csv
+./vm_setup.bash start           # start a server node on each prod_hosts.csv VM, THEN the metadata_server on $METADATA_HOST
+./vm_setup.bash start-servers   # start a server node on each prod_hosts.csv VM only (skip the metadata_server)
+./vm_setup.bash start-metadata  # start the metadata_server on $METADATA_HOST only
+./vm_setup.bash kill            # stop servers + metadata on prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST
 ```
+
+Typical bring-up order: `setup` → `build` → `start`. `start` launches a server
+node on every `prod_hosts.csv` VM and then brings up the `metadata_server` on
+`$METADATA_HOST` (it pushes Configure to every node, then runs the ping-ack
+detector) — no separate `start-metadata` step needed. If `METADATA_HOST` is
+unset, `start` warns and skips the metadata step. Clients then point at
+`$METADATA_HOST:$METADATA_PORT`. Use `start-servers` when you want the node
+servers without (re)starting the metadata server, and `start-metadata` to
+(re)start just the metadata server — e.g. to switch modes with a different
+`METADATA_CONFIG`.
 
 ### 2. `setup.bash` (Dependency Installation)
 One-time setup of system dependencies on each VM.
@@ -96,60 +112,65 @@ attach: tmux -S /tmp/crown-shared/tmux.sock attach -t crown_node_5001
 tmux -S /tmp/crown-shared/tmux.sock attach -t crown_node_5001
 ```
 
-### 4. `kill.bash` (Process Cleanup)
-Stop all nodes for a given user.
+### 4. `start_metadata.bash` (Metadata store)
+Clone/build the repo on this VM and start `build/metadata_server` in a tmux
+session. The metadata server is the single source of truth for cluster topology:
+it reads `$METADATA_CONFIG`, validates it, pushes Configure to every node, runs a
+ping-ack failure detector (logs a node DOWN after `$METADATA_FAILURE_THRESHOLD`
+missed acks), and serves `MetadataStore.GetCluster`. Run it on exactly one VM.
 
-**Changes:**
-- ✅ Uses `SSH_USER` from environment (or current user fallback)
-- ✅ Kills shared tmux sessions (matches `crown_node_*` pattern)
-- ✅ Kills server processes for the deployment user
-- ✅ Cleans up pid files in shared `run/shared/` directories
-- ✅ Safe: Only kills processes owned by the specified user (uses `pkill -u`)
-- ✅ Works across multiple project modes and locations
-
-**Usage:**
 ```bash
-./kill.bash          # Kill all nodes for SSH_USER from .env
-
-# Via vm_setup.bash:
-./vm_setup.bash kill
+# Via vm_setup.bash (runs on $METADATA_HOST only):
+./vm_setup.bash start-metadata
 ```
 
-### 5. `run_throughput_experiments.py` (Distributed Throughput Runner)
-Runs write/read throughput tests for CHAIN, CRAQ, and CROWN using distributed client VMs.
+Relevant env vars: `METADATA_PORT`, `METADATA_CONFIG`,
+`METADATA_PING_INTERVAL_MS`, `METADATA_PING_TIMEOUT_MS`,
+`METADATA_FAILURE_THRESHOLD`. Logs at `run/$RUN_SCOPE/metadata_${METADATA_PORT}.log`,
+tmux session `crown_metadata_${METADATA_PORT}`.
 
-**Highlights:**
-- ✅ Distributed-only workflow (one client process per host)
-- ✅ Supports both single-client (`1 host`) and multi-client (`N hosts`) runs
-- ✅ Supports all modes and both ops in one command
-- ✅ Auto-assigns `client_index` and `num_clients`
-- ✅ Collects remote client logs and generates local `summary.csv`
+### 5. `kill.bash` (Process Cleanup)
+Stop all server **and** metadata processes for the deployment user.
+
+- ✅ Kills shared tmux sessions (`crown_node_*`, `crown_metadata_*`, legacy `crown`)
+- ✅ Kills `server` and `metadata_server` processes for the deployment user
+- ✅ Cleans up pid files in shared `run/shared/` directories
+- ✅ Safe: only kills processes owned by the specified user (`pkill -u`)
+
+```bash
+./kill.bash            # locally
+./vm_setup.bash kill   # across prod_hosts.csv ∪ client_hosts.csv
+```
+
+### 6. `run_throughput_experiments.py` (Distributed Throughput Runner)
+Runs write/read throughput tests using distributed client VMs. The clients fetch
+their topology from the metadata server, so **start the metadata server first**
+(`./vm_setup.bash start-metadata`). The runner takes a `--metadata HOST:PORT`
+endpoint (defaults to `$METADATA_HOST:$METADATA_PORT`); `--hosts` defaults to the
+machines in `setup/client_hosts.csv`.
+
+Because the metadata server defines the replication mode, run one mode at a time
+(restart `metadata_server` with a different `config.json` to switch modes). The
+`--modes` list is still accepted but is only used for log/key-prefix labels.
 
 **Usage:**
 ```bash
-# Single client VM:
-python3 setup/run_throughput_experiments.py \
-  --hosts sp26-cs525-1201.cs.illinois.edu \
-  --ssh-user <your-netid> \
-  --remote-repo-dir /home/crown \
-  --modes chain craq crown \
-  --ops write read \
-  --write-op-count 5000 \
-  --read-op-count 5000 \
-  --key-count 64 \
-  --work-dir build/prod_throughput_single_client
+# 1) bring up the cluster + metadata server (one command: servers, then metadata)
+./setup/vm_setup.bash start
+#    (to switch modes later, restart just the metadata server with a different config:
+#     METADATA_CONFIG=build/prod_configs/config.craq.json ./setup/vm_setup.bash start-metadata)
 
-# Multi-client simultaneous run (one process per listed host):
+# 2) run benchmarks from the client VMs
 python3 setup/run_throughput_experiments.py \
-  --hosts "$(cat setup/prod_hosts.csv)" \
   --ssh-user <your-netid> \
   --remote-repo-dir /home/crown \
-  --modes chain craq crown \
+  --metadata "$METADATA_HOST:$METADATA_PORT" \
+  --modes crown \
   --ops write read \
   --write-op-count 50000 \
   --read-op-count 50000 \
   --key-count 64 \
-  --work-dir build/prod_throughput_multi_client
+  --work-dir build/prod_throughput
 ```
 
 **Outputs:**
@@ -159,11 +180,10 @@ python3 setup/run_throughput_experiments.py \
 
 ## Configuration (.env file)
 
-Use the existing `.env` file in this directory and customize it:
+Use the existing `.env` file in this directory and customize it. For this
+repository, use `PROJECT_SUBDIR=.` because the top-level `CMakeLists.txt` lives at
+the repository root.
 
-For this repository, use `PROJECT_SUBDIR=.` because the top-level `CMakeLists.txt` lives at the repository root.
-
-Edit `.env`:
 ```bash
 SSH_USER=your-username              # Default SSH user
 REPO_URL=https://github.com/.../crown.git
@@ -173,8 +193,17 @@ PROJECT_SUBDIR=.                    # repo root
 PROJECT_MODE=crown                  # or craq
 TMUX_SOCKET=/tmp/crown-shared/tmux.sock
 RUN_SCOPE=shared
-NODE_PORT=5001
+NODE_PORT=50051
+
+# Metadata store
+METADATA_HOST=sp26-cs525-1201.cs.illinois.edu   # which prod VM runs the metadata store
+METADATA_PORT=50050
+METADATA_CONFIG=config.json                      # config the metadata server loads + pushes
 ```
+
+Host inventory files (one host per line, trailing comma OK, `#` comments ignored):
+- `prod_hosts.csv`   — server-node VMs (one also runs the metadata store).
+- `client_hosts.csv` — client-only VMs (benchmark drivers).
 
 ## Multi-User Multi-Node Example
 
@@ -293,3 +322,9 @@ cd crown/setup
 | TMUX_SOCKET | /tmp/crown-shared/tmux.sock | /tmp/crown-shared/tmux.sock | Shared tmux socket path |
 | RUN_SCOPE | shared | shared | Run directory scope under run/ |
 | SSH_USER | (required) | alice | SSH user for all VMs |
+| METADATA_HOST | (required for start-metadata) | sp26-cs525-1201.cs.illinois.edu | VM that runs the metadata store |
+| METADATA_PORT | 50050 | 50050 | metadata_server gRPC port |
+| METADATA_CONFIG | config.json | build/prod_configs/config.crown.json | config the metadata server loads + pushes |
+| METADATA_PING_INTERVAL_MS | 1000 | 500 | ping interval for the failure detector |
+| METADATA_PING_TIMEOUT_MS | 500 | 300 | per-ping deadline |
+| METADATA_FAILURE_THRESHOLD | 3 | 5 | consecutive missed pings → node DOWN |

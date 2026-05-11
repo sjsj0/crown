@@ -158,6 +158,20 @@ public:
         return grpc::Status::OK;
     }
 
+    // ----------------------------------------------------------
+    // Liveness probe — answered by metadata_server's failure detector.
+    // Works even before Configure: liveness is independent of topology.
+    // ----------------------------------------------------------
+
+    grpc::Status Ping(grpc::ServerContext*       /*ctx*/,
+                      const chain::PingRequest*  req,
+                      chain::PingResponse*       resp) override {
+        resp->set_node_id(strategy_ ? node_.node_index() : -1);
+        resp->set_seq(req->seq());
+        resp->set_configured(strategy_ != nullptr);
+        return grpc::Status::OK;
+    }
+
 private:
     Node                            node_;
     unique_ptr<ReplicationStrategy> strategy_;   // null until Configure is called

@@ -112,7 +112,40 @@ message VersionQueryResponse {
 }
 
 // ============================================================
-// Service
+// Liveness — metadata_server pings each node
+// ============================================================
+
+message PingRequest {
+    uint64 seq = 1; // monotonically increasing sequence from the pinger
+}
+
+message PingResponse {
+    int32  node_id    = 1; // node's configured id, or -1 if not configured yet
+    uint64 seq        = 2; // echoed back
+    bool   configured = 3; // true once a Configure RPC has been applied
+}
+
+// ============================================================
+// Metadata store — cluster topology + liveness, queried by clients
+// ============================================================
+
+message NodeStatus {
+    int32       node_id = 1;
+    NodeAddress addr    = 2;
+    bool        alive   = 3;
+    bool        is_head = 4;
+    bool        is_tail = 5;
+    optional NodeAddress predecessor = 6;
+    optional NodeAddress successor   = 7;
+}
+
+message ClusterState {
+    ReplicationMode    mode  = 1;
+    repeated NodeStatus nodes = 2;
+}
+
+// ============================================================
+// Services
 // ============================================================
 
 service ChainNode {
@@ -127,4 +160,12 @@ service ChainNode {
 
     // CRAQ only
     rpc VersionQuery (VersionQueryRequest) returns (VersionQueryResponse);
+
+    // metadata_server -> Node liveness probe
+    rpc Ping         (PingRequest)         returns (PingResponse);
+}
+
+service MetadataStore {
+    // Clients fetch the current topology + liveness from here.
+    rpc GetCluster (google.protobuf.Empty) returns (ClusterState);
 }
