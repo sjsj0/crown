@@ -35,10 +35,15 @@ if [[ -n "${SSH_KEY_LOCAL:-}" && -f "${SSH_KEY_LOCAL:-/dev/null}" ]]; then
 fi
 
 # --- host inventory ---------------------------------------------------------
-# prod_hosts.csv  : VMs that run server nodes (one of them also runs metadata).
+# prod_hosts.csv  : VMs that run server nodes (one of them often also runs metadata).
 # client_hosts.csv: VMs that run only the client binary (benchmark drivers).
-# The repo is built on the UNION of both; servers/metadata only start on the
-# relevant subset.
+# $METADATA_HOST  : VM that runs the metadata_server (may be one of the above,
+#                   or a host listed in neither file).
+# Dependency setup + teardown cover prod_hosts ∪ client_hosts ∪ $METADATA_HOST;
+# `build`/`deploy`/`rerun` (which also start a node server) cover only
+# prod_hosts ∪ client_hosts so they don't spawn a stray server on a
+# metadata-only VM. The metadata_server's own deploy script clones + builds the
+# repo on $METADATA_HOST itself.
 read_hosts_csv() {
   local file="$1"
   [[ -f "$file" ]] || return 0
@@ -48,13 +53,17 @@ read_hosts_csv() {
     | awk -F',' '{ gsub(/^[ \t]+|[ \t]+$/, "", $1); if ($1 != "") print $1 }'
 }
 
-mapfile -t prod_hosts   < <(read_hosts_csv "$SCRIPT_DIR/prod_hosts.csv")
-mapfile -t client_hosts < <(read_hosts_csv "$SCRIPT_DIR/client_hosts.csv")
-mapfile -t all_hosts    < <(printf '%s\n' "${prod_hosts[@]}" "${client_hosts[@]}" | awk 'NF' | sort -u)
+mapfile -t prod_hosts     < <(read_hosts_csv "$SCRIPT_DIR/prod_hosts.csv")
+mapfile -t client_hosts   < <(read_hosts_csv "$SCRIPT_DIR/client_hosts.csv")
+mapfile -t all_hosts      < <(printf '%s\n' "${prod_hosts[@]}" "${client_hosts[@]}" | awk 'NF' | sort -u)
+# prod ∪ client ∪ metadata host -- the full set of VMs that need build deps /
+# get torn down (the metadata host may not appear in either CSV).
+mapfile -t all_hosts_meta < <(printf '%s\n' "${all_hosts[@]}" "${METADATA_HOST:-}" | awk 'NF' | sort -u)
 
 usage() {
   echo "Usage: $0 <setup|start|start-servers|start-metadata|build|deploy|rerun|kill>"
-  echo "  setup|build|deploy|rerun : run on prod_hosts.csv ∪ client_hosts.csv"
+  echo "  setup                    : install build deps on prod_hosts.csv ∪ client_hosts.csv ∪ \$METADATA_HOST"
+  echo "  build|deploy|rerun       : clone/build (+ start a node server) on prod_hosts.csv ∪ client_hosts.csv"
   echo "  start                    : start a server node on each prod_hosts.csv VM, then the metadata_server on \$METADATA_HOST"
   echo "  start-servers            : start a server node on each prod_hosts.csv VM only (skip the metadata_server)"
   echo "  start-metadata           : start the metadata_server on \$METADATA_HOST only"
@@ -103,8 +112,8 @@ fi
 ACTION="$1"
 case "$ACTION" in
   setup)
-    [[ ${#all_hosts[@]} -gt 0 ]] || { echo "No target hosts (check prod_hosts.csv / client_hosts.csv)."; exit 1; }
-    for host in "${all_hosts[@]}"; do deploy_to_host "$SCRIPT_DIR/setup.bash" "$host" "$ACTION"; done
+    [[ ${#all_hosts_meta[@]} -gt 0 ]] || { echo "No target hosts (check prod_hosts.csv / client_hosts.csv / METADATA_HOST)."; exit 1; }
+    for host in "${all_hosts_meta[@]}"; do deploy_to_host "$SCRIPT_DIR/setup.bash" "$host" "$ACTION"; done
     ;;
   build|deploy)
     [[ ${#all_hosts[@]} -gt 0 ]] || { echo "No target hosts (check prod_hosts.csv / client_hosts.csv)."; exit 1; }
@@ -128,11 +137,8 @@ case "$ACTION" in
     deploy_to_host "$SCRIPT_DIR/start_metadata.bash" "$METADATA_HOST" "$ACTION"
     ;;
   kill)
-    # Stop everything on the union of the host files plus the metadata host
-    # (which may live outside both CSVs).
-    mapfile -t kill_hosts < <(printf '%s\n' "${all_hosts[@]}" "${METADATA_HOST:-}" | awk 'NF' | sort -u)
-    [[ ${#kill_hosts[@]} -gt 0 ]] || { echo "No target hosts (check prod_hosts.csv / client_hosts.csv)."; exit 1; }
-    for host in "${kill_hosts[@]}"; do deploy_to_host "$SCRIPT_DIR/kill.bash" "$host" "$ACTION"; done
+    [[ ${#all_hosts_meta[@]} -gt 0 ]] || { echo "No target hosts (check prod_hosts.csv / client_hosts.csv / METADATA_HOST)."; exit 1; }
+    for host in "${all_hosts_meta[@]}"; do deploy_to_host "$SCRIPT_DIR/kill.bash" "$host" "$ACTION"; done
     ;;
   *)
     echo "Invalid action: $ACTION"
