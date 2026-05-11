@@ -260,7 +260,7 @@ void ChainStyleReplicationSupport::enqueue_predecessor_ack(const chain::AckReque
 void ChainStyleReplicationSupport::start_ack_workers() {
     stop_ack_workers();
 
-    // Start propagate workers (using existing pattern)
+    // Start propagate workers with retry support
     {
         lock_guard<mutex> lk(prop_queue_mtx_);
         size_t workers = std::thread::hardware_concurrency();
@@ -273,22 +273,13 @@ void ChainStyleReplicationSupport::start_ack_workers() {
         }
     }
 
-    // Start ACK workers (2 threads for client + predecessor ACKs)
-    {
-        lock_guard<mutex> lk(ack_queue_mtx_);
-        ack_workers_.reserve(2);
-        for (int i = 0; i < 2; ++i) {
-            ack_workers_.emplace_back([this]() { ack_worker_loop(); });
-        }
-    }
-
-    // Start retry scheduler (single thread for all retries)
+    // Start retry scheduler (handles propagate retries)
     {
         lock_guard<mutex> lk(retry_queue_mtx_);
         retry_scheduler_thread_ = make_shared<thread>([this]() { retry_scheduler_loop(); });
     }
 
-    // Legacy predecessor ACK worker
+    // Start predecessor ACK worker (inter-node ACK with retry)
     pred_ack_worker_running_.store(true, memory_order_release);
     pred_ack_worker_thread_ = make_shared<thread>([this] { predecessor_ack_worker_loop(); });
 }
@@ -297,23 +288,12 @@ void ChainStyleReplicationSupport::stop_ack_workers() {
     // Stop propagate workers
     {
         lock_guard<mutex> lk(prop_queue_mtx_);
-        // Signal workers to exit by making them check an empty queue after notify
     }
     prop_queue_cv_.notify_all();
     for (auto& worker : prop_workers_) {
         if (worker.joinable()) worker.join();
     }
     prop_workers_.clear();
-
-    // Stop ACK workers
-    {
-        lock_guard<mutex> lk(ack_queue_mtx_);
-    }
-    ack_queue_cv_.notify_all();
-    for (auto& worker : ack_workers_) {
-        if (worker.joinable()) worker.join();
-    }
-    ack_workers_.clear();
 
     // Stop retry scheduler
     {
@@ -325,7 +305,7 @@ void ChainStyleReplicationSupport::stop_ack_workers() {
     }
     retry_scheduler_thread_.reset();
 
-    // Legacy predecessor ACK worker
+    // Stop predecessor ACK worker
     pred_ack_worker_running_.store(false, memory_order_release);
     pred_ack_queue_cv_.notify_one();
     if (pred_ack_worker_thread_ && pred_ack_worker_thread_->joinable()) {
@@ -350,28 +330,11 @@ void ChainStyleReplicationSupport::enqueue_propagate(
     prop_queue_cv_.notify_one();
 }
 
-void ChainStyleReplicationSupport::enqueue_client_ack(const chain::AckRequest& req) {
-    {
-        lock_guard<mutex> lk(ack_queue_mtx_);
-        ack_queue_.push(AckTask{req, false, 0});
-    }
-    ack_queue_cv_.notify_one();
-}
-
 void ChainStyleReplicationSupport::schedule_propagate_retry(PropagateTask task, int backoff_seconds) {
     {
         lock_guard<mutex> lk(retry_queue_mtx_);
         auto retry_time = chrono::steady_clock::now() + chrono::seconds(backoff_seconds);
-        retry_queue_.push(RetryEntry{retry_time, true, task});
-    }
-    retry_queue_cv_.notify_one();
-}
-
-void ChainStyleReplicationSupport::schedule_ack_retry(AckTask task, int backoff_seconds) {
-    {
-        lock_guard<mutex> lk(retry_queue_mtx_);
-        auto retry_time = chrono::steady_clock::now() + chrono::seconds(backoff_seconds);
-        retry_queue_.push(RetryEntry{retry_time, false, task});
+        retry_queue_.push(RetryEntry{retry_time, task});
     }
     retry_queue_cv_.notify_one();
 }
@@ -412,66 +375,6 @@ void ChainStyleReplicationSupport::propagate_worker_loop() {
     }
 }
 
-void ChainStyleReplicationSupport::ack_worker_loop() {
-    static constexpr int kMaxRetryAttempts = 3;
-    static constexpr int kBackoffs[] = {15, 45, 90};
-
-    while (true) {
-        AckTask task;
-        {
-            unique_lock<mutex> lk(ack_queue_mtx_);
-            ack_queue_cv_.wait(lk, [this] { return !ack_queue_.empty(); });
-            if (ack_queue_.empty()) break;
-            task = std::move(ack_queue_.front());
-            ack_queue_.pop();
-        }
-
-        google::protobuf::Empty ignored;
-        grpc::ClientContext ctx;
-        grpc::Status status;
-
-        if (task.is_pred_ack) {
-            auto pred = predecessor_stub();
-            if (!pred) {
-                cerr << "[Support] ACK (pred) skipped: no predecessor stub\n";
-                continue;
-            }
-            status = pred->Ack(&ctx, task.req, &ignored);
-        } else {
-            auto stub = get_or_create_client_stub(task.req.client_addr());
-            if (!stub) {
-                cerr << "[Support] ACK (client) skipped: no client stub\n";
-                continue;
-            }
-            status = stub->Ack(&ctx, task.req, &ignored);
-        }
-
-        if (!status.ok()) {
-            const char* ack_type = task.is_pred_ack ? "pred" : "client";
-            cerr << "[Support] ACK (" << ack_type << ") attempt " << (task.attempt + 1)
-                 << " failed key='" << task.req.key() << "' version=" << task.req.version()
-                 << ": " << status.error_message() << "\n";
-
-            if (task.attempt < kMaxRetryAttempts) {
-                task.attempt += 1;
-                int backoff = kBackoffs[task.attempt - 1];
-                schedule_ack_retry(task, backoff);
-            } else {
-                const char* ack_type_long = task.is_pred_ack ? "predecessor" : "client";
-                cerr << "[Support] ACK (" << ack_type_long << ") dropped after " << (task.attempt + 1)
-                     << " attempts key='" << task.req.key() << "' version=" << task.req.version() << "\n";
-            }
-
-            // On client ACK failure, drop the cached stub to force reconnect
-            if (!task.is_pred_ack && task.attempt == 0) {
-                lock_guard<mutex> lk(client_stub_cache_mtx_);
-                client_stubs_.erase(task.req.client_addr());
-                client_channels_.erase(task.req.client_addr());
-            }
-        }
-    }
-}
-
 void ChainStyleReplicationSupport::retry_scheduler_loop() {
     while (true) {
         chrono::steady_clock::time_point next_deadline;
@@ -489,46 +392,32 @@ void ChainStyleReplicationSupport::retry_scheduler_loop() {
             next_deadline = top.retry_after;
         }
 
-        // Wait until deadline or until new retries added (with 1s max timeout)
+        // Wait until deadline or until new retries added
         {
             unique_lock<mutex> lk(retry_queue_mtx_);
             retry_queue_cv_.wait_until(lk, next_deadline);
         }
 
-        // Move ready retries back to work queues
+        // Move ready retries back to propagate work queue
         vector<RetryEntry> ready;
         {
             unique_lock<mutex> lk(retry_queue_mtx_);
             auto now = chrono::steady_clock::now();
 
             while (!retry_queue_.empty() && retry_queue_.top().retry_after <= now) {
-                ready.push_back(std::move(const_cast<RetryEntry&>(retry_queue_.top())));
+                ready.push_back(retry_queue_.top());
                 const_cast<priority_queue<RetryEntry, vector<RetryEntry>, greater<RetryEntry> >&>(
                     retry_queue_).pop();
             }
         }
 
-        // Enqueue ready retries back to their respective work queues
-        for (auto& entry : ready) {
-            if (entry.is_propagate) {
-                PropagateTask* task = std::get_if<PropagateTask>(&entry.task);
-                if (task) {
-                    {
-                        lock_guard<mutex> lk(prop_queue_mtx_);
-                        prop_queue_.push(std::move(*task));
-                    }
-                    prop_queue_cv_.notify_one();
-                }
-            } else {
-                AckTask* task = std::get_if<AckTask>(&entry.task);
-                if (task) {
-                    {
-                        lock_guard<mutex> lk(ack_queue_mtx_);
-                        ack_queue_.push(std::move(*task));
-                    }
-                    ack_queue_cv_.notify_one();
-                }
+        // Enqueue ready retries back to propagate work queue
+        if (!ready.empty()) {
+            lock_guard<mutex> lk(prop_queue_mtx_);
+            for (auto& entry : ready) {
+                prop_queue_.push(entry.task);
             }
+            prop_queue_cv_.notify_all();
         }
     }
 }

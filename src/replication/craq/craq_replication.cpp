@@ -62,7 +62,7 @@ chain::WriteResponse CRAQReplication::handle_write(const chain::WriteRequest& re
         ack.set_version(version);
         ack.set_client_addr(req.client_addr());
         ack.set_request_id(req.request_id());
-        support_.enqueue_client_ack(ack);
+        support_.send_client_ack(ack);
 
         return resp;
     }
@@ -155,7 +155,7 @@ void CRAQReplication::handle_propagate(const chain::PropagateRequest& req, Node&
         client_ack.set_version(req.version());
         client_ack.set_client_addr(req.client_addr());
         client_ack.set_request_id(req.request_id());
-        support_.enqueue_client_ack(client_ack);
+        support_.send_client_ack(client_ack);
 
         if (!node.is_head()) {
             chain::AckRequest ack;

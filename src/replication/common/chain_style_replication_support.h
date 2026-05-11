@@ -73,15 +73,15 @@ public:
     std::shared_ptr<chain::ChainNode::Stub> successor_stub() const;
     std::shared_ptr<chain::ChainNode::Stub> tail_stub() const;
 
-    // Enqueue propagate for async fire-with-retry to successor.
+    // Enqueue propagate for async fire-with-retry to successor (inter-node).
     void enqueue_propagate(std::shared_ptr<chain::ChainNode::Stub> successor,
                           chain::PropagateRequest req,
                           std::string from_node);
 
-    // Enqueue client ACK for async delivery with retry.
-    void enqueue_client_ack(const chain::AckRequest& req);
+    // Send client ACK synchronously (final confirmation, needs to be fast).
+    void send_client_ack(const chain::AckRequest& req);
 
-    // Enqueue predecessor ACK for background delivery with retry.
+    // Enqueue predecessor ACK for async delivery with retry (inter-node).
     void enqueue_predecessor_ack(const chain::AckRequest& req);
 
     // Start and stop background worker threads (propagate, ACK, retry scheduler).
@@ -89,9 +89,6 @@ public:
     void stop_ack_workers();
 
 private:
-    // Send client ACK synchronously (called by async ACK worker).
-    void send_client_ack(const chain::AckRequest& req);
-
     std::shared_ptr<chain::ChainNode::Stub> get_or_create_client_stub(const std::string& client_addr);
 
     // Propagate dispatcher structures and worker
@@ -102,16 +99,9 @@ private:
         int attempt = 0;
     };
 
-    struct AckTask {
-        chain::AckRequest req;
-        bool is_pred_ack = false;  // false = client, true = predecessor
-        int attempt = 0;
-    };
-
     struct RetryEntry {
         std::chrono::steady_clock::time_point retry_after;
-        bool is_propagate;  // true = PropagateTask, false = AckTask
-        std::variant<PropagateTask, AckTask> task;
+        PropagateTask task;
 
         bool operator>(const RetryEntry& o) const { return retry_after > o.retry_after; }
     };
@@ -124,15 +114,6 @@ private:
     std::condition_variable prop_queue_cv_;
     std::queue<PropagateTask> prop_queue_;
     std::vector<std::thread> prop_workers_;
-
-    // ACK workers and queue
-    void ack_worker_loop();
-    void schedule_ack_retry(AckTask task, int backoff_seconds);
-
-    std::mutex ack_queue_mtx_;
-    std::condition_variable ack_queue_cv_;
-    std::queue<AckTask> ack_queue_;
-    std::vector<std::thread> ack_workers_;
 
     // Retry scheduler
     void retry_scheduler_loop();

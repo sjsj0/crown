@@ -52,7 +52,7 @@ chain::WriteResponse ChainReplication::handle_write(const chain::WriteRequest& r
         ack.set_version(version);
         ack.set_client_addr(req.client_addr());
         ack.set_request_id(req.request_id());
-        support_.enqueue_client_ack(ack);
+        support_.send_client_ack(ack);
 
         return resp;
     }
@@ -109,7 +109,7 @@ void ChainReplication::handle_propagate(const chain::PropagateRequest& req, Node
         ack.set_version(req.version());
         ack.set_client_addr(req.client_addr());
         ack.set_request_id(req.request_id());
-        support_.enqueue_client_ack(ack);
+        support_.send_client_ack(ack);
         return;
     }
 
