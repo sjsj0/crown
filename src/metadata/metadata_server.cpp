@@ -46,7 +46,7 @@ namespace {
 struct Options {
     string config_path       = "config.json";
     string bind_host         = "0.0.0.0";
-    string external_host     = "sp26-cs525-1220.cs.illinois.edu";     // address that nodes use to reach this server
+    string external_host     = "172.22.154.121";     // address that nodes use to reach this server
     int    bind_port         = 50050;
     int    ping_interval_ms  = 1000;
     int    ping_timeout_ms   = 1000;
