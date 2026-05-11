@@ -307,16 +307,17 @@ void ChainStyleReplicationSupport::start_ack_workers() {
 }
 
 void ChainStyleReplicationSupport::stop_ack_workers() {
-    // Stop propagate workers: signal stopping flag then wake all waiters
+    // Signal all workers to stop (must stay true until all are joined)
     workers_stopping_.store(true, memory_order_release);
+
+    // Stop propagate workers
     prop_queue_cv_.notify_all();
     for (auto& worker : prop_workers_) {
         if (worker.joinable()) worker.join();
     }
     prop_workers_.clear();
-    workers_stopping_.store(false, memory_order_release);
 
-    // Stop retry scheduler
+    // Stop retry scheduler (uses workers_stopping_ in its wait predicate)
     retry_queue_cv_.notify_one();
     if (retry_scheduler_thread_ && retry_scheduler_thread_->joinable()) {
         retry_scheduler_thread_->join();
@@ -330,6 +331,9 @@ void ChainStyleReplicationSupport::stop_ack_workers() {
         pred_ack_worker_thread_->join();
     }
     pred_ack_worker_thread_.reset();
+
+    // Reset after all workers have exited
+    workers_stopping_.store(false, memory_order_release);
 }
 
 void ChainStyleReplicationSupport::enqueue_propagate(
