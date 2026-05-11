@@ -1004,8 +1004,12 @@ int main(int argc, char** argv) {
          << " threshold=" << opt.failure_threshold << ")\n";
 
     // --- Build reconfigure orchestrator ---
-    // Use a routable host (not 0.0.0.0) for nodes to send InflightAck back.
-    const string meta_addr_for_nodes = (opt.bind_host == "0.0.0.0") ? "127.0.0.1" : opt.bind_host;
+    // Use advertised host (or fallback to bind_host) for nodes to send InflightAck back.
+    string meta_addr_for_nodes = opt.external_host;
+    if (meta_addr_for_nodes.empty() || meta_addr_for_nodes == opt.bind_host) {
+        // Fallback: if bind_host is 0.0.0.0, use 127.0.0.1 (local); otherwise use bind_host
+        meta_addr_for_nodes = (opt.bind_host == "0.0.0.0") ? "127.0.0.1" : opt.bind_host;
+    }
     ReconfigOrchestrator orchestrator(&state, meta_addr_for_nodes, opt.bind_port);
 
     // Wire automatic failure-triggered reconfig

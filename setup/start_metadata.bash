@@ -208,7 +208,7 @@ if [[ -f "$PID_FILE" ]]; then
     sleep 1
   fi
 fi
-pkill -u "$DEPLOY_USER" -f "metadata_server .*--port $META_PORT" >/dev/null 2>&1 || true
+pkill -u "$DEPLOY_USER" -f "metadata_server .*--port $META_PORT --external-host 172.22.154.121" >/dev/null 2>&1 || true
 
 META_CMD="cd '$PROJECT_DIR' && exec '$META_BIN' --config '$META_CONFIG' --host '$META_HOST' --port '$META_PORT' --ping-interval-ms '$PING_INTERVAL_MS' --ping-timeout-ms '$PING_TIMEOUT_MS' --failure-threshold '$FAILURE_THRESHOLD' --log"
 echo "Run command: $META_CMD"
