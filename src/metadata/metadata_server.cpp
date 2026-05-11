@@ -46,7 +46,7 @@ namespace {
 struct Options {
     string config_path       = "config.json";
     string bind_host         = "0.0.0.0";
-    string external_host     = "172.22.154.121";     // address that nodes use to reach this server
+    string external_host     = "";     // address that nodes use to reach this server (empty = auto-detect)
     int    bind_port         = 50050;
     int    ping_interval_ms  = 1000;
     int    ping_timeout_ms   = 1000;
@@ -1024,6 +1024,8 @@ int main(int argc, char** argv) {
     MetadataStoreServiceImpl service(state, orchestrator);
     const string bind_addr = opt.bind_host + ":" + to_string(opt.bind_port);
     grpc::ServerBuilder builder;
+    // Try to bind to IPv4; disable SO_REUSEPORT to avoid IPv6 binding issues
+    builder.AddChannelArgument("grpc.so_reuseport", 0);
     builder.AddListeningPort(bind_addr, grpc::InsecureServerCredentials());
     builder.RegisterService(&service);
     unique_ptr<grpc::Server> server = builder.BuildAndStart();

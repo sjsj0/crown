@@ -171,6 +171,7 @@ fi
 META_HOST="${METADATA_BIND_HOST:-0.0.0.0}"
 META_PORT="${METADATA_PORT:-50050}"
 META_CONFIG="${METADATA_CONFIG:-config.json}"
+META_EXTERNAL_HOST="${METADATA_EXTERNAL_HOST:-172.22.154.121}"
 PING_INTERVAL_MS="${METADATA_PING_INTERVAL_MS:-1000}"
 PING_TIMEOUT_MS="${METADATA_PING_TIMEOUT_MS:-500}"
 FAILURE_THRESHOLD="${METADATA_FAILURE_THRESHOLD:-3}"
@@ -208,9 +209,15 @@ if [[ -f "$PID_FILE" ]]; then
     sleep 1
   fi
 fi
-pkill -u "$DEPLOY_USER" -f "metadata_server .*--port $META_PORT --external-host 172.22.154.121" >/dev/null 2>&1 || true
+# Kill any existing metadata_server on this port
+pkill -u "$DEPLOY_USER" -f "metadata_server .*--port $META_PORT" >/dev/null 2>&1 || true
 
-META_CMD="cd '$PROJECT_DIR' && exec '$META_BIN' --config '$META_CONFIG' --host '$META_HOST' --port '$META_PORT' --ping-interval-ms '$PING_INTERVAL_MS' --ping-timeout-ms '$PING_TIMEOUT_MS' --failure-threshold '$FAILURE_THRESHOLD' --log"
+META_EXTERNAL_FLAG=""
+if [[ -n "$META_EXTERNAL_HOST" ]]; then
+  META_EXTERNAL_FLAG="--external-host '$META_EXTERNAL_HOST'"
+fi
+
+META_CMD="cd '$PROJECT_DIR' && exec '$META_BIN' --config '$META_CONFIG' --host '$META_HOST' --port '$META_PORT' $META_EXTERNAL_FLAG --ping-interval-ms '$PING_INTERVAL_MS' --ping-timeout-ms '$PING_TIMEOUT_MS' --failure-threshold '$FAILURE_THRESHOLD' --log"
 echo "Run command: $META_CMD"
 printf '[launch] %s\n' "$META_CMD" | tee -a "$LOG_FILE" >> "$OUT_FILE"
 "${TMUX_CMD[@]}" new-session -d -s "$SESSION_NAME" "$META_CMD"
