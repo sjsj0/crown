@@ -8,7 +8,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, List, Sequence
+from typing import IO, List, Optional, Sequence
 
 
 class RunnerError(RuntimeError):
@@ -43,6 +43,8 @@ class RunnerConfig:
 
     key_prefix_base: str
     value_prefix_base: str
+    key_prefix_exact: Optional[str]
+    value_prefix_exact: Optional[str]
     ack_base_port: int
 
     dry_run: bool
@@ -191,6 +193,16 @@ def parse_args(root_dir: Path) -> argparse.Namespace:
 
     p.add_argument("--key-prefix-base", default=env_str("KEY_PREFIX_BASE", "bench-key"))
     p.add_argument("--value-prefix-base", default=env_str("VALUE_PREFIX_BASE", "bench-value"))
+    p.add_argument(
+        "--key-prefix-exact",
+        default=env_str("KEY_PREFIX_EXACT", ""),
+        help="Exact benchmark key prefix. When set, mode/op suffixes are not appended.",
+    )
+    p.add_argument(
+        "--value-prefix-exact",
+        default=env_str("VALUE_PREFIX_EXACT", ""),
+        help="Exact benchmark value prefix. When set, mode/op suffixes are not appended.",
+    )
     p.add_argument("--ack-base-port", type=int, default=env_int("ACK_BASE_PORT", 61000))
 
     p.add_argument(
@@ -318,6 +330,8 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
         remote_log_dir=args.remote_log_dir,
         key_prefix_base=args.key_prefix_base,
         value_prefix_base=args.value_prefix_base,
+        key_prefix_exact=args.key_prefix_exact.strip() or None,
+        value_prefix_exact=args.value_prefix_exact.strip() or None,
         ack_base_port=args.ack_base_port,
         dry_run=args.dry_run,
         fail_fast=args.fail_fast,
@@ -346,8 +360,8 @@ def build_remote_client_command(
     # The client fetches topology (and the actual replication mode) from the
     # metadata server. The `mode` here is only a label for prefixes / filenames;
     # make sure the running metadata server is configured with that mode.
-    key_prefix = f"{cfg.key_prefix_base}-{mode}-{op}-"
-    value_prefix = f"{cfg.value_prefix_base}-{mode}-{op}-"
+    key_prefix = cfg.key_prefix_exact or f"{cfg.key_prefix_base}-{mode}-{op}-"
+    value_prefix = cfg.value_prefix_exact or f"{cfg.value_prefix_base}-{mode}-{op}-"
 
     cmd = [
         cfg.remote_client_bin,

@@ -237,7 +237,112 @@ Key args: `--metadata host:port` (default `$METADATA_HOST:$METADATA_PORT`), `--h
 
 ---
 
-## 7) Switch replication mode
+## 7) Chain-length throughput experiment runner
+
+Runs the full chain-length experiment grid from your laptop by SSHing into the
+server/client VMs. The script generates mode configs, kills/restarts remote
+servers and metadata, runs the distributed client benchmark, collects logs, and
+writes CSVs locally.
+
+```bash
+# preview every SSH/SCP/benchmark command without touching remote machines
+python3 setup/run_chain_length_experiments.py --dry-run
+
+# full default run
+python3 setup/run_chain_length_experiments.py
+```
+
+Default experiment grid:
+
+- chain lengths: `3 5 7`
+- modes: `chain craq crown`
+- client counts: `1 3 5`
+- operations: `write read`
+- trials: `3`
+- unique keys per benchmark run: `64`
+- total writes per write benchmark run: `50000`
+- total reads per read benchmark run: `50000`
+
+That is `3 * 3 * 3 * 2 * 3 = 162` benchmark runs. Each benchmark
+run gets a full kill/start cycle before it runs. A benchmark run is one
+operation for one tuple, e.g. `n=5, mode=crown, clients=3, op=write, trial=2`.
+
+Quick smoke run:
+
+```bash
+python3 setup/run_chain_length_experiments.py \
+  --chain-lengths 3 --modes crown --client-counts 1 --trials 3 \
+  --key-count 8 --write-op-count 100 --read-op-count 100
+```
+
+Custom workload size:
+
+```bash
+python3 setup/run_chain_length_experiments.py \
+  --chain-lengths 3 5 7 \
+  --client-counts 1 3 5 \
+  --trials 3 \
+  --key-count 128 \
+  --write-op-count 100000 \
+  --read-op-count 100000
+```
+
+Inputs picked up from files / environment:
+
+- `setup/.env`: `SSH_USER`, `SSH_KEY_LOCAL`, `REPO_URL`, `REPO_BRANCH`,
+  `REMOTE_BASE_DIR`, `REPO_NAME`, `PROJECT_SUBDIR`, `REMOTE_REPO_DIR`,
+  `METADATA_HOST`, `METADATA_PORT`, `NODE_PORT`, `TMUX_SOCKET`, and related
+  deployment settings.
+- `setup/prod_hosts.csv`: server inventory. For chain length `N`, the script
+  uses the first `N` hosts. The default grid requires at least 7 server hosts.
+- `setup/client_hosts.csv`: client inventory. For client count `C`, the script
+  uses the first `C` hosts. The default grid requires at least 5 client hosts.
+
+Inputs from code defaults unless overridden:
+
+- `--work-dir build/chain_length_throughput_runs`
+- `--chain-lengths 3 5 7`
+- `--modes chain craq crown`
+- `--client-counts 1 3 5`
+- `--ops write read`
+- `--trials 3`
+- `--key-count 64`
+- `--write-op-count 50000`
+- `--read-op-count 50000`
+- `--stabilization-seconds 3`
+
+Outputs:
+
+- `build/chain_length_throughput_runs/raw_trials.csv` — one row per operation
+  per trial, with labels such as `chain_length`, `mode`, `operation`,
+  `client_count`, `trial`, `key_count`, `op_count`, server/client host lists,
+  config path, and source log path.
+- `build/chain_length_throughput_runs/summary_by_chain_length.csv` — grouped
+  rows with `throughput_mean`, `throughput_stddev`, `latency_mean_ms`, and
+  `latency_stddev_ms` for graph error bars.
+- Per-case logs under `build/chain_length_throughput_runs/cases/`.
+- Lifecycle SSH/SCP logs under `build/chain_length_throughput_runs/lifecycle_logs/`.
+
+The per-benchmark key/value prefixes are exact and identify the run:
+
+```text
+bench-n{chain_length}-{mode}-c{client_count}-t{trial}-{op}-
+value-n{chain_length}-{mode}-c{client_count}-t{trial}-{op}-
+```
+
+Yes: you run this script from your laptop/local checkout. The benchmark itself
+runs on the remote server/client VMs via SSH. Make sure you have already run
+the remote build on all server, client, and metadata hosts before the full run:
+
+```bash
+./setup/vm_setup.bash build
+python3 setup/run_chain_length_experiments.py --dry-run
+python3 setup/run_chain_length_experiments.py
+```
+
+---
+
+## 8) Switch replication mode
 
 Stop the metadata server and restart it with a different config; clients pick up the new mode on their next start.
 
@@ -250,7 +355,7 @@ METADATA_CONFIG=build/prod_configs/config.chain.json ./setup/vm_setup.bash start
 
 ---
 
-## 8) setup/.env keys (reference)
+## 9) setup/.env keys (reference)
 
 ```bash
 SSH_USER=<netid>
