@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 PROD_HOST_PREFIX = "sp26-cs525-"
-PROD_HOST_START = 1201
+PROD_HOST_START = 1212
 PROD_HOST_SUFFIX = ".cs.illinois.edu"
 
 
