@@ -104,22 +104,54 @@ mkdir -p "$TMUX_SOCKET_DIR"
 chmod 1777 "$TMUX_SOCKET_DIR" 2>/dev/null || true
 TMUX_CMD=(tmux -S "$TMUX_SOCKET")
 
+# Aggressive cleanup of existing sessions and processes
 if "${TMUX_CMD[@]}" has-session -t "$SESSION_NAME" 2>/dev/null; then
   echo "Stopping existing tmux session: $SESSION_NAME"
   "${TMUX_CMD[@]}" kill-session -t "$SESSION_NAME" || true
-  sleep 1
+
+  # Wait for session to fully terminate (with retry)
+  for i in {1..10}; do
+    sleep 0.5
+    if ! "${TMUX_CMD[@]}" has-session -t "$SESSION_NAME" 2>/dev/null; then
+      echo "Tmux session killed after $(( i / 2 )) seconds"
+      break
+    fi
+    if [[ $i -eq 10 ]]; then
+      echo "WARNING: Tmux session still exists after 5 seconds, forcing cleanup..."
+      # Force kill the pane process
+      PANE_PID=$("${TMUX_CMD[@]}" display-message -p -t "$SESSION_NAME:0.0" "#{pane_pid}" 2>/dev/null || true)
+      if [[ -n "$PANE_PID" ]]; then
+        kill -9 "$PANE_PID" 2>/dev/null || true
+      fi
+      sleep 1
+    fi
+  done
 fi
 
+# Kill any lingering processes on the port
 if [[ -f "$PID_FILE" ]]; then
   OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
   if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
     echo "Stopping existing process pid=$OLD_PID"
     kill "$OLD_PID" || true
-    sleep 1
+    sleep 0.5
+    # Force kill if still running
+    kill -9 "$OLD_PID" 2>/dev/null || true
   fi
+  rm -f "$PID_FILE"
 fi
 
+# Catch-all: kill any server process on this port
 pkill -u "$DEPLOY_USER" -f "server --host .* --port $NODE_PORT" >/dev/null 2>&1 || true
+sleep 0.5
+pkill -9 -u "$DEPLOY_USER" -f "server --host .* --port $NODE_PORT" >/dev/null 2>&1 || true
+
+# Clean up stale tmux socket if session won't die
+if [[ -S "$TMUX_SOCKET" ]] && "${TMUX_CMD[@]}" has-session -t "$SESSION_NAME" 2>/dev/null; then
+  echo "WARNING: Stale tmux socket, removing and reconnecting..."
+  rm -f "$TMUX_SOCKET"
+  sleep 1
+fi
 
 SERVER_CMD="cd '$PROJECT_DIR' && exec '$NODE_BIN' --host '$NODE_HOST' --port '$NODE_PORT' --server-log '$SERVER_LOG'"
 echo "Run command: $SERVER_CMD"
