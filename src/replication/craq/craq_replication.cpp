@@ -24,95 +24,6 @@ string craq_node_label(const Node& node) {
     return node.self_addr().to_string();
 }
 
-struct PropagateTask {
-    std::shared_ptr<chain::ChainNode::Stub> successor;
-    chain::PropagateRequest req;
-    std::string from_node;
-};
-
-class PropagateDispatcher {
-public:
-    explicit PropagateDispatcher(const std::string& tag)
-        : tag_(tag) {
-        size_t workers = std::thread::hardware_concurrency();
-        if (workers == 0) workers = 4;
-        workers = std::min<size_t>(workers, 8);
-
-        workers_.reserve(workers);
-        for (size_t i = 0; i < workers; ++i) {
-            workers_.emplace_back([this]() { worker_loop(); });
-        }
-    }
-
-    ~PropagateDispatcher() {
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            stop_ = true;
-        }
-        cv_.notify_all();
-        for (auto& worker : workers_) {
-            if (worker.joinable()) worker.join();
-        }
-    }
-
-    void enqueue(std::shared_ptr<chain::ChainNode::Stub> successor,
-                 chain::PropagateRequest req,
-                 std::string from_node) {
-        if (!successor) {
-            cerr << tag_ << " Async PROPAGATE skipped from " << from_node
-                 << ": no successor stub\n";
-            return;
-        }
-
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            queue_.push(PropagateTask{std::move(successor), std::move(req), std::move(from_node)});
-        }
-        cv_.notify_one();
-    }
-
-private:
-    void worker_loop() {
-        while (true) {
-            PropagateTask task;
-            {
-                std::unique_lock<std::mutex> lk(mtx_);
-                cv_.wait(lk, [this]() { return stop_ || !queue_.empty(); });
-                if (stop_ && queue_.empty()) return;
-                task = std::move(queue_.front());
-                queue_.pop();
-            }
-
-            google::protobuf::Empty ignored;
-            grpc::ClientContext ctx;
-            grpc::Status status = task.successor->Propagate(&ctx, task.req, &ignored);
-            if (!status.ok()) {
-                cerr << tag_ << " Async PROPAGATE failed from " << task.from_node
-                     << " key='" << task.req.key() << "' version=" << task.req.version()
-                     << ": " << status.error_message() << "\n";
-            }
-        }
-    }
-
-    std::string tag_;
-    std::mutex mtx_;
-    std::condition_variable cv_;
-    std::queue<PropagateTask> queue_;
-    std::vector<std::thread> workers_;
-    bool stop_ = false;
-};
-
-PropagateDispatcher& craq_propagate_dispatcher() {
-    static PropagateDispatcher dispatcher("[CRAQ]");
-    return dispatcher;
-}
-
-void forward_propagate_async(std::shared_ptr<chain::ChainNode::Stub> successor,
-                             chain::PropagateRequest req,
-                             const std::string& from_node) {
-    craq_propagate_dispatcher().enqueue(std::move(successor), std::move(req), from_node);
-}
-
 chain::ReadResponse build_read_response(const std::string& key,
                                         const std::string& value,
                                         uint64_t version) {
@@ -151,7 +62,7 @@ chain::WriteResponse CRAQReplication::handle_write(const chain::WriteRequest& re
         ack.set_version(version);
         ack.set_client_addr(req.client_addr());
         ack.set_request_id(req.request_id());
-        support_.send_client_ack(ack);
+        support_.enqueue_client_ack(ack);
 
         return resp;
     }
@@ -165,7 +76,7 @@ chain::WriteResponse CRAQReplication::handle_write(const chain::WriteRequest& re
     fwd.set_request_id(req.request_id());
 
     auto succ = support_.successor_stub();
-    forward_propagate_async(succ, std::move(fwd), craq_node_label(node));
+    support_.enqueue_propagate(succ, std::move(fwd), craq_node_label(node));
 
     return resp;
 }
@@ -244,7 +155,7 @@ void CRAQReplication::handle_propagate(const chain::PropagateRequest& req, Node&
         client_ack.set_version(req.version());
         client_ack.set_client_addr(req.client_addr());
         client_ack.set_request_id(req.request_id());
-        support_.send_client_ack(client_ack);
+        support_.enqueue_client_ack(client_ack);
 
         if (!node.is_head()) {
             chain::AckRequest ack;
@@ -260,7 +171,7 @@ void CRAQReplication::handle_propagate(const chain::PropagateRequest& req, Node&
 
     auto succ = support_.successor_stub();
     chain::PropagateRequest fwd = req;
-    forward_propagate_async(succ, std::move(fwd), craq_node_label(node));
+    support_.enqueue_propagate(succ, std::move(fwd), craq_node_label(node));
 }
 
 void CRAQReplication::handle_ack(const chain::AckRequest& req, Node& node) {

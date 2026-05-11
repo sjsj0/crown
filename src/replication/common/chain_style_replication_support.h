@@ -7,9 +7,12 @@
 #include <unordered_map>
 #include <thread>
 #include <deque>
+#include <queue>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <variant>
+#include <chrono>
 
 #include <grpcpp/grpcpp.h>
 #include "chain.grpc.pb.h"
@@ -70,20 +73,76 @@ public:
     std::shared_ptr<chain::ChainNode::Stub> successor_stub() const;
     std::shared_ptr<chain::ChainNode::Stub> tail_stub() const;
 
-    // Send client ACK synchronously from caller context.
-    void send_client_ack(const chain::AckRequest& req);
+    // Enqueue propagate for async fire-with-retry to successor.
+    void enqueue_propagate(std::shared_ptr<chain::ChainNode::Stub> successor,
+                          chain::PropagateRequest req,
+                          std::string from_node);
 
-    // Enqueue predecessor ACK for background delivery.
+    // Enqueue client ACK for async delivery with retry.
+    void enqueue_client_ack(const chain::AckRequest& req);
+
+    // Enqueue predecessor ACK for background delivery with retry.
     void enqueue_predecessor_ack(const chain::AckRequest& req);
 
-    // Start and stop background ACK worker thread(s).
+    // Start and stop background worker threads (propagate, ACK, retry scheduler).
     void start_ack_workers();
     void stop_ack_workers();
 
 private:
+    // Send client ACK synchronously (called by async ACK worker).
+    void send_client_ack(const chain::AckRequest& req);
+
     std::shared_ptr<chain::ChainNode::Stub> get_or_create_client_stub(const std::string& client_addr);
 
-    // Worker thread entry point.
+    // Propagate dispatcher structures and worker
+    struct PropagateTask {
+        std::shared_ptr<chain::ChainNode::Stub> successor;
+        chain::PropagateRequest req;
+        std::string from_node;
+        int attempt = 0;
+    };
+
+    struct AckTask {
+        chain::AckRequest req;
+        bool is_pred_ack = false;  // false = client, true = predecessor
+        int attempt = 0;
+    };
+
+    struct RetryEntry {
+        std::chrono::steady_clock::time_point retry_after;
+        bool is_propagate;  // true = PropagateTask, false = AckTask
+        std::variant<PropagateTask, AckTask> task;
+
+        bool operator>(const RetryEntry& o) const { return retry_after > o.retry_after; }
+    };
+
+    // Propagate workers and queue
+    void propagate_worker_loop();
+    void schedule_propagate_retry(PropagateTask task, int backoff_seconds);
+
+    std::mutex prop_queue_mtx_;
+    std::condition_variable prop_queue_cv_;
+    std::queue<PropagateTask> prop_queue_;
+    std::vector<std::thread> prop_workers_;
+
+    // ACK workers and queue
+    void ack_worker_loop();
+    void schedule_ack_retry(AckTask task, int backoff_seconds);
+
+    std::mutex ack_queue_mtx_;
+    std::condition_variable ack_queue_cv_;
+    std::queue<AckTask> ack_queue_;
+    std::vector<std::thread> ack_workers_;
+
+    // Retry scheduler
+    void retry_scheduler_loop();
+
+    std::mutex retry_queue_mtx_;
+    std::priority_queue<RetryEntry, std::vector<RetryEntry>, std::greater<RetryEntry> > retry_queue_;
+    std::condition_variable retry_queue_cv_;
+    std::shared_ptr<std::thread> retry_scheduler_thread_;
+
+    // Worker thread entry points (legacy for predecessor ACK, kept for compatibility)
     void predecessor_ack_worker_loop();
 
     struct KeyState {
