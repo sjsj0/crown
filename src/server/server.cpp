@@ -80,6 +80,18 @@ public:
         node_.update_config(std::move(cfg));
         strategy_->on_config_change(node_);
 
+        // Apply any bootstrap data that arrived before strategy was ready
+        // (new node: BootstrapFromSource runs before first Configure)
+        {
+            std::lock_guard<std::mutex> lk(pending_dump_mtx_);
+            if (pending_dump_) {
+                strategy_->support()->load_from_dump(*pending_dump_);
+                cout << "[Server] Applied pending bootstrap dump ("
+                     << pending_dump_->entries_size() << " entries)\n";
+                pending_dump_.reset();
+            }
+        }
+
         // A Configure arriving during freeze means reconfig is complete —
         // resume accepting client writes.
         if (frozen_.exchange(false)) {
@@ -295,6 +307,11 @@ public:
 
             if (strategy_) {
                 strategy_->support()->load_from_dump(dump);
+            } else {
+                // Strategy not yet configured (Configure arrives after BootstrapFromSource).
+                // Buffer the dump; Configure handler will apply it.
+                std::lock_guard<std::mutex> lk(pending_dump_mtx_);
+                pending_dump_ = std::make_unique<chain::DataDump>(std::move(dump));
             }
 
             // Tell metadata we're ready
@@ -375,6 +392,9 @@ private:
     // metadata address is set on first Freeze or via --join; raw atomic ptr
     // (intentional small-leak on overwrite — only changes during reconfig)
     std::atomic<string*>            metadata_addr_{nullptr};
+    // Bootstrap data buffered when BootstrapFromSource arrives before Configure
+    std::mutex                      pending_dump_mtx_;
+    std::unique_ptr<chain::DataDump> pending_dump_;
 
     static unique_ptr<ReplicationStrategy> make_strategy(ReplicationMode mode) {
         switch (mode) {

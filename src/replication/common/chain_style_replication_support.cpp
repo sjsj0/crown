@@ -307,20 +307,16 @@ void ChainStyleReplicationSupport::start_ack_workers() {
 }
 
 void ChainStyleReplicationSupport::stop_ack_workers() {
-    // Stop propagate workers
-    {
-        lock_guard<mutex> lk(prop_queue_mtx_);
-    }
+    // Stop propagate workers: signal stopping flag then wake all waiters
+    workers_stopping_.store(true, memory_order_release);
     prop_queue_cv_.notify_all();
     for (auto& worker : prop_workers_) {
         if (worker.joinable()) worker.join();
     }
     prop_workers_.clear();
+    workers_stopping_.store(false, memory_order_release);
 
     // Stop retry scheduler
-    {
-        lock_guard<mutex> lk(retry_queue_mtx_);
-    }
     retry_queue_cv_.notify_one();
     if (retry_scheduler_thread_ && retry_scheduler_thread_->joinable()) {
         retry_scheduler_thread_->join();
@@ -369,8 +365,10 @@ void ChainStyleReplicationSupport::propagate_worker_loop() {
         PropagateTask task;
         {
             unique_lock<mutex> lk(prop_queue_mtx_);
-            prop_queue_cv_.wait(lk, [this] { return !prop_queue_.empty(); });
-            if (prop_queue_.empty()) break;
+            prop_queue_cv_.wait(lk, [this] {
+                return !prop_queue_.empty() || workers_stopping_.load(memory_order_acquire);
+            });
+            if (prop_queue_.empty()) break;  // empty + stopping (or spurious), exit
             task = std::move(prop_queue_.front());
             prop_queue_.pop();
         }
@@ -405,7 +403,9 @@ void ChainStyleReplicationSupport::retry_scheduler_loop() {
 
             // Wait until we have retries or shutdown
             if (retry_queue_.empty()) {
-                retry_queue_cv_.wait(lk, [this] { return !retry_queue_.empty(); });
+                retry_queue_cv_.wait(lk, [this] {
+                    return !retry_queue_.empty() || workers_stopping_.load(memory_order_acquire);
+                });
                 if (retry_queue_.empty()) break;
             }
 
@@ -523,6 +523,17 @@ void ChainStyleReplicationSupport::predecessor_ack_worker_loop() {
             pred_ack_queue_.pop_front();
         }
 
-        enqueue_predecessor_ack(req);
+        auto pred = predecessor_stub();
+        if (!pred) {
+            cerr << "[Support] Pred ACK dropped: no predecessor stub\n";
+            continue;
+        }
+        google::protobuf::Empty resp;
+        grpc::ClientContext ctx;
+        ctx.set_deadline(chrono::system_clock::now() + chrono::seconds(5));
+        grpc::Status st = pred->Ack(&ctx, req, &resp);
+        if (!st.ok()) {
+            cerr << "[Support] Pred ACK failed: " << st.error_message() << "\n";
+        }
     }
 }
