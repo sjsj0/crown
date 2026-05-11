@@ -161,8 +161,18 @@ def parse_args(root_dir: Path) -> argparse.Namespace:
     p.add_argument("--modes", nargs="+", default=env_words("MODES", "chain craq crown"))
     p.add_argument("--ops", nargs="+", default=env_words("OPS", "write read"))
 
-    p.add_argument("--write-op-count", type=int, default=env_int("WRITE_OP_COUNT", 50000))
-    p.add_argument("--read-op-count", type=int, default=env_int("READ_OP_COUNT", 50000))
+    p.add_argument(
+        "--write-op-count",
+        type=int,
+        default=env_int("WRITE_OP_COUNT", 50000),
+        help="Write operations per client process.",
+    )
+    p.add_argument(
+        "--read-op-count",
+        type=int,
+        default=env_int("READ_OP_COUNT", 50000),
+        help="Read operations per client process.",
+    )
     p.add_argument("--key-count", type=int, default=env_int("KEY_COUNT", 64))
     p.add_argument("--craq-read-node-id", type=int, default=env_int("CRAQ_READ_NODE_ID", -1))
     p.add_argument(
@@ -236,9 +246,9 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
         raise RunnerError(f"unknown ops: {' '.join(bad_ops)}")
 
     if args.write_op_count <= 0:
-        raise RunnerError("--write-op-count must be > 0")
+        raise RunnerError("--write-op-count must be > 0 per client")
     if args.read_op_count <= 0:
-        raise RunnerError("--read-op-count must be > 0")
+        raise RunnerError("--read-op-count must be > 0 per client")
     if args.key_count <= 0:
         raise RunnerError("--key-count must be > 0")
     if args.crown_hot_head_pct < 0 or args.crown_hot_head_pct > 100:
@@ -402,8 +412,13 @@ def build_remote_client_command(
 
 def launch_case(cfg: RunnerConfig, mode: str, op: str, run_idx: int) -> None:
     num_clients = len(cfg.hosts)
-    total_ops = cfg.write_op_count if op == "write" else cfg.read_op_count
-    log(f"Running mode={mode} op={op} clients={num_clients} total_ops={total_ops}")
+    ops_per_client = cfg.write_op_count if op == "write" else cfg.read_op_count
+    aggregate_requested_ops = ops_per_client * num_clients
+    log(
+        f"Running mode={mode} op={op} clients={num_clients} "
+        f"ops_per_client={ops_per_client} "
+        f"aggregate_requested_ops={aggregate_requested_ops}"
+    )
 
     launches: List[ActiveLaunch] = []
 
@@ -534,8 +549,8 @@ def main() -> int:
     log(f"  metadata={cfg.metadata_addr}")
     log(f"  modes={cfg.modes}")
     log(f"  ops={cfg.ops}")
-    log(f"  write_op_count={cfg.write_op_count}")
-    log(f"  read_op_count={cfg.read_op_count}")
+    log(f"  write_ops_per_client={cfg.write_op_count}")
+    log(f"  read_ops_per_client={cfg.read_op_count}")
     log(f"  key_count={cfg.key_count}")
     log(f"  crown_hot_head_pct={cfg.crown_hot_head_pct}")
     log(f"  read_hot_key_pct={cfg.read_hot_key_pct}")

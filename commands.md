@@ -172,13 +172,13 @@ metadata `host:port` (topology and replication mode come from there).
 
 ```bash
 # --- benchmark: write ---
-./build/client <metadata_host:port> [ack_port] bench-write <total_ops> <key_count> <client_index> <num_clients> [key_prefix] [value_prefix] [hot=<0-100>]
-# e.g. 50k writes, 64 keys, this is client 0 of 1
+./build/client <metadata_host:port> [ack_port] bench-write <ops_per_client> <key_count> <client_index> <num_clients> [key_prefix] [value_prefix] [hot=<0-100>]
+# e.g. 50k writes from this client, 64 keys, this is client 0 of 1
 ./build/client sp26-cs525-1201.cs.illinois.edu:50050 bench-write 50000 64 0 1
 
 # --- benchmark: read ---
-./build/client <metadata_host:port> [ack_port] bench-read <total_ops> <key_count> <client_index> <num_clients> [craq_node_id] [key_prefix] [hot=<0-100>]
-# e.g. 50k reads, 64 keys, CRAQ read from any node (-1)
+./build/client <metadata_host:port> [ack_port] bench-read <ops_per_client> <key_count> <client_index> <num_clients> [craq_node_id] [key_prefix] [hot=<0-100>]
+# e.g. 50k reads from this client, 64 keys, CRAQ read from any node (-1)
 ./build/client sp26-cs525-1201.cs.illinois.edu:50050 bench-read 50000 64 0 1 -1
 ```
 
@@ -233,7 +233,7 @@ python3 setup/run_throughput_experiments.py ... --dry-run
 
 Outputs per `--work-dir <DIR>`: `<DIR>/logs/*.log`, `<DIR>/ssh_logs/*.log`, `<DIR>/summary.csv`. Aggregate further with `python3 setup/aggregate_bench_results.py` if needed.
 
-Key args: `--metadata host:port` (default `$METADATA_HOST:$METADATA_PORT`), `--hosts` / `--hosts-file`, `--modes` (chain|craq|crown, label only), `--ops` (write read), `--write-op-count` / `--read-op-count`, `--key-count`, `--craq-read-node-id`, `--crown-hot-head-pct`, `--read-hot-key-pct`, `--work-dir`, `--dry-run`.
+Key args: `--metadata host:port` (default `$METADATA_HOST:$METADATA_PORT`), `--hosts` / `--hosts-file`, `--modes` (chain|craq|crown, label only), `--ops` (write read), `--write-op-count` / `--read-op-count`, `--key-count`, `--craq-read-node-id`, `--crown-hot-head-pct`, `--read-hot-key-pct`, `--work-dir`, `--dry-run`. The write/read op counts are per client process, so aggregate requested work is `client_count * op_count`.
 
 ---
 
@@ -260,12 +260,21 @@ Default experiment grid:
 - operations: `write read`
 - trials: `3`
 - unique keys per benchmark run: `64`
-- total writes per write benchmark run: `50000`
-- total reads per read benchmark run: `50000`
+- writes per client for each write benchmark run: `50000`
+- reads per client for each read benchmark run: `50000`
 
 That is `3 * 3 * 3 * 2 * 3 = 162` benchmark runs. Each benchmark
 run gets a full kill/start cycle before it runs. A benchmark run is one
 operation for one tuple, e.g. `n=5, mode=crown, clients=3, op=write, trial=2`.
+With the defaults, a 3-client write benchmark requests `3 * 50000 = 150000`
+total writes across the clients.
+
+Run order is `chain_length -> client_count -> operation -> trial -> mode`, so
+the runner completes all trials for `write` before moving to `read`. Within
+each trial it executes `chain`, then `craq`, then `crown` for the same chain
+length/client count/operation.
+The generated CSVs use this same order, so spreadsheet views keep the write
+rows together and the read rows together.
 
 Quick smoke run:
 
@@ -287,6 +296,9 @@ python3 setup/run_chain_length_experiments.py \
   --read-op-count 100000
 ```
 
+This example uses 128 logical keys and asks each client to issue 100000 writes
+or reads for its benchmark run.
+
 Inputs picked up from files / environment:
 
 - `setup/.env`: `SSH_USER`, `SSH_KEY_LOCAL`, `REPO_URL`, `REPO_BRANCH`,
@@ -307,19 +319,29 @@ Inputs from code defaults unless overridden:
 - `--ops write read`
 - `--trials 3`
 - `--key-count 64`
-- `--write-op-count 50000`
-- `--read-op-count 50000`
+- `--write-op-count 50000` per client
+- `--read-op-count 50000` per client
 - `--stabilization-seconds 3`
+- `--server-log false`
+- `--metadata-log false`
+
+The chain-length runner intentionally turns node/metadata verbose logging off
+by default so logging overhead does not distort throughput measurements. To
+override that for debugging, pass `--server-log true` and/or `--metadata-log true`,
+or set `CHAIN_LENGTH_SERVER_LOG=true` / `CHAIN_LENGTH_METADATA_LOG=true`.
 
 Outputs:
 
 - `build/chain_length_throughput_runs/raw_trials.csv` — one row per operation
   per trial, with labels such as `chain_length`, `mode`, `operation`,
-  `client_count`, `trial`, `key_count`, `op_count`, server/client host lists,
-  config path, and source log path.
+  `client_count`, `trial`, `key_count`, `op_count`, `ops_per_client`,
+  `total_requested_ops`, server/client host lists, config path, and source log
+  path. `op_count` is kept as an alias for `ops_per_client`.
 - `build/chain_length_throughput_runs/summary_by_chain_length.csv` — grouped
   rows with `throughput_mean`, `throughput_stddev`, `latency_mean_ms`, and
   `latency_stddev_ms` for graph error bars.
+  For write rows, latency is weighted write-ack latency; for read rows, latency
+  is weighted read RPC response latency.
 - Per-case logs under `build/chain_length_throughput_runs/cases/`.
 - Lifecycle SSH/SCP logs under `build/chain_length_throughput_runs/lifecycle_logs/`.
 

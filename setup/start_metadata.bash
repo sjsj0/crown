@@ -174,6 +174,15 @@ META_CONFIG="${METADATA_CONFIG:-config.json}"
 PING_INTERVAL_MS="${METADATA_PING_INTERVAL_MS:-1000}"
 PING_TIMEOUT_MS="${METADATA_PING_TIMEOUT_MS:-500}"
 FAILURE_THRESHOLD="${METADATA_FAILURE_THRESHOLD:-3}"
+METADATA_LOG_RAW="${METADATA_LOG:-true}"
+case "${METADATA_LOG_RAW,,}" in
+  1|true|yes|y|on) METADATA_LOG="true" ;;
+  0|false|no|n|off|"") METADATA_LOG="false" ;;
+  *)
+    echo "ERROR: METADATA_LOG must be true/false (or 1/0, yes/no). Got: $METADATA_LOG_RAW"
+    exit 1
+    ;;
+esac
 
 RUN_SCOPE="${RUN_SCOPE:-shared}"
 RUN_DIR="$PROJECT_DIR/run/$RUN_SCOPE"
@@ -194,6 +203,7 @@ echo "  pid_file: $PID_FILE"
 echo "  log_file: $LOG_FILE"
 echo "  session: $SESSION_NAME"
 echo "  config: $META_CONFIG"
+echo "  metadata_log: $METADATA_LOG"
 
 if "${TMUX_CMD[@]}" has-session -t "$SESSION_NAME" 2>/dev/null; then
   echo "Stopping existing tmux session: $SESSION_NAME"
@@ -210,7 +220,12 @@ if [[ -f "$PID_FILE" ]]; then
 fi
 pkill -u "$DEPLOY_USER" -f "metadata_server .*--port $META_PORT --external-host 172.22.154.121" >/dev/null 2>&1 || true
 
-META_CMD="cd '$PROJECT_DIR' && exec '$META_BIN' --config '$META_CONFIG' --host '$META_HOST' --port '$META_PORT' --ping-interval-ms '$PING_INTERVAL_MS' --ping-timeout-ms '$PING_TIMEOUT_MS' --failure-threshold '$FAILURE_THRESHOLD' --log"
+META_LOG_FLAG=""
+if [[ "$METADATA_LOG" == "true" ]]; then
+  META_LOG_FLAG=" --log"
+fi
+
+META_CMD="cd '$PROJECT_DIR' && exec '$META_BIN' --config '$META_CONFIG' --host '$META_HOST' --port '$META_PORT' --ping-interval-ms '$PING_INTERVAL_MS' --ping-timeout-ms '$PING_TIMEOUT_MS' --failure-threshold '$FAILURE_THRESHOLD'$META_LOG_FLAG"
 echo "Run command: $META_CMD"
 printf '[launch] %s\n' "$META_CMD" | tee -a "$LOG_FILE" >> "$OUT_FILE"
 "${TMUX_CMD[@]}" new-session -d -s "$SESSION_NAME" "$META_CMD"

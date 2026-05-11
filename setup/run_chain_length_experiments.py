@@ -29,6 +29,8 @@ RAW_FIELDNAMES = [
     "trial",
     "key_count",
     "op_count",
+    "ops_per_client",
+    "total_requested_ops",
     "server_hosts",
     "client_hosts",
     "config_file",
@@ -47,6 +49,7 @@ RAW_FIELDNAMES = [
     "agg_read_resp_rps",
     "throughput_ops_per_sec",
     "weighted_avg_ack_latency_ms",
+    "weighted_avg_read_latency_ms",
     "complete",
     "status",
     "error",
@@ -61,6 +64,8 @@ SUMMARY_FIELDNAMES = [
     "client_count",
     "key_count",
     "op_count",
+    "ops_per_client",
+    "total_requested_ops",
     "trials_expected",
     "trials_completed",
     "throughput_mean",
@@ -71,6 +76,10 @@ SUMMARY_FIELDNAMES = [
     "write_rpc_failures_mean",
     "all_trials_complete",
 ]
+
+
+MODE_SORT_ORDER = {"chain": 0, "craq": 1, "crown": 2}
+OP_SORT_ORDER = {"write": 0, "read": 1}
 
 
 @dataclass(frozen=True)
@@ -121,6 +130,7 @@ class ExperimentConfig:
     metadata_ping_interval_ms: int
     metadata_ping_timeout_ms: int
     metadata_failure_threshold: int
+    metadata_log: str
 
     node_host: str
     node_port: int
@@ -352,8 +362,18 @@ def parse_args(root_dir: Path, dotenv: dict[str, str]) -> argparse.Namespace:
     p.add_argument("--trials", type=int, default=env_int(dotenv, "TRIALS", 3))
 
     p.add_argument("--key-count", type=int, default=env_int(dotenv, "KEY_COUNT", 64))
-    p.add_argument("--write-op-count", type=int, default=env_int(dotenv, "WRITE_OP_COUNT", 50000))
-    p.add_argument("--read-op-count", type=int, default=env_int(dotenv, "READ_OP_COUNT", 50000))
+    p.add_argument(
+        "--write-op-count",
+        type=int,
+        default=env_int(dotenv, "WRITE_OP_COUNT", 50000),
+        help="Write operations per client process.",
+    )
+    p.add_argument(
+        "--read-op-count",
+        type=int,
+        default=env_int(dotenv, "READ_OP_COUNT", 50000),
+        help="Read operations per client process.",
+    )
     p.add_argument("--craq-read-node-id", type=int, default=env_int(dotenv, "CRAQ_READ_NODE_ID", -1))
     p.add_argument("--crown-hot-head-pct", type=int, default=env_int(dotenv, "CROWN_HOT_HEAD_PCT", 0))
     p.add_argument("--read-hot-key-pct", type=int, default=env_int(dotenv, "READ_HOT_KEY_PCT", 0))
@@ -382,10 +402,19 @@ def parse_args(root_dir: Path, dotenv: dict[str, str]) -> argparse.Namespace:
     p.add_argument("--metadata-ping-interval-ms", type=int, default=env_int(dotenv, "METADATA_PING_INTERVAL_MS", 1000))
     p.add_argument("--metadata-ping-timeout-ms", type=int, default=env_int(dotenv, "METADATA_PING_TIMEOUT_MS", 500))
     p.add_argument("--metadata-failure-threshold", type=int, default=env_int(dotenv, "METADATA_FAILURE_THRESHOLD", 3))
+    p.add_argument(
+        "--metadata-log",
+        default=env_get(dotenv, "CHAIN_LENGTH_METADATA_LOG", "false"),
+        help="Enable metadata_server verbose --log during chain-length experiments (default: false).",
+    )
 
     p.add_argument("--node-host", default=env_get(dotenv, "NODE_HOST", "0.0.0.0"))
     p.add_argument("--node-port", type=int, default=env_int(dotenv, "NODE_PORT", 50051))
-    p.add_argument("--server-log", default=env_get(dotenv, "SERVER_LOG", "true"))
+    p.add_argument(
+        "--server-log",
+        default=env_get(dotenv, "CHAIN_LENGTH_SERVER_LOG", "false"),
+        help="Enable server --server-log during chain-length experiments (default: false).",
+    )
     p.add_argument("--tmux-session-name", default=env_get(dotenv, "TMUX_SESSION_NAME", ""))
     p.add_argument("--tmux-metadata-session-name", default=env_get(dotenv, "TMUX_METADATA_SESSION_NAME", ""))
     p.add_argument("--tmux-socket", default=env_get(dotenv, "TMUX_SOCKET", "/tmp/crown-shared/tmux.sock"))
@@ -433,9 +462,9 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> ExperimentConfig:
     if args.key_count <= 0:
         raise RunnerError("--key-count must be > 0")
     if args.write_op_count <= 0:
-        raise RunnerError("--write-op-count must be > 0")
+        raise RunnerError("--write-op-count must be > 0 per client")
     if args.read_op_count <= 0:
-        raise RunnerError("--read-op-count must be > 0")
+        raise RunnerError("--read-op-count must be > 0 per client")
     if not (0 <= args.crown_hot_head_pct <= 100):
         raise RunnerError("--crown-hot-head-pct must be in [0, 100]")
     if not (0 <= args.read_hot_key_pct <= 100):
@@ -534,9 +563,10 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> ExperimentConfig:
         metadata_ping_interval_ms=args.metadata_ping_interval_ms,
         metadata_ping_timeout_ms=args.metadata_ping_timeout_ms,
         metadata_failure_threshold=args.metadata_failure_threshold,
+        metadata_log="true" if parse_bool(args.metadata_log, "--metadata-log") else "false",
         node_host=args.node_host.strip() or "0.0.0.0",
         node_port=args.node_port,
-        server_log=args.server_log.strip() or "true",
+        server_log="true" if parse_bool(args.server_log, "--server-log") else "false",
         tmux_session_name=args.tmux_session_name.strip(),
         tmux_metadata_session_name=args.tmux_metadata_session_name.strip(),
         tmux_socket=args.tmux_socket.strip() or "/tmp/crown-shared/tmux.sock",
@@ -670,6 +700,7 @@ def base_remote_env(cfg: ExperimentConfig) -> dict[str, str]:
         "METADATA_PING_INTERVAL_MS": str(cfg.metadata_ping_interval_ms),
         "METADATA_PING_TIMEOUT_MS": str(cfg.metadata_ping_timeout_ms),
         "METADATA_FAILURE_THRESHOLD": str(cfg.metadata_failure_threshold),
+        "METADATA_LOG": cfg.metadata_log,
         "BUILD_ONLY": "false",
         "START_ONLY": "true",
     }
@@ -785,6 +816,8 @@ def run_throughput_case(cfg: ExperimentConfig,
         cfg.remote_log_dir,
         f"n{case.chain_length}_{case.mode}_c{case.client_count}_t{case.trial}_{case.op}",
     )
+    if not remote_case_log_dir.startswith("/"):
+        remote_case_log_dir = remote_join(cfg.remote_repo_dir, remote_case_log_dir)
 
     cmd = [
         sys.executable,
@@ -864,6 +897,10 @@ def op_count_for_case(cfg: ExperimentConfig, case: ExperimentCase) -> int:
     return cfg.write_op_count if case.op == "write" else cfg.read_op_count
 
 
+def total_requested_ops_for_case(cfg: ExperimentConfig, case: ExperimentCase) -> int:
+    return op_count_for_case(cfg, case) * case.client_count
+
+
 def build_raw_row(cfg: ExperimentConfig,
                   case: ExperimentCase,
                   *,
@@ -878,6 +915,7 @@ def build_raw_row(cfg: ExperimentConfig,
         if case.op == "write"
         else summary_row.get("agg_read_resp_rps", "0")
     )
+    ops_per_client = op_count_for_case(cfg, case)
     return {
         "experiment_id": case.experiment_id,
         "group_experiment_id": case.group_experiment_id,
@@ -887,7 +925,9 @@ def build_raw_row(cfg: ExperimentConfig,
         "client_count": str(case.client_count),
         "trial": str(case.trial),
         "key_count": str(cfg.key_count),
-        "op_count": str(op_count_for_case(cfg, case)),
+        "op_count": str(ops_per_client),
+        "ops_per_client": str(ops_per_client),
+        "total_requested_ops": str(total_requested_ops_for_case(cfg, case)),
         "server_hosts": ";".join(server_hosts),
         "client_hosts": ";".join(client_hosts),
         "config_file": str(local_config),
@@ -906,6 +946,7 @@ def build_raw_row(cfg: ExperimentConfig,
         "agg_read_resp_rps": summary_row.get("agg_read_resp_rps", "0"),
         "throughput_ops_per_sec": throughput,
         "weighted_avg_ack_latency_ms": summary_row.get("weighted_avg_ack_latency_ms", "0"),
+        "weighted_avg_read_latency_ms": summary_row.get("weighted_avg_read_latency_ms", "0"),
         "complete": summary_row.get("complete", "False"),
         "status": "ok",
         "error": "",
@@ -922,6 +963,7 @@ def build_failed_raw_row(cfg: ExperimentConfig,
                          case_work_dir: Path,
                          error: str) -> dict[str, str]:
     row = {field: "" for field in RAW_FIELDNAMES}
+    ops_per_client = op_count_for_case(cfg, case)
     row.update(
         {
             "experiment_id": case.experiment_id,
@@ -932,7 +974,9 @@ def build_failed_raw_row(cfg: ExperimentConfig,
             "client_count": str(case.client_count),
             "trial": str(case.trial),
             "key_count": str(cfg.key_count),
-            "op_count": str(op_count_for_case(cfg, case)),
+            "op_count": str(ops_per_client),
+            "ops_per_client": str(ops_per_client),
+            "total_requested_ops": str(total_requested_ops_for_case(cfg, case)),
             "server_hosts": ";".join(server_hosts),
             "client_hosts": ";".join(client_hosts),
             "config_file": str(local_config),
@@ -946,12 +990,44 @@ def build_failed_raw_row(cfg: ExperimentConfig,
     return row
 
 
+def csv_int(row: dict[str, str], field: str) -> int:
+    try:
+        return int(row.get(field, "0"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def raw_row_sort_key(row: dict[str, str]) -> tuple[int, int, int, int, int, int, int, str]:
+    return (
+        csv_int(row, "chain_length"),
+        csv_int(row, "client_count"),
+        OP_SORT_ORDER.get(row.get("operation", ""), 99),
+        csv_int(row, "trial"),
+        MODE_SORT_ORDER.get(row.get("mode", ""), 99),
+        csv_int(row, "key_count"),
+        csv_int(row, "ops_per_client") or csv_int(row, "op_count"),
+        row.get("experiment_id", ""),
+    )
+
+
+def summary_row_sort_key(row: dict[str, str]) -> tuple[int, int, int, int, int, int, str]:
+    return (
+        csv_int(row, "chain_length"),
+        csv_int(row, "client_count"),
+        OP_SORT_ORDER.get(row.get("operation", ""), 99),
+        MODE_SORT_ORDER.get(row.get("mode", ""), 99),
+        csv_int(row, "key_count"),
+        csv_int(row, "ops_per_client") or csv_int(row, "op_count"),
+        row.get("experiment_id", ""),
+    )
+
+
 def write_raw_csv(path: Path, rows: Sequence[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=RAW_FIELDNAMES)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(sorted(rows, key=raw_row_sort_key))
 
 
 def to_float(raw: str) -> Optional[float]:
@@ -978,21 +1054,32 @@ def is_complete_row(row: dict[str, str]) -> bool:
 
 
 def summarize_rows(cfg: ExperimentConfig, raw_rows: Sequence[dict[str, str]]) -> List[dict[str, str]]:
-    grouped: dict[tuple[str, str, str, str, str, str], List[dict[str, str]]] = {}
+    grouped: dict[tuple[str, str, str, str, str, str, str], List[dict[str, str]]] = {}
     for row in raw_rows:
         key = (
             row["chain_length"],
-            row["mode"],
-            row["operation"],
             row["client_count"],
+            row["operation"],
+            row["mode"],
             row["key_count"],
             row["op_count"],
+            row["total_requested_ops"],
         )
         grouped.setdefault(key, []).append(row)
 
     summary_rows: List[dict[str, str]] = []
-    for key, rows in sorted(grouped.items(), key=lambda item: (int(item[0][0]), item[0][1], int(item[0][3]), item[0][2])):
-        chain_length, mode, operation, client_count, key_count, op_count = key
+    for key, rows in sorted(
+        grouped.items(),
+        key=lambda item: (
+            int(item[0][0]),
+            int(item[0][1]),
+            OP_SORT_ORDER.get(item[0][2], 99),
+            MODE_SORT_ORDER.get(item[0][3], 99),
+            int(item[0][4]),
+            int(item[0][5]),
+        ),
+    ):
+        chain_length, client_count, operation, mode, key_count, op_count, total_requested_ops = key
         complete_rows = [row for row in rows if is_complete_row(row)]
 
         throughput_values = [
@@ -1002,7 +1089,15 @@ def summarize_rows(cfg: ExperimentConfig, raw_rows: Sequence[dict[str, str]]) ->
         ]
         latency_values = [
             value for row in complete_rows
-            for value in [to_float(row.get("weighted_avg_ack_latency_ms", ""))]
+            for value in [
+                to_float(
+                    row.get(
+                        "weighted_avg_ack_latency_ms" if row.get("operation") == "write"
+                        else "weighted_avg_read_latency_ms",
+                        "",
+                    )
+                )
+            ]
             if value is not None
         ]
         read_failure_values = [
@@ -1028,6 +1123,8 @@ def summarize_rows(cfg: ExperimentConfig, raw_rows: Sequence[dict[str, str]]) ->
                 "client_count": client_count,
                 "key_count": key_count,
                 "op_count": op_count,
+                "ops_per_client": op_count,
+                "total_requested_ops": total_requested_ops,
                 "trials_expected": str(cfg.trials),
                 "trials_completed": str(len(complete_rows)),
                 "throughput_mean": f"{mean(throughput_values):.6f}",
@@ -1047,17 +1144,17 @@ def write_summary_csv(path: Path, rows: Sequence[dict[str, str]]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDNAMES)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(sorted(rows, key=summary_row_sort_key))
 
 
 def build_cases(cfg: ExperimentConfig) -> List[ExperimentCase]:
     cases: List[ExperimentCase] = []
     index = 0
     for chain_length in cfg.chain_lengths:
-        for mode in cfg.modes:
-            for client_count in cfg.client_counts:
+        for client_count in cfg.client_counts:
+            for op in cfg.ops:
                 for trial in range(1, cfg.trials + 1):
-                    for op in cfg.ops:
+                    for mode in cfg.modes:
                         index += 1
                         cases.append(
                             ExperimentCase(
@@ -1160,10 +1257,13 @@ def print_plan(cfg: ExperimentConfig, cases: Sequence[ExperimentCase]) -> None:
     log(f"  client_counts={cfg.client_counts}")
     log(f"  ops={cfg.ops}")
     log(f"  trials={cfg.trials}")
+    log("  case_order=chain_length -> client_count -> operation -> trial -> mode")
     log(f"  planned_benchmark_runs={len(cases)}")
     log(f"  key_count={cfg.key_count}")
-    log(f"  write_op_count={cfg.write_op_count}")
-    log(f"  read_op_count={cfg.read_op_count}")
+    log(f"  write_ops_per_client={cfg.write_op_count}")
+    log(f"  read_ops_per_client={cfg.read_op_count}")
+    log(f"  server_log={cfg.server_log}")
+    log(f"  metadata_log={cfg.metadata_log}")
     log(f"  server_hosts_available={len(cfg.server_hosts)}")
     log(f"  client_hosts_available={len(cfg.client_hosts)}")
     log(f"  metadata={cfg.metadata_addr}")

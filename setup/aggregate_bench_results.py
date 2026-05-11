@@ -30,6 +30,7 @@ class SummaryRecord:
     read_req_rps: float
     read_resp_rps: float
     avg_ack_latency_ms: float
+    avg_read_latency_ms: float
     source_file: str
 
 
@@ -77,6 +78,7 @@ def parse_summary_line(line: str, source_file: str) -> SummaryRecord | None:
         read_req_rps=float_field("read_req_rps"),
         read_resp_rps=float_field("read_resp_rps"),
         avg_ack_latency_ms=float_field("avg_ack_latency_ms"),
+        avg_read_latency_ms=float_field("avg_read_latency_ms"),
         source_file=source_file,
     )
 
@@ -121,6 +123,12 @@ def write_aggregate_csv(records: list[SummaryRecord], output: Path) -> None:
             )
         else:
             weighted_ack_latency_ms = 0.0
+        if reads_ok > 0:
+            weighted_read_latency_ms = (
+                sum(r.avg_read_latency_ms * r.reads_ok for r in recs) / reads_ok
+            )
+        else:
+            weighted_read_latency_ms = 0.0
 
         complete = clients_reported == num_clients
 
@@ -142,6 +150,7 @@ def write_aggregate_csv(records: list[SummaryRecord], output: Path) -> None:
                 "agg_read_req_rps": agg_read_req_rps,
                 "agg_read_resp_rps": agg_read_resp_rps,
                 "weighted_avg_ack_latency_ms": weighted_ack_latency_ms,
+                "weighted_avg_read_latency_ms": weighted_read_latency_ms,
             }
         )
 
@@ -165,6 +174,7 @@ def write_aggregate_csv(records: list[SummaryRecord], output: Path) -> None:
         "agg_read_req_rps",
         "agg_read_resp_rps",
         "weighted_avg_ack_latency_ms",
+        "weighted_avg_read_latency_ms",
     ]
 
     with output.open("w", encoding="utf-8", newline="") as f:

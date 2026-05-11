@@ -119,6 +119,7 @@ struct ThroughputMetricsSummary {
     double read_requests_per_sec = 0.0;
     double read_responses_per_sec = 0.0;
     double avg_ack_latency_ms = 0.0;
+    double avg_read_latency_ms = 0.0;
 };
 
 struct ThroughputMetricsState {
@@ -134,6 +135,8 @@ struct ThroughputMetricsState {
 
     atomic<uint64_t> ack_latency_samples{0};
     atomic<uint64_t> ack_latency_total_us{0};
+    atomic<uint64_t> read_latency_samples{0};
+    atomic<uint64_t> read_latency_total_us{0};
 
     mutex pending_write_times_mtx;
     unordered_map<uint64_t, SteadyClock::time_point> pending_write_times;
@@ -170,6 +173,8 @@ static shared_ptr<ThroughputMetricsState> benchmark_current_metrics_state() {
     state.write_rpc_failures.store(0, memory_order_relaxed);
     state.ack_latency_samples.store(0, memory_order_relaxed);
     state.ack_latency_total_us.store(0, memory_order_relaxed);
+    state.read_latency_samples.store(0, memory_order_relaxed);
+    state.read_latency_total_us.store(0, memory_order_relaxed);
 
     {
         lock_guard<mutex> lk(state.pending_write_times_mtx);
@@ -250,10 +255,15 @@ static void benchmark_note_read_sent() {
     state->reads_sent.fetch_add(1, memory_order_relaxed);
 }
 
-static void benchmark_note_read_success() {
+static void benchmark_note_read_success(SteadyClock::time_point issued_at) {
     auto state = benchmark_current_metrics_state();
     if (!state || !state->enabled.load(memory_order_relaxed)) return;
+
     state->reads_ok.fetch_add(1, memory_order_relaxed);
+
+    const auto latency_us = chrono::duration_cast<chrono::microseconds>(SteadyClock::now() - issued_at).count();
+    state->read_latency_total_us.fetch_add(static_cast<uint64_t>(max<int64_t>(0, latency_us)), memory_order_relaxed);
+    state->read_latency_samples.fetch_add(1, memory_order_relaxed);
 }
 
 static void benchmark_note_read_failure() {
@@ -279,6 +289,8 @@ static void benchmark_note_read_failure() {
 
     const uint64_t ack_latency_samples = state.ack_latency_samples.load(memory_order_relaxed);
     const uint64_t ack_latency_total_us = state.ack_latency_total_us.load(memory_order_relaxed);
+    const uint64_t read_latency_samples = state.read_latency_samples.load(memory_order_relaxed);
+    const uint64_t read_latency_total_us = state.read_latency_total_us.load(memory_order_relaxed);
 
     summary.ack_writes_per_sec = static_cast<double>(summary.acks_received) / summary.duration_sec;
     summary.read_requests_per_sec = static_cast<double>(summary.reads_sent) / summary.duration_sec;
@@ -287,6 +299,10 @@ static void benchmark_note_read_failure() {
     if (ack_latency_samples > 0) {
         summary.avg_ack_latency_ms =
             (static_cast<double>(ack_latency_total_us) / static_cast<double>(ack_latency_samples)) / 1000.0;
+    }
+    if (read_latency_samples > 0) {
+        summary.avg_read_latency_ms =
+            (static_cast<double>(read_latency_total_us) / static_cast<double>(read_latency_samples)) / 1000.0;
     }
     return summary;
 }
@@ -307,7 +323,8 @@ static void benchmark_note_read_failure() {
         << " ack_wps=" << summary.ack_writes_per_sec
         << " read_req_rps=" << summary.read_requests_per_sec
         << " read_resp_rps=" << summary.read_responses_per_sec
-        << " avg_ack_latency_ms=" << summary.avg_ack_latency_ms;
+        << " avg_ack_latency_ms=" << summary.avg_ack_latency_ms
+        << " avg_read_latency_ms=" << summary.avg_read_latency_ms;
     return out.str();
 }
 
@@ -318,7 +335,8 @@ enum class ClientRunMode {
 };
 
 struct BenchmarkRunConfig {
-    uint64_t total_ops = 0;
+    // Number of benchmark operations this client process should issue.
+    uint64_t ops_per_client = 0;
     int key_count = 0;
     int client_index = 0;
     int num_clients = 1;
@@ -391,8 +409,8 @@ static void benchmark_wait_for_pending_acks() {
 static void print_usage(const char* bin) {
     cerr << "Usage:\n"
          << "  " << bin << " <metadata_host:port> [ack_port]\n"
-         << "  " << bin << " <metadata_host:port> [ack_port] bench-write <total_ops> <key_count> <client_index> <num_clients> [key_prefix] [value_prefix] [hot=<0-100>]\n"
-         << "  " << bin << " <metadata_host:port> [ack_port] bench-read  <total_ops> <key_count> <client_index> <num_clients> [craq_node_id] [key_prefix] [hot=<0-100>]\n";
+         << "  " << bin << " <metadata_host:port> [ack_port] bench-write <ops_per_client> <key_count> <client_index> <num_clients> [key_prefix] [value_prefix] [hot=<0-100>]\n"
+         << "  " << bin << " <metadata_host:port> [ack_port] bench-read  <ops_per_client> <key_count> <client_index> <num_clients> [craq_node_id] [key_prefix] [hot=<0-100>]\n";
 }
 
 static bool parse_run_mode_args(int argc,
@@ -430,12 +448,12 @@ static bool parse_run_mode_args(int argc,
     run_mode = is_write ? ClientRunMode::BENCH_WRITE : ClientRunMode::BENCH_READ;
 
     if (argc - argi < 4) {
-        err = "benchmark mode requires: <total_ops> <key_count> <client_index> <num_clients>";
+        err = "benchmark mode requires: <ops_per_client> <key_count> <client_index> <num_clients>";
         return false;
     }
 
-    if (!parse_uint64_text(argv[argi++], bench_cfg.total_ops) || bench_cfg.total_ops == 0) {
-        err = "total_ops must be > 0";
+    if (!parse_uint64_text(argv[argi++], bench_cfg.ops_per_client) || bench_cfg.ops_per_client == 0) {
+        err = "ops_per_client must be > 0";
         return false;
     }
     if (!parse_int_text(argv[argi++], bench_cfg.key_count) || bench_cfg.key_count <= 0) {
@@ -769,23 +787,16 @@ static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
     }
 
     vector<PreparedBenchmarkWrite> prepared;
-    prepared.reserve(static_cast<size_t>(
-        (cfg.total_ops + static_cast<uint64_t>(cfg.num_clients) - 1)
-        / static_cast<uint64_t>(cfg.num_clients)));
+    prepared.reserve(static_cast<size_t>(cfg.ops_per_client));
 
-    uint64_t op_index = 0;
-    while (true) {
-        const uint64_t global_op = static_cast<uint64_t>(cfg.client_index)
-            + static_cast<uint64_t>(cfg.num_clients) * op_index;
-        if (global_op >= cfg.total_ops) break;
-
+    for (uint64_t op_index = 0; op_index < cfg.ops_per_client; ++op_index) {
         PreparedBenchmarkWrite next;
 
         if (crown_hotspot_enabled) {
             const bool want_hot =
                 (cfg.crown_hot_head_pct >= 100)
                     ? true
-                    : ((global_op % 100ULL) < static_cast<uint64_t>(cfg.crown_hot_head_pct));
+                    : ((op_index % 100ULL) < static_cast<uint64_t>(cfg.crown_hot_head_pct));
 
             size_t key_idx = 0;
             if (want_hot && !hot_key_indices.empty()) {
@@ -804,7 +815,7 @@ static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
 
             next.key = keys[key_idx];
         } else {
-            next.key = benchmark_select_key_round_robin(keys, global_op);
+            next.key = benchmark_select_key_round_robin(keys, op_index);
         }
 
         next.value = cfg.value_prefix + to_string(cfg.client_index) + "-" + to_string(op_index);
@@ -822,7 +833,6 @@ static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
         }
 
         prepared.push_back(std::move(next));
-        ++op_index;
     }
 
     if (crown_hotspot_enabled) {
@@ -885,22 +895,15 @@ static vector<PreparedBenchmarkRead> benchmark_prepare_read_batch(
     }
 
     vector<PreparedBenchmarkRead> prepared;
-    prepared.reserve(static_cast<size_t>(
-        (cfg.total_ops + static_cast<uint64_t>(cfg.num_clients) - 1)
-        / static_cast<uint64_t>(cfg.num_clients)));
+    prepared.reserve(static_cast<size_t>(cfg.ops_per_client));
 
-    uint64_t op_index = 0;
-    while (true) {
-        const uint64_t global_op = static_cast<uint64_t>(cfg.client_index)
-            + static_cast<uint64_t>(cfg.num_clients) * op_index;
-        if (global_op >= cfg.total_ops) break;
-
+    for (uint64_t op_index = 0; op_index < cfg.ops_per_client; ++op_index) {
         PreparedBenchmarkRead next;
         if (read_hotspot_enabled) {
             const bool want_hot =
                 (cfg.read_hot_key_pct >= 100)
                     ? true
-                    : ((global_op % 100ULL) < static_cast<uint64_t>(cfg.read_hot_key_pct));
+                    : ((op_index % 100ULL) < static_cast<uint64_t>(cfg.read_hot_key_pct));
 
             if (want_hot || cold_key_indices.empty()) {
                 next.key = keys[hot_key_idx];
@@ -910,12 +913,12 @@ static vector<PreparedBenchmarkRead> benchmark_prepare_read_batch(
                 next.key = keys[cold_key_idx];
             }
         } else {
-            next.key = benchmark_select_key_round_robin(keys, global_op);
+            next.key = benchmark_select_key_round_robin(keys, op_index);
         }
 
         int node_id = -1;
         if (topo.mode == chain::ReplicationMode::CRAQ) {
-            node_id = benchmark_select_craq_node_id(topo, global_op, cfg.craq_node_id);
+            node_id = benchmark_select_craq_node_id(topo, op_index, cfg.craq_node_id);
         }
 
         next.target = resolve_read_target(topo, next.key, node_id, false);
@@ -924,7 +927,6 @@ static vector<PreparedBenchmarkRead> benchmark_prepare_read_batch(
         }
 
         prepared.push_back(std::move(next));
-        ++op_index;
     }
 
     if (read_hotspot_enabled) {
@@ -1174,6 +1176,7 @@ static bool do_read(Topology& topo, const string& key, int node_id = -1, bool ve
     req.set_key(key);
 
     benchmark_note_read_sent();
+    const auto issued_at = SteadyClock::now();
 
     // Resolve target + stub under topology lock, then call RPC with the copy.
     // Refresh + retry on UNAVAILABLE (e.g., dead tail after reconfig).
@@ -1212,7 +1215,7 @@ static bool do_read(Topology& topo, const string& key, int node_id = -1, bool ve
         if (verbose) cerr << "[Read] Failed: " << status.error_message() << "\n";
         return false;
     }
-    benchmark_note_read_success();
+    benchmark_note_read_success(issued_at);
 
     if (verbose) {
         if (resp.value().empty())
@@ -1385,6 +1388,7 @@ static ThroughputMetricsSummary run_bench_read(Topology& topo,
         chain::ReadResponse response;
         grpc::ClientContext ctx;
         grpc::Status status;
+        SteadyClock::time_point issued_at;
         unique_ptr<grpc::ClientAsyncResponseReader<chain::ReadResponse>> rpc;
     };
 
@@ -1398,6 +1402,7 @@ static ThroughputMetricsSummary run_bench_read(Topology& topo,
 
         auto* call = new AsyncReadCall();
         call->request.set_key(prepared.key);
+        call->issued_at = SteadyClock::now();
 
         call->rpc = prepared.target->stub->AsyncRead(&call->ctx, call->request, &cq);
         if (!call->rpc) {
@@ -1436,7 +1441,7 @@ static ThroughputMetricsSummary run_bench_read(Topology& topo,
         if (!ok || !call->status.ok()) {
             benchmark_note_read_failure();
         } else {
-            benchmark_note_read_success();
+            benchmark_note_read_success(call->issued_at);
         }
         delete call;
     }
@@ -1576,7 +1581,9 @@ int main(int argc, char** argv) {
         const bool is_write = (run_mode == ClientRunMode::BENCH_WRITE);
         cout << "[Client] Running " << (is_write ? "bench-write" : "bench-read")
              << " mode=" << mode_name(mode)
-             << " total_ops=" << bench_cfg.total_ops
+             << " ops_per_client=" << bench_cfg.ops_per_client
+             << " aggregate_requested_ops="
+             << (bench_cfg.ops_per_client * static_cast<uint64_t>(bench_cfg.num_clients))
              << " key_count=" << bench_cfg.key_count
              << " client_index=" << bench_cfg.client_index
              << " num_clients=" << bench_cfg.num_clients;
