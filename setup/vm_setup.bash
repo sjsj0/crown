@@ -63,7 +63,8 @@ mapfile -t all_hosts_meta < <(printf '%s\n' "${all_hosts[@]}" "${METADATA_HOST:-
 usage() {
   echo "Usage: $0 <setup|start|start-servers|start-metadata|build|deploy|rerun|kill>"
   echo "  setup                    : install build deps on prod_hosts.csv ∪ client_hosts.csv ∪ \$METADATA_HOST"
-  echo "  build|deploy|rerun       : clone/build (+ start a node server) on prod_hosts.csv ∪ client_hosts.csv"
+  echo "  build|deploy             : clone/build (+ start a node server) on prod_hosts.csv ∪ client_hosts.csv"
+  echo "  rerun [--skip-build]     : pull + rebuild + restart node servers on prod_hosts.csv ∪ client_hosts.csv (--skip-build: pull + restart only)"
   echo "  start                    : start a server node on each prod_hosts.csv VM, then the metadata_server on \$METADATA_HOST"
   echo "  start-servers            : start a server node on each prod_hosts.csv VM only (skip the metadata_server)"
   echo "  start-metadata           : start the metadata_server on \$METADATA_HOST only"
@@ -72,23 +73,26 @@ usage() {
 
 # --- remote deploy helper ---------------------------------------------------
 # Copies a local script to a host and runs it there with the deployment env.
-# Usage: deploy_to_host <local_script_path> <host> <label>
+# Usage: deploy_to_host <local_script_path> <host> <label> [remote_arg...]
+# Any trailing args are forwarded to the remote script (e.g. --skip-build).
 deploy_to_host() {
   local local_script="$1" host="$2" label="$3"
+  shift 3
   [[ -f "$local_script" ]] || { echo "Error: $local_script not found"; exit 1; }
-  local script_name remote_script server
+  local script_name remote_script server remote_args=""
   script_name="$(basename "$local_script")"
   remote_script="/home/${SSH_USER}/${script_name}"
   server="${SSH_USER}@${host}"
+  (( $# > 0 )) && remote_args="$(printf ' %q' "$@")"
 
   echo "==> $server  ($label)"
 
   echo "   -> copying $script_name"
   scp "${SSH_OPTS[@]}" "$local_script" "$server:$remote_script"
 
-  echo "   -> running $remote_script"
+  echo "   -> running $remote_script$remote_args"
   ssh -t "${SSH_OPTS[@]}" "$server" \
-    "export SSH_USER='$SSH_USER' REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REMOTE_BASE_DIR='$REMOTE_BASE_DIR' REPO_NAME='$REPO_NAME' PROJECT_SUBDIR='$PROJECT_SUBDIR' PROJECT_MODE='${PROJECT_MODE:-crown}' BUILD_TYPE='${BUILD_TYPE:-Release}' NODE_HOST='${NODE_HOST:-0.0.0.0}' NODE_PORT='${NODE_PORT:-50051}' SERVER_LOG='${SERVER_LOG:-true}' TMUX_SESSION_NAME='${TMUX_SESSION_NAME:-}' TMUX_SOCKET='${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}' RUN_SCOPE='${RUN_SCOPE:-shared}' METADATA_HOST='${METADATA_HOST:-}' METADATA_PORT='${METADATA_PORT:-50050}' METADATA_CONFIG='${METADATA_CONFIG:-config.json}'; tr -d '\r' < '$remote_script' | bash -s --"
+    "export SSH_USER='$SSH_USER' REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REMOTE_BASE_DIR='$REMOTE_BASE_DIR' REPO_NAME='$REPO_NAME' PROJECT_SUBDIR='$PROJECT_SUBDIR' PROJECT_MODE='${PROJECT_MODE:-crown}' BUILD_TYPE='${BUILD_TYPE:-Release}' NODE_HOST='${NODE_HOST:-0.0.0.0}' NODE_PORT='${NODE_PORT:-50051}' SERVER_LOG='${SERVER_LOG:-true}' TMUX_SESSION_NAME='${TMUX_SESSION_NAME:-}' TMUX_SOCKET='${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}' RUN_SCOPE='${RUN_SCOPE:-shared}' METADATA_HOST='${METADATA_HOST:-}' METADATA_PORT='${METADATA_PORT:-50050}' METADATA_CONFIG='${METADATA_CONFIG:-config.json}'; tr -d '\r' < '$remote_script' | bash -s --$remote_args"
 }
 
 # Starts the metadata_server on $METADATA_HOST (its own script clones + builds
@@ -120,8 +124,15 @@ case "$ACTION" in
     for host in "${all_hosts[@]}"; do deploy_to_host "$SCRIPT_DIR/start_server.bash" "$host" "$ACTION"; done
     ;;
   rerun)
+    shift  # drop "rerun"; anything left (e.g. --skip-build) is forwarded to rerun.bash
+    for arg in "$@"; do
+      case "$arg" in
+        --skip-build) ;;
+        *) echo "Invalid argument for 'rerun': $arg"; usage; exit 1 ;;
+      esac
+    done
     [[ ${#all_hosts[@]} -gt 0 ]] || { echo "No target hosts (check prod_hosts.csv / client_hosts.csv)."; exit 1; }
-    for host in "${all_hosts[@]}"; do deploy_to_host "$SCRIPT_DIR/rerun.bash" "$host" "$ACTION"; done
+    for host in "${all_hosts[@]}"; do deploy_to_host "$SCRIPT_DIR/rerun.bash" "$host" "rerun" "$@"; done
     ;;
   start|start-servers)
     [[ ${#prod_hosts[@]} -gt 0 ]] || { echo "No server hosts (check prod_hosts.csv)."; exit 1; }

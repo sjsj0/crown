@@ -24,12 +24,14 @@ processes start only on the relevant subset.
 
 **Usage:**
 ```bash
-./vm_setup.bash setup           # install deps on prod_hosts.csv ∪ client_hosts.csv
-./vm_setup.bash build           # clone/build the repo on prod_hosts.csv ∪ client_hosts.csv
-./vm_setup.bash start           # start a server node on each prod_hosts.csv VM, THEN the metadata_server on $METADATA_HOST
-./vm_setup.bash start-servers   # start a server node on each prod_hosts.csv VM only (skip the metadata_server)
-./vm_setup.bash start-metadata  # start the metadata_server on $METADATA_HOST only
-./vm_setup.bash kill            # stop servers + metadata on prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST
+./vm_setup.bash setup                 # install deps on prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST
+./vm_setup.bash build                 # clone/build the repo (+ start a node server) on prod_hosts.csv ∪ client_hosts.csv
+./vm_setup.bash start                 # start a server node on each prod_hosts.csv VM, THEN the metadata_server on $METADATA_HOST
+./vm_setup.bash start-servers         # start a server node on each prod_hosts.csv VM only (skip the metadata_server)
+./vm_setup.bash start-metadata        # start the metadata_server on $METADATA_HOST only
+./vm_setup.bash rerun                 # pull + rebuild + restart node servers on prod_hosts.csv ∪ client_hosts.csv
+./vm_setup.bash rerun --skip-build    # ...same, but skip the cmake build (pull + restart only)
+./vm_setup.bash kill                  # stop servers + metadata on prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST
 ```
 
 Typical bring-up order: `setup` → `build` → `start`. `start` launches a server

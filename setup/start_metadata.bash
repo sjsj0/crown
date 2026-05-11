@@ -47,6 +47,10 @@ if [[ -e "$REPO_DIR" && ! -w "$REPO_DIR" ]]; then
   fi
 fi
 
+# Shared $REPO_DIR is often owned by whichever user first cloned it; mark it as
+# a trusted path so git fetch/checkout/pull don't abort with "dubious ownership".
+git config --global --add safe.directory "$REPO_DIR" >/dev/null 2>&1 || true
+
 if [[ -d "$REPO_NAME/.git" ]]; then
   echo "Repo exists; pulling latest branch: $REPO_BRANCH"
   git -C "$REPO_NAME" fetch --all --prune

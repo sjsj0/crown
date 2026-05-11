@@ -97,7 +97,7 @@ METADATA_CONFIG=build/prod_configs/config.crown.json ./setup/vm_setup.bash start
 Variants:
 - `./setup/vm_setup.bash start-servers` — node servers only, skip the metadata server.
 - `METADATA_CONFIG=build/prod_configs/config.craq.json ./setup/vm_setup.bash start-metadata` — (re)start just the metadata server, e.g. to switch modes.
-- `./setup/vm_setup.bash rerun` — pull + rebuild + restart on all VMs (after code changes).
+- `./setup/vm_setup.bash rerun` — `git pull` + rebuild + restart the node servers on all prod/client VMs (after code changes). Add `--skip-build` to skip the cmake build (pull + restart only — fast restart when the binary is already current).
 - `./setup/vm_setup.bash kill` — stop all servers + metadata.
 
 Check / attach on a VM:
@@ -121,8 +121,9 @@ tmux -S /tmp/crown-shared/tmux.sock attach -t crown_node_50051
 ./setup/vm_setup.bash start-servers    # server nodes only (skip the metadata_server)
 # (re)start just the metadata server; METADATA_CONFIG picks the mode (must exist on that VM)
 METADATA_CONFIG=build/prod_configs/config.crown.json ./setup/vm_setup.bash start-metadata
-./setup/vm_setup.bash rerun            # pull + rebuild + restart
-./setup/vm_setup.bash kill             # stop servers + metadata on prod_hosts ∪ client_hosts
+./setup/vm_setup.bash rerun            # git pull + rebuild + restart node servers (prod ∪ client)
+./setup/vm_setup.bash rerun --skip-build  # ...same, but skip the cmake build (pull + restart only)
+./setup/vm_setup.bash kill             # stop servers + metadata on prod_hosts ∪ client_hosts ∪ $METADATA_HOST
 ```
 
 Manual equivalents (5 nodes 1201..1205, shared port 50051):
