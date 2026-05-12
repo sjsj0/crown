@@ -151,6 +151,7 @@ message ClusterState {
 message FreezeRequest {
     uint64      reconfig_id    = 1;
     NodeAddress metadata_addr  = 2; // where the node should send InflightAck
+    bool        direct_inflight_ack = 3; // failure path: old topology may contain the failed node
 }
 
 message InflightCheckRequest {

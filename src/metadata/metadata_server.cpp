@@ -295,14 +295,18 @@ public:
         return nodes_[idx].endpoint();
     }
 
-    // Apply one ping result for node `idx`. Logs DOWN/UP transitions.
-    void record_ping_result(size_t idx, bool ok, int failure_threshold, bool verbose) {
+    // Apply one ping result for an endpoint. Detector workers are long-lived
+    // while reconfig can shrink/renumber nodes, so endpoint identity is safer
+    // than a stale vector index.
+    void record_ping_result(const string& endpoint, bool ok, int failure_threshold, bool verbose) {
         std::function<void(int)> cb_to_fire;
         int failed_node_id = -1;
         {
             lock_guard<mutex> lk(mtx_);
-            if (idx >= nodes_.size()) return;
-            NodeEntry& n = nodes_[idx];
+            auto it = std::find_if(nodes_.begin(), nodes_.end(),
+                                   [&](const NodeEntry& n) { return n.endpoint() == endpoint; });
+            if (it == nodes_.end()) return;
+            NodeEntry& n = *it;
             if (ok) {
                 n.consecutive_misses = 0;
                 if (!n.alive) {
@@ -392,7 +396,7 @@ void detector_loop(MetadataState* state, size_t idx, Options opt) {
         grpc::ClientContext ctx;
         ctx.set_deadline(chrono::system_clock::now() + chrono::milliseconds(opt.ping_timeout_ms));
         const grpc::Status st = stub->Ping(&ctx, req, &resp);
-        state->record_ping_result(idx, st.ok(), opt.failure_threshold, opt.verbose);
+        state->record_ping_result(endpoint, st.ok(), opt.failure_threshold, opt.verbose);
 
         this_thread::sleep_for(chrono::milliseconds(opt.ping_interval_ms));
     }
@@ -529,11 +533,14 @@ private:
             }
         }
 
-        const int freeze_failures = freeze_all(survivors, ctx->id);
+        const bool direct_inflight_ack =
+            (mode == chain::ReplicationMode::CROWN && !is_add);
+        const int freeze_failures = freeze_all(survivors, ctx->id, direct_inflight_ack);
         const auto freeze_ms = ms_since(ctx->phase_start);
         cout << "[Reconfig " << ctx->id << "] Freeze sent to " << survivors.size()
              << " nodes (" << freeze_ms << "ms";
         if (freeze_failures > 0) cout << ", " << freeze_failures << " failed";
+        if (direct_inflight_ack) cout << ", direct inflight ACK";
         cout << ")\n" << flush;
 
         // ----- Phase 2: Inflight check -----
@@ -621,7 +628,9 @@ private:
     }
 
     // Send Freeze RPC to all nodes in parallel.
-    int freeze_all(const vector<NodeEntry>& nodes, uint64_t reconfig_id) {
+    int freeze_all(const vector<NodeEntry>& nodes,
+                   uint64_t reconfig_id,
+                   bool direct_inflight_ack) {
         std::atomic<int> failures{0};
         vector<std::thread> threads;
         for (const auto& n : nodes) {
@@ -633,6 +642,7 @@ private:
                 req.set_reconfig_id(reconfig_id);
                 req.mutable_metadata_addr()->set_host(metadata_host_);
                 req.mutable_metadata_addr()->set_port(metadata_port_);
+                req.set_direct_inflight_ack(direct_inflight_ack);
                 google::protobuf::Empty resp;
                 grpc::ClientContext ctx;
                 ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
@@ -700,6 +710,7 @@ private:
             for (size_t i = 0; i < N; ++i) {
                 size_t prev_i = (i + N - 1) % N;
                 size_t next_i = (i + 1) % N;
+                out[i].node_id = static_cast<int>(i);
                 out[i].is_head = false;
                 out[i].is_tail = false;
                 out[i].has_pred = true;

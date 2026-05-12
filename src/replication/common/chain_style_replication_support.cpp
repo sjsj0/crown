@@ -495,6 +495,7 @@ void ChainStyleReplicationSupport::send_inflight_check(uint64_t reconfig_id, int
         for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
             google::protobuf::Empty ignored;
             grpc::ClientContext ctx;
+            ctx.set_deadline(chrono::system_clock::now() + chrono::seconds(5));
             grpc::Status status = succ->InflightCheck(&ctx, req, &ignored);
             if (status.ok()) return;
 

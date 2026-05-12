@@ -218,6 +218,14 @@ public:
         cout << "[Server] Frozen for reconfig_id=" << reconfig_id
              << " (metadata=" << metadata_addr << ")\n";
 
+        if (req->direct_inflight_ack()) {
+            const int32_t my_id = node_.node_index();
+            cout << "[Server] Direct InflightAck for reconfig_id=" << reconfig_id
+                 << " node=" << my_id << "\n";
+            send_inflight_ack_to_metadata(reconfig_id, my_id);
+            return grpc::Status::OK;
+        }
+
         // Initiate inflight check based on mode + role:
         //   CROWN: every node sends its own token
         //   CHAIN/CRAQ: only head initiates
