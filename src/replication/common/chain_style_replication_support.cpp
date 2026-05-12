@@ -258,6 +258,7 @@ void ChainStyleReplicationSupport::send_client_ack(const chain::AckRequest& req)
 
     google::protobuf::Empty ignored;
     grpc::ClientContext ctx;
+    ctx.set_deadline(chrono::system_clock::now() + chrono::seconds(5));
     grpc::Status status = stub->Ack(&ctx, req, &ignored);
     if (!status.ok()) {
         cerr << "[ChainStyleReplicationSupport] Client ACK failed to " << req.client_addr()
@@ -512,6 +513,8 @@ void ChainStyleReplicationSupport::send_inflight_check(uint64_t reconfig_id, int
 }
 
 void ChainStyleReplicationSupport::predecessor_ack_worker_loop() {
+    static constexpr int kBackoffs[] = {1, 2, 5, 10};
+
     while (pred_ack_worker_running_.load(memory_order_acquire)) {
         chain::AckRequest req;
         {
@@ -527,17 +530,40 @@ void ChainStyleReplicationSupport::predecessor_ack_worker_loop() {
             pred_ack_queue_.pop_front();
         }
 
-        auto pred = predecessor_stub();
-        if (!pred) {
-            cerr << "[Support] Pred ACK dropped: no predecessor stub\n";
-            continue;
-        }
-        google::protobuf::Empty resp;
-        grpc::ClientContext ctx;
-        ctx.set_deadline(chrono::system_clock::now() + chrono::seconds(5));
-        grpc::Status st = pred->Ack(&ctx, req, &resp);
-        if (!st.ok()) {
-            cerr << "[Support] Pred ACK failed: " << st.error_message() << "\n";
+        int attempt = 0;
+        while (pred_ack_worker_running_.load(memory_order_acquire)) {
+            auto pred = predecessor_stub();
+            if (!pred) {
+                cerr << "[Support] Pred ACK waiting: no predecessor stub"
+                     << " key='" << req.key() << "' version=" << req.version() << "\n";
+            } else {
+                google::protobuf::Empty resp;
+                grpc::ClientContext ctx;
+                ctx.set_deadline(chrono::system_clock::now() + chrono::seconds(5));
+                grpc::Status st = pred->Ack(&ctx, req, &resp);
+                if (st.ok()) {
+                    cout << "[Support] Pred ACK delivered"
+                         << " key='" << req.key() << "' version=" << req.version() << "\n";
+                    break;
+                }
+
+                cerr << "[Support] Pred ACK attempt " << (attempt + 1)
+                     << " failed key='" << req.key() << "' version=" << req.version()
+                     << ": " << st.error_message() << "\n";
+            }
+
+            const int backoff = kBackoffs[min(
+                attempt,
+                static_cast<int>(sizeof(kBackoffs) / sizeof(kBackoffs[0])) - 1)];
+            ++attempt;
+
+            unique_lock<mutex> pred_lk(pred_ack_queue_mtx_);
+            pred_ack_queue_cv_.wait_for(
+                pred_lk,
+                chrono::seconds(backoff),
+                [this] {
+                    return !pred_ack_worker_running_.load(memory_order_acquire);
+                });
         }
     }
 }

@@ -148,24 +148,19 @@ void CRAQReplication::handle_propagate(const chain::PropagateRequest& req, Node&
         support_.mark_version_clean(req.key(), req.version());
 
         cout << "[CRAQ] Tail committed key='" << req.key()
-             << "' version=" << req.version() << " and sending ACK to client\n";
+             << "' version=" << req.version()
+             << " and starting ACK propagation\n";
 
         chain::AckRequest client_ack;
         client_ack.set_key(req.key());
         client_ack.set_version(req.version());
         client_ack.set_client_addr(req.client_addr());
         client_ack.set_request_id(req.request_id());
-        support_.send_client_ack(client_ack);
 
         if (!node.is_head()) {
-            chain::AckRequest ack;
-            ack.set_key(req.key());
-            ack.set_version(req.version());
-            ack.set_client_addr(req.client_addr());
-            ack.set_request_id(req.request_id());
-
-            support_.enqueue_predecessor_ack(ack);
+            support_.enqueue_predecessor_ack(client_ack);
         }
+        support_.send_client_ack(client_ack);
         return;
     }
 
