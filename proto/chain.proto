@@ -49,6 +49,7 @@ message NodeConfig {
     // Client populates head_ranges with N placeholders so servers can infer N.
     repeated KeyRange head_ranges = 9;
     repeated KeyRange tail_ranges = 10;
+    bool hold_frozen = 11; // reconfig: install config without resuming client traffic
 }
 
 // ============================================================
@@ -159,6 +160,10 @@ message InflightCheckRequest {
     int32  origin_node_id = 2; // CROWN: when origin == self, token has fully circled
 }
 
+message UnfreezeRequest {
+    uint64 reconfig_id = 1;
+}
+
 message FetchDataRequest {
     uint64 reconfig_id = 1;
 }
@@ -221,6 +226,7 @@ service ChainNode {
 
     // Reconfigure protocol — metadata_server -> Node, Node -> Node
     rpc Freeze              (FreezeRequest)        returns (google.protobuf.Empty);
+    rpc Unfreeze            (UnfreezeRequest)      returns (google.protobuf.Empty);
     rpc InflightCheck       (InflightCheckRequest) returns (google.protobuf.Empty);
     rpc FetchData           (FetchDataRequest)     returns (DataDump);
     rpc BootstrapFromSource (BootstrapRequest)     returns (google.protobuf.Empty);

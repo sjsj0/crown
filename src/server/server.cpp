@@ -92,9 +92,11 @@ public:
             }
         }
 
-        // A Configure arriving during freeze means reconfig is complete —
-        // resume accepting client writes.
-        if (frozen_.exchange(false)) {
+        if (req->hold_frozen()) {
+            frozen_.store(true);
+            cout << "[Server] Config installed and held frozen (reconfig_id="
+                 << active_reconfig_id_.load() << ")\n";
+        } else if (frozen_.exchange(false)) {
             cout << "[Server] Unfrozen by Configure (reconfig_id="
                  << active_reconfig_id_.load() << ")\n";
             active_reconfig_id_.store(0);
@@ -236,6 +238,27 @@ public:
             strategy_->support()->send_inflight_check(reconfig_id, my_id);
             cout << "[Server] Initiated InflightCheck origin=" << my_id << "\n";
         }
+        return grpc::Status::OK;
+    }
+
+    grpc::Status Unfreeze(grpc::ServerContext*          /*ctx*/,
+                          const chain::UnfreezeRequest* req,
+                          google::protobuf::Empty*      /*resp*/) override {
+        if (!strategy_)
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                "Node not configured yet");
+
+        const uint64_t active = active_reconfig_id_.load();
+        if (active != 0 && active != req->reconfig_id()) {
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                "stale unfreeze reconfig_id");
+        }
+
+        if (frozen_.exchange(false)) {
+            cout << "[Server] Unfrozen by Unfreeze RPC (reconfig_id="
+                 << req->reconfig_id() << ")\n";
+        }
+        active_reconfig_id_.store(0);
         return grpc::Status::OK;
     }
 

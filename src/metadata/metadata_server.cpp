@@ -607,7 +607,7 @@ private:
         // ----- Phase 4: Build + push new config -----
         ctx->phase_start = std::chrono::steady_clock::now();
         vector<NodeEntry> new_topology = build_new_topology(survivors, ctx, mode, is_add);
-        const int cfg_failures = push_topology(new_topology, mode);
+        const int cfg_failures = push_topology(new_topology, mode, true);
         const auto cfg_ms = ms_since(ctx->phase_start);
         cout << "[Reconfig " << ctx->id << "] New config pushed to " << new_topology.size()
              << " nodes (" << cfg_ms << "ms";
@@ -616,6 +616,14 @@ private:
 
         // Commit the new topology atomically
         state_->replace_nodes(new_topology);
+
+        ctx->phase_start = std::chrono::steady_clock::now();
+        const int unfreeze_failures = unfreeze_all(new_topology, ctx->id);
+        const auto unfreeze_ms = ms_since(ctx->phase_start);
+        cout << "[Reconfig " << ctx->id << "] Unfreeze sent to " << new_topology.size()
+             << " nodes (" << unfreeze_ms << "ms";
+        if (unfreeze_failures > 0) cout << ", " << unfreeze_failures << " failed";
+        cout << ")\n" << flush;
 
         const auto total_ms = ms_since(ctx->start_time);
         cout << "[Reconfig " << ctx->id << "] Complete (total: " << total_ms << "ms)\n" << flush;
@@ -649,6 +657,31 @@ private:
                 grpc::Status st = stub->Freeze(&ctx, req, &resp);
                 if (!st.ok()) {
                     cerr << "[Reconfig " << reconfig_id << "] Freeze RPC failed for node "
+                         << n.node_id << ": " << st.error_message() << "\n";
+                    failures.fetch_add(1);
+                }
+            });
+        }
+        for (auto& t : threads) t.join();
+        return failures.load();
+    }
+
+    int unfreeze_all(const vector<NodeEntry>& nodes, uint64_t reconfig_id) {
+        std::atomic<int> failures{0};
+        vector<std::thread> threads;
+        for (const auto& n : nodes) {
+            threads.emplace_back([&, n]() {
+                const string ep = n.endpoint();
+                auto channel = grpc::CreateChannel(ep, grpc::InsecureChannelCredentials());
+                auto stub = chain::ChainNode::NewStub(channel);
+                chain::UnfreezeRequest req;
+                req.set_reconfig_id(reconfig_id);
+                google::protobuf::Empty resp;
+                grpc::ClientContext ctx;
+                ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                grpc::Status st = stub->Unfreeze(&ctx, req, &resp);
+                if (!st.ok()) {
+                    cerr << "[Reconfig " << reconfig_id << "] Unfreeze RPC failed for node "
                          << n.node_id << ": " << st.error_message() << "\n";
                     failures.fetch_add(1);
                 }
@@ -745,7 +778,9 @@ private:
     }
 
     // Push Configure to all nodes in the new topology in parallel.
-    int push_topology(const vector<NodeEntry>& topology, chain::ReplicationMode mode) {
+    int push_topology(const vector<NodeEntry>& topology,
+                      chain::ReplicationMode mode,
+                      bool hold_frozen = false) {
         std::atomic<int> failures{0};
         const int crown_count = (mode == chain::ReplicationMode::CROWN)
                                   ? static_cast<int>(topology.size()) : 0;
@@ -769,6 +804,7 @@ private:
                 cfg.set_mode(mode);
                 cfg.set_is_head(n.is_head);
                 cfg.set_is_tail(n.is_tail);
+                cfg.set_hold_frozen(hold_frozen);
                 cfg.mutable_self_addr()->set_host(n.host);
                 cfg.mutable_self_addr()->set_port(n.port);
                 if (n.has_pred) {
