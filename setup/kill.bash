@@ -19,6 +19,21 @@ wait_for_pid_exit() {
   return 1
 }
 
+wait_for_no_process_match() {
+  local pattern="$1" label="$2"
+  local i
+  for i in {1..30}; do
+    if ! pgrep -u "$DEPLOY_USER" -f "$pattern" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  echo "WARNING: $label process(es) still running after waiting:"
+  pgrep -u "$DEPLOY_USER" -af "$pattern" || true
+  return 1
+}
+
 remove_stale_tmux_socket_if_safe() {
   [[ -S "$TMUX_SOCKET" ]] || return 0
 
@@ -92,6 +107,20 @@ fi
 echo "Killing server / metadata_server processes for user $DEPLOY_USER"
 pkill -u "$DEPLOY_USER" -f 'metadata_server' >/dev/null 2>&1 || true
 pkill -u "$DEPLOY_USER" -f 'server' >/dev/null 2>&1 || true
+echo "Killing benchmark client processes for user $DEPLOY_USER"
+pkill -u "$DEPLOY_USER" -f 'build/client .*bench-(write|read)' >/dev/null 2>&1 || true
+
+if ! wait_for_no_process_match 'build/client .*bench-(write|read)' "benchmark client"; then
+  echo "Force-killing lingering benchmark client processes"
+  pkill -9 -u "$DEPLOY_USER" -f 'build/client .*bench-(write|read)' >/dev/null 2>&1 || true
+  wait_for_no_process_match 'build/client .*bench-(write|read)' "benchmark client" || {
+    echo "ERROR: benchmark client process(es) are still running."
+    exit 1
+  }
+fi
+
+wait_for_no_process_match 'metadata_server' "metadata_server" || true
+wait_for_no_process_match 'build/server' "server" || true
 
 # Remove pid files in shared run directories
 echo "Cleaning up shared pid files"

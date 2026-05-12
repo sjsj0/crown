@@ -218,6 +218,15 @@ mkdir -p "$RUN_DIR"
 PID_FILE="$RUN_DIR/server_${NODE_PORT}.pid"
 LOG_FILE="$RUN_DIR/server_${NODE_PORT}.log"
 OUT_FILE="$RUN_DIR/server_${NODE_PORT}.out"
+TRUNCATE_RUN_LOGS_RAW="${TRUNCATE_RUN_LOGS:-false}"
+case "${TRUNCATE_RUN_LOGS_RAW,,}" in
+  1|true|yes|y|on) TRUNCATE_RUN_LOGS="true" ;;
+  0|false|no|n|off|"") TRUNCATE_RUN_LOGS="false" ;;
+  *)
+    echo "ERROR: TRUNCATE_RUN_LOGS must be true/false (or 1/0, yes/no). Got: $TRUNCATE_RUN_LOGS_RAW"
+    exit 1
+    ;;
+esac
 # SESSION_NAME="${TMUX_SESSION_NAME:-crown_node_${NODE_PORT}}"
 SESSION_NAME="${TMUX_SESSION_NAME:-crown}"
 TMUX_SOCKET="${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}"
@@ -237,6 +246,11 @@ echo "  log_file: $LOG_FILE"
 echo "  out_file: $OUT_FILE"
 echo "  session: $SESSION_NAME"
 echo "  tmux_socket: $TMUX_SOCKET"
+
+if [[ "$TRUNCATE_RUN_LOGS" == "true" ]]; then
+  : > "$LOG_FILE"
+  : > "$OUT_FILE"
+fi
 
 if "${TMUX_CMD[@]}" has-session -t "$SESSION_NAME" 2>/dev/null; then
   echo "Stopping existing tmux session: $SESSION_NAME"

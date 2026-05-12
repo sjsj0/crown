@@ -716,6 +716,7 @@ def base_remote_env(cfg: ExperimentConfig) -> dict[str, str]:
         "METADATA_PING_TIMEOUT_MS": str(cfg.metadata_ping_timeout_ms),
         "METADATA_FAILURE_THRESHOLD": str(cfg.metadata_failure_threshold),
         "METADATA_LOG": cfg.metadata_log,
+        "TRUNCATE_RUN_LOGS": "true",
         "BUILD_ONLY": "false",
         "START_ONLY": "true",
     }

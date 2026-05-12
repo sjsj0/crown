@@ -157,7 +157,10 @@ Runs write/read throughput tests using distributed client VMs. The clients fetch
 their topology from the metadata server, so **start the metadata server first**
 (`./vm_setup.bash start-metadata`). The runner takes a `--metadata HOST:PORT`
 endpoint (defaults to `$METADATA_HOST:$METADATA_PORT`); `--hosts` defaults to the
-machines in `setup/client_hosts.csv`.
+machines in `setup/client_hosts.csv`. With no explicit `--hosts` / `--hosts-file`,
+the runner sweeps `--client-counts 1 3 5` and uses exactly the first `N` hosts for
+each case. If you pass hosts explicitly, the default is to run exactly those hosts
+unless you also pass `--client-counts`.
 
 Because the metadata server defines the replication mode, run one mode at a time
 (restart `metadata_server` with a different `config.json` to switch modes). The

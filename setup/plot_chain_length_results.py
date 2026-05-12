@@ -13,6 +13,7 @@ from typing import Iterable, Sequence
 
 try:
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 except ImportError as exc:  # pragma: no cover - depends on local environment
     raise SystemExit(
         "matplotlib is required for plotting. Install it with: python3 -m pip install matplotlib"
@@ -40,6 +41,36 @@ MODE_STYLES = {
         "marker": "D",
     },
 }
+
+TAIL_LATENCY_SERIES = [
+    {
+        "key": "p50",
+        "label": "P50",
+        "mean": "latency_p50_mean_ms",
+        "stddev": "latency_p50_stddev_ms",
+        "linestyle": ":",
+        "marker": "^",
+        "linewidth": 1.8,
+    },
+    {
+        "key": "p95",
+        "label": "P95",
+        "mean": "latency_p95_mean_ms",
+        "stddev": "latency_p95_stddev_ms",
+        "linestyle": "--",
+        "marker": "s",
+        "linewidth": 2.0,
+    },
+    {
+        "key": "p99",
+        "label": "P99",
+        "mean": "latency_p99_mean_ms",
+        "stddev": "latency_p99_stddev_ms",
+        "linestyle": "-",
+        "marker": "D",
+        "linewidth": 2.2,
+    },
+]
 
 METRIC_DEFS = {
     "throughput": {
@@ -76,6 +107,12 @@ METRIC_DEFS = {
         "ylabel": "{operation_title} P99 Latency (ms)",
         "title": "{operation_title} P99 Latency vs Chain Length",
         "filename": "{operation}_latency_p99_clients{client_count}_keys{key_count}_ops{ops_per_client}",
+    },
+    "latency_percentiles": {
+        "combined": "tail_latency",
+        "ylabel": "{operation_title} Tail Latency (ms)",
+        "title": "{operation_title} P50/P95/P99 Latency vs Chain Length",
+        "filename": "{operation}_tail_latency_percentiles_clients{client_count}_keys{key_count}_ops{ops_per_client}",
     },
     "read_failures": {
         "mean": "read_failures_mean",
@@ -186,6 +223,14 @@ def read_summary(path: Path) -> list[SummaryRow]:
                 )
             )
     return rows
+
+
+def read_summary_fieldnames(path: Path) -> set[str]:
+    if not path.is_file():
+        raise SystemExit(f"summary CSV not found: {path}")
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        return set(reader.fieldnames or [])
 
 
 def operation_title(operation: str) -> str:
@@ -354,6 +399,112 @@ def make_plot(
     return out_paths
 
 
+def make_tail_latency_plot(
+    rows: Sequence[SummaryRow],
+    *,
+    series_list: Sequence[dict[str, object]],
+    out_dir: Path,
+    formats: Sequence[str],
+    dpi: int,
+) -> list[Path]:
+    metric_def = METRIC_DEFS["latency_percentiles"]
+    operation, client_count, key_count, ops_per_client = (
+        rows[0].operation,
+        rows[0].client_count,
+        rows[0].key_count,
+        rows[0].ops_per_client,
+    )
+    op_title = operation_title(operation)
+
+    by_mode: dict[str, list[SummaryRow]] = defaultdict(list)
+    for row in rows:
+        by_mode[row.mode].append(row)
+
+    fig, ax = plt.subplots(figsize=(9.3, 5.35))
+
+    max_y = 0.0
+    chain_lengths: set[int] = set()
+    for mode in MODE_ORDER:
+        mode_rows = sorted(by_mode.get(mode, []), key=lambda r: r.chain_length)
+        if not mode_rows:
+            continue
+
+        xs = [row.chain_length for row in mode_rows]
+        chain_lengths.update(xs)
+        mode_style = MODE_STYLES[mode]
+        for series in series_list:
+            ys = [metric_value(row, series["mean"]) for row in mode_rows]
+            yerrs = [metric_value(row, series["stddev"]) for row in mode_rows]
+            max_y = max(max_y, max((y + err for y, err in zip(ys, yerrs)), default=0.0))
+            ax.errorbar(
+                xs,
+                ys,
+                yerr=yerrs if any(err > 0.0 for err in yerrs) else None,
+                color=mode_style["color"],
+                linestyle=series["linestyle"],
+                marker=series["marker"],
+                linewidth=series["linewidth"],
+                markersize=5.6,
+                capsize=3,
+                elinewidth=0.9,
+                alpha=0.95,
+            )
+
+    percentile_title = "/".join(str(series["label"]) for series in series_list)
+    title = f"{op_title} {percentile_title} Latency vs Chain Length"
+    ylabel = metric_def["ylabel"].format(operation_title=op_title)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.set_xlabel("Chain Length")
+    ax.set_ylabel(ylabel)
+    if chain_lengths:
+        ax.set_xticks(sorted(chain_lengths))
+    ax.set_ylim(bottom=0, top=max(max_y * 1.18, 1.0))
+    ax.grid(True, linestyle="--", alpha=0.3, linewidth=0.6)
+
+    protocol_handles = [
+        Line2D([0], [0], color=MODE_STYLES[mode]["color"], linewidth=2.4, label=MODE_STYLES[mode]["label"])
+        for mode in MODE_ORDER
+        if mode in by_mode
+    ]
+    percentile_handles = [
+        Line2D(
+            [0],
+            [0],
+            color="#303030",
+            linestyle=series["linestyle"],
+            marker=series["marker"],
+            linewidth=series["linewidth"],
+            markersize=5.6,
+            label=series["label"],
+        )
+        for series in series_list
+    ]
+    protocol_legend = ax.legend(handles=protocol_handles, title="Protocol", loc="upper left", frameon=True)
+    ax.add_artist(protocol_legend)
+    ax.legend(handles=percentile_handles, title="Percentile", loc="upper right", frameon=True)
+
+    subtitle = f"clients={client_count}, keys={key_count}, ops/client={ops_per_client}"
+    incomplete = sorted({row.mode for row in rows if not row.all_trials_complete})
+    if incomplete:
+        subtitle += f", incomplete={','.join(MODE_STYLES[m]['label'] for m in incomplete)}"
+    fig.text(0.5, 0.01, subtitle, ha="center", fontsize=9)
+    fig.tight_layout(rect=(0, 0.035, 1, 1))
+
+    basename = metric_def["filename"].format(
+        operation=operation,
+        client_count=client_count,
+        key_count=key_count,
+        ops_per_client=ops_per_client,
+    )
+    out_paths: list[Path] = []
+    for fmt in formats:
+        path = out_dir / f"{safe_filename(basename)}.{fmt}"
+        fig.savefig(path, dpi=dpi)
+        out_paths.append(path)
+    plt.close(fig)
+    return out_paths
+
+
 def write_index(path: Path, rows: Sequence[dict[str, str]]) -> None:
     if not rows:
         return
@@ -396,7 +547,7 @@ def parse_args() -> argparse.Namespace:
         "--metrics",
         nargs="+",
         choices=sorted(METRIC_DEFS),
-        default=["throughput", "latency"],
+        default=["throughput", "latency", "latency_percentiles"],
         help="Metrics to plot.",
     )
     p.add_argument(
@@ -432,8 +583,59 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def available_tail_latency_series(fieldnames: set[str]) -> list[dict[str, object]]:
+    return [
+        series for series in TAIL_LATENCY_SERIES
+        if series["mean"] in fieldnames and series["stddev"] in fieldnames
+    ]
+
+
+def required_metric_fields(metric: str) -> list[str]:
+    metric_def = METRIC_DEFS[metric]
+    fields = [metric_def["mean"]]
+    if metric_def["stddev"]:
+        fields.append(metric_def["stddev"])
+    return fields
+
+
 def main() -> int:
     args = parse_args()
+    summary_fieldnames = read_summary_fieldnames(args.summary)
+    tail_latency_series = available_tail_latency_series(summary_fieldnames)
+    metrics = []
+    for metric in args.metrics:
+        if METRIC_DEFS[metric].get("combined") == "tail_latency":
+            if not tail_latency_series:
+                print(
+                    "Skipping latency_percentiles: summary CSV is missing all percentile latency columns",
+                    file=sys.stderr,
+                )
+                continue
+            omitted = [
+                series["label"] for series in TAIL_LATENCY_SERIES
+                if series not in tail_latency_series
+            ]
+            if omitted:
+                included = ", ".join(series["label"] for series in tail_latency_series)
+                print(
+                    f"Plotting latency_percentiles with {included}; "
+                    f"missing {', '.join(omitted)} in summary CSV",
+                    file=sys.stderr,
+                )
+            metrics.append(metric)
+            continue
+
+        missing = [field for field in required_metric_fields(metric) if field not in summary_fieldnames]
+        if missing:
+            print(
+                f"Skipping {metric}: summary CSV is missing {', '.join(missing)}",
+                file=sys.stderr,
+            )
+            continue
+        metrics.append(metric)
+    if not metrics:
+        raise SystemExit("none of the requested metrics exist in the summary CSV")
+
     rows = read_summary(args.summary)
     filtered = filter_rows(
         rows,
@@ -452,15 +654,24 @@ def main() -> int:
     for key in sorted(grouped, key=lambda k: (k[1], k[0], k[2], k[3])):
         group = grouped[key]
         operation, client_count, key_count, ops_per_client = key
-        for metric in args.metrics:
-            paths = make_plot(
-                group,
-                metric=metric,
-                out_dir=args.out_dir,
-                formats=args.formats,
-                dpi=args.dpi,
-                show_labels=not args.no_labels,
-            )
+        for metric in metrics:
+            if METRIC_DEFS[metric].get("combined") == "tail_latency":
+                paths = make_tail_latency_plot(
+                    group,
+                    series_list=tail_latency_series,
+                    out_dir=args.out_dir,
+                    formats=args.formats,
+                    dpi=args.dpi,
+                )
+            else:
+                paths = make_plot(
+                    group,
+                    metric=metric,
+                    out_dir=args.out_dir,
+                    formats=args.formats,
+                    dpi=args.dpi,
+                    show_labels=not args.no_labels,
+                )
             for path in paths:
                 index_rows.append(
                     {

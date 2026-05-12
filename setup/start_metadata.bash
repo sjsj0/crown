@@ -191,6 +191,15 @@ mkdir -p "$RUN_DIR"
 PID_FILE="$RUN_DIR/metadata_${META_PORT}.pid"
 LOG_FILE="$RUN_DIR/metadata_${META_PORT}.log"
 OUT_FILE="$RUN_DIR/metadata_${META_PORT}.out"
+TRUNCATE_RUN_LOGS_RAW="${TRUNCATE_RUN_LOGS:-false}"
+case "${TRUNCATE_RUN_LOGS_RAW,,}" in
+  1|true|yes|y|on) TRUNCATE_RUN_LOGS="true" ;;
+  0|false|no|n|off|"") TRUNCATE_RUN_LOGS="false" ;;
+  *)
+    echo "ERROR: TRUNCATE_RUN_LOGS must be true/false (or 1/0, yes/no). Got: $TRUNCATE_RUN_LOGS_RAW"
+    exit 1
+    ;;
+esac
 SESSION_NAME="${TMUX_METADATA_SESSION_NAME:-crown_metadata_${META_PORT}}"
 TMUX_SOCKET="${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}"
 TMUX_SOCKET_DIR="$(dirname "$TMUX_SOCKET")"
@@ -209,6 +218,11 @@ echo "  log_file: $LOG_FILE"
 echo "  session: $SESSION_NAME"
 echo "  config: $META_CONFIG"
 echo "  metadata_log: $METADATA_LOG"
+
+if [[ "$TRUNCATE_RUN_LOGS" == "true" ]]; then
+  : > "$LOG_FILE"
+  : > "$OUT_FILE"
+fi
 
 if "${TMUX_CMD[@]}" has-session -t "$SESSION_NAME" 2>/dev/null; then
   echo "Stopping existing tmux session: $SESSION_NAME"

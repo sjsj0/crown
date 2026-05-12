@@ -190,10 +190,10 @@ Notes: `client_index` in `[0, num_clients)`; `hot=N` (also accepts `crown_hot_he
 
 ## 6) Distributed throughput runner
 
-Drives one client process per host (from `--hosts`, default `setup/client_hosts.csv`); auto-assigns `client_index=0..N-1`. Metadata server must already be running. The metadata server defines the mode — run one mode at a time; `--modes` here is only a log/key-prefix label.
+Drives distributed client benchmark runs from `setup/client_hosts.csv` by default. With no `--hosts` / `--hosts-file`, it sweeps `--client-counts 1 3 5` and uses exactly the first `N` hosts for each case, auto-assigning `client_index=0..N-1`. If you pass `--hosts` or `--hosts-file` explicitly, the default is to use exactly those supplied hosts unless you also pass `--client-counts`. Metadata server must already be running. The metadata server defines the mode — run one mode at a time; `--modes` here is only a log/key-prefix label.
 
 ```bash
-# multi-client (one process per VM in client_hosts.csv)
+# default client-count sweep: 1, then 3, then 5 clients from setup/client_hosts.csv
 python3 setup/run_throughput_experiments.py \
   --ssh-user ritwikg3 --remote-repo-dir /home/crown \
   --metadata sp26-cs525-1201.cs.illinois.edu:50050 \
@@ -209,6 +209,14 @@ python3 setup/run_throughput_experiments.py \
   --modes crown --ops write read \
   --write-op-count 5000 --read-op-count 5000 --key-count 64 \
   --work-dir build/prod_throughput_single_client
+
+# custom client-count sweep from the first N hosts in setup/client_hosts.csv
+python3 setup/run_throughput_experiments.py \
+  --ssh-user ritwikg3 --remote-repo-dir /home/crown \
+  --metadata sp26-cs525-1201.cs.illinois.edu:50050 \
+  --modes crown --ops write \
+  --client-counts 1 2 4 \
+  --write-op-count 25000 --key-count 64
 
 # CHAIN / CRAQ / CROWN — restart metadata_server with the matching config first
 python3 setup/run_throughput_experiments.py --ssh-user ritwikg3 --remote-repo-dir /home/crown \
@@ -235,7 +243,7 @@ python3 setup/run_throughput_experiments.py ... --dry-run
 
 Outputs per `--work-dir <DIR>`: `<DIR>/logs/*.log`, `<DIR>/ssh_logs/*.log`, `<DIR>/summary.csv`. Aggregate further with `python3 setup/aggregate_bench_results.py` if needed.
 
-Key args: `--metadata host:port` (default `$METADATA_HOST:$METADATA_PORT`), `--hosts` / `--hosts-file`, `--modes` (chain|craq|crown, label only), `--ops` (write read), `--write-op-count` / `--read-op-count`, `--key-count`, `--craq-read-node-id`, `--crown-hot-head-pct`, `--read-hot-key-pct`, `--work-dir`, `--dry-run`. The write/read op counts are per client process, so aggregate requested work is `client_count * op_count`.
+Key args: `--metadata host:port` (default `$METADATA_HOST:$METADATA_PORT`), `--hosts` / `--hosts-file`, `--client-counts`, `--modes` (chain|craq|crown, label only), `--ops` (write read), `--write-op-count` / `--read-op-count`, `--key-count`, `--craq-read-node-id`, `--crown-hot-head-pct`, `--read-hot-key-pct`, `--work-dir`, `--dry-run`. The write/read op counts are per client process, so aggregate requested work is `client_count * op_count`.
 
 ---
 
@@ -370,7 +378,8 @@ Plot the chain-length summaries:
 # one-time local dependency, if matplotlib is not already installed
 python3 -m pip install matplotlib
 
-# writes PNG plots into build/chain_length_throughput_runs/plots/
+# writes throughput, average latency, and combined p50/p95/p99 latency PNG plots into
+# build/chain_length_throughput_runs/plots/
 python3 setup/plot_chain_length_results.py
 
 # only make throughput plots for one-client experiments
@@ -378,9 +387,9 @@ python3 setup/plot_chain_length_results.py \
   --metrics throughput \
   --client-counts 1
 
-# plot average plus percentile latencies
+# plot only average latency plus the combined p50/p95/p99 latency figure
 python3 setup/plot_chain_length_results.py \
-  --metrics latency latency_p50 latency_p95 latency_p99
+  --metrics latency latency_percentiles
 
 # emit both PNG and PDF, skipping incomplete trial groups
 python3 setup/plot_chain_length_results.py \
@@ -393,6 +402,34 @@ The plotting script uses fixed styles on every figure:
 - `CHAIN`: blue solid line with circle markers
 - `CRAQ`: orange dashed line with square markers
 - `CROWN`: green dash-dot line with diamond markers
+
+Write-count throughput sweep:
+
+```bash
+# default: total writes 50k, 100k, 200k, 400k; modes chain/craq/crown;
+# chain length 3; one client; three trials; key-count 64
+python3 setup/run_write_count_experiments.py
+
+# dry-run the planned commands
+python3 setup/run_write_count_experiments.py --dry-run
+
+# custom version
+python3 setup/run_write_count_experiments.py \
+  --write-counts 50000 100000 200000 400000 \
+  --chain-length 3 \
+  --client-count 1 \
+  --trials 3 \
+  --key-count 64
+```
+
+Outputs:
+
+- `build/write_count_throughput_runs/write_count_throughput.csv`
+- `build/write_count_throughput_runs/write_count_throughput.png`
+
+The x-axis is aggregate requested writes. If you use more than one client,
+each write count must divide evenly by `--client-count`; the script passes
+`write_count / client_count` as the per-client write count to the benchmark.
 
 ---
 

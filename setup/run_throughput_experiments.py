@@ -24,6 +24,7 @@ class RunnerConfig:
     summary_csv: Path
 
     hosts: List[str]
+    client_counts: List[int]
     modes: List[str]
     ops: List[str]
 
@@ -64,6 +65,39 @@ class ActiveLaunch:
 
 def log(msg: str) -> None:
     print(f"[throughput-runner] {msg}", flush=True)
+
+
+def load_dotenv(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+
+        raw_value = raw_value.strip()
+        try:
+            parsed = shlex.split(raw_value, comments=True, posix=True)
+            values[key] = parsed[0] if parsed else ""
+        except ValueError:
+            values[key] = raw_value.strip("'\"")
+    return values
+
+
+def apply_dotenv_defaults(path: Path) -> None:
+    for key, value in load_dotenv(path).items():
+        os.environ.setdefault(key, value)
 
 
 def env_str(name: str, default: str) -> str:
@@ -125,6 +159,17 @@ def unique_preserve_order(items: Sequence[str]) -> List[str]:
     return out
 
 
+def unique_ints_preserve_order(items: Sequence[int]) -> List[int]:
+    seen = set()
+    out: List[int] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
 def shell_quote(s: str) -> str:
     return shlex.quote(s)
 
@@ -157,6 +202,16 @@ def parse_args(root_dir: Path) -> argparse.Namespace:
 
     p.add_argument("--hosts", default=env_str("HOSTS", ""), help="Comma-separated host list")
     p.add_argument("--hosts-file", default=env_str("HOSTS_FILE", ""), help="Host file (CSV or one-per-line)")
+    p.add_argument(
+        "--client-counts",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Client counts to sweep. Defaults to 1 3 5 when using setup/client_hosts.csv; "
+            "defaults to all explicitly supplied hosts when --hosts/--hosts-file is set."
+        ),
+    )
 
     p.add_argument("--modes", nargs="+", default=env_words("MODES", "chain craq crown"))
     p.add_argument("--ops", nargs="+", default=env_words("OPS", "write read"))
@@ -278,6 +333,37 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
     if not hosts:
         raise RunnerError("no hosts provided; use --hosts / --hosts-file or populate setup/client_hosts.csv")
 
+    env_client_counts = env_words("CLIENT_COUNTS", "")
+    if args.client_counts is not None:
+        client_counts = unique_ints_preserve_order(args.client_counts)
+    elif env_client_counts:
+        try:
+            client_counts = unique_ints_preserve_order([int(item) for item in env_client_counts])
+        except ValueError as exc:
+            raise RunnerError(f"invalid integer in CLIENT_COUNTS: {' '.join(env_client_counts)}") from exc
+    elif args.hosts.strip() or args.hosts_file.strip():
+        client_counts = [len(hosts)]
+    else:
+        client_counts = [1, 3, 5]
+
+    if not client_counts:
+        raise RunnerError("--client-counts cannot be empty")
+    bad_client_counts = [count for count in client_counts if count <= 0]
+    if bad_client_counts:
+        raise RunnerError(f"--client-counts values must be > 0, got: {bad_client_counts}")
+    max_client_count = max(client_counts)
+    if max_client_count > len(hosts):
+        raise RunnerError(
+            f"not enough client hosts for --client-counts: need {max_client_count}, "
+            f"found {len(hosts)}"
+        )
+    planned_cases = len(modes) * len(ops) * len(client_counts)
+    max_ack_port = args.ack_base_port + max(0, planned_cases - 1) * 100 + max_client_count - 1
+    if max_ack_port > 65535:
+        raise RunnerError(
+            f"--ack-base-port too high for planned cases/client counts: highest port would be {max_ack_port}"
+        )
+
     metadata_addr = args.metadata.strip()
     if not metadata_addr:
         meta_host = env_str("METADATA_HOST", "").strip()
@@ -307,7 +393,7 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
     ]
     ssh_key = args.ssh_key.strip()
     if ssh_key:
-        key_path = Path(ssh_key)
+        key_path = Path(ssh_key).expanduser()
         if not key_path.is_file():
             raise RunnerError(f"ssh key not found: {ssh_key}")
         ssh_opts = ["-i", str(key_path)] + ssh_opts
@@ -324,6 +410,7 @@ def build_config(args: argparse.Namespace, root_dir: Path) -> RunnerConfig:
         ssh_log_dir=ssh_log_dir,
         summary_csv=summary_csv,
         hosts=hosts,
+        client_counts=client_counts,
         modes=modes,
         ops=ops,
         write_op_count=args.write_op_count,
@@ -370,8 +457,8 @@ def build_remote_client_command(
     # The client fetches topology (and the actual replication mode) from the
     # metadata server. The `mode` here is only a label for prefixes / filenames;
     # make sure the running metadata server is configured with that mode.
-    key_prefix = cfg.key_prefix_exact or f"{cfg.key_prefix_base}-{mode}-{op}-"
-    value_prefix = cfg.value_prefix_exact or f"{cfg.value_prefix_base}-{mode}-{op}-"
+    key_prefix = cfg.key_prefix_exact or f"{cfg.key_prefix_base}-{mode}-{op}-c{num_clients}-"
+    value_prefix = cfg.value_prefix_exact or f"{cfg.value_prefix_base}-{mode}-{op}-c{num_clients}-"
 
     cmd = [
         cfg.remote_client_bin,
@@ -410,8 +497,9 @@ def build_remote_client_command(
     return cmd, remote_log_file
 
 
-def launch_case(cfg: RunnerConfig, mode: str, op: str, run_idx: int) -> None:
-    num_clients = len(cfg.hosts)
+def launch_case(cfg: RunnerConfig, mode: str, op: str, client_count: int, run_idx: int) -> None:
+    hosts = cfg.hosts[:client_count]
+    num_clients = len(hosts)
     ops_per_client = cfg.write_op_count if op == "write" else cfg.read_op_count
     aggregate_requested_ops = ops_per_client * num_clients
     log(
@@ -422,7 +510,7 @@ def launch_case(cfg: RunnerConfig, mode: str, op: str, run_idx: int) -> None:
 
     launches: List[ActiveLaunch] = []
 
-    for client_index, host in enumerate(cfg.hosts):
+    for client_index, host in enumerate(hosts):
         ack_port = cfg.ack_base_port + run_idx * 100 + client_index
 
         client_cmd, remote_log_file = build_remote_client_command(
@@ -539,13 +627,15 @@ def aggregate_results(cfg: RunnerConfig) -> None:
 
 def main() -> int:
     root_dir = Path(__file__).resolve().parent.parent
+    apply_dotenv_defaults(root_dir / "setup" / ".env")
     args = parse_args(root_dir)
     cfg = build_config(args, root_dir)
 
     cleanup_previous_logs(cfg)
 
     log("Distributed benchmark configuration")
-    log(f"  hosts={cfg.hosts}")
+    log(f"  hosts_available={cfg.hosts}")
+    log(f"  client_counts={cfg.client_counts}")
     log(f"  metadata={cfg.metadata_addr}")
     log(f"  modes={cfg.modes}")
     log(f"  ops={cfg.ops}")
@@ -559,13 +649,17 @@ def main() -> int:
     run_idx = 0
     for mode in cfg.modes:
         for op in cfg.ops:
-            try:
-                launch_case(cfg, mode, op, run_idx)
-            except RunnerError:
-                if cfg.fail_fast:
-                    raise
-                log(f"Continuing after failed case mode={mode} op={op} because --fail-fast=false")
-            run_idx += 1
+            for client_count in cfg.client_counts:
+                try:
+                    launch_case(cfg, mode, op, client_count, run_idx)
+                except RunnerError:
+                    if cfg.fail_fast:
+                        raise
+                    log(
+                        f"Continuing after failed case mode={mode} op={op} "
+                        f"clients={client_count} because --fail-fast=false"
+                    )
+                run_idx += 1
 
     if cfg.dry_run:
         log("Dry run complete. No commands executed.")
