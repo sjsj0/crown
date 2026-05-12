@@ -50,6 +50,15 @@ RAW_FIELDNAMES = [
     "throughput_ops_per_sec",
     "weighted_avg_ack_latency_ms",
     "weighted_avg_read_latency_ms",
+    "weighted_p50_ack_latency_ms",
+    "weighted_p95_ack_latency_ms",
+    "weighted_p99_ack_latency_ms",
+    "weighted_p50_read_latency_ms",
+    "weighted_p95_read_latency_ms",
+    "weighted_p99_read_latency_ms",
+    "latency_p50_ms",
+    "latency_p95_ms",
+    "latency_p99_ms",
     "complete",
     "status",
     "error",
@@ -72,6 +81,12 @@ SUMMARY_FIELDNAMES = [
     "throughput_stddev",
     "latency_mean_ms",
     "latency_stddev_ms",
+    "latency_p50_mean_ms",
+    "latency_p50_stddev_ms",
+    "latency_p95_mean_ms",
+    "latency_p95_stddev_ms",
+    "latency_p99_mean_ms",
+    "latency_p99_stddev_ms",
     "read_failures_mean",
     "write_rpc_failures_mean",
     "all_trials_complete",
@@ -365,13 +380,13 @@ def parse_args(root_dir: Path, dotenv: dict[str, str]) -> argparse.Namespace:
     p.add_argument(
         "--write-op-count",
         type=int,
-        default=env_int(dotenv, "WRITE_OP_COUNT", 50000),
+        default=env_int(dotenv, "WRITE_OP_COUNT", 25000),
         help="Write operations per client process.",
     )
     p.add_argument(
         "--read-op-count",
         type=int,
-        default=env_int(dotenv, "READ_OP_COUNT", 50000),
+        default=env_int(dotenv, "READ_OP_COUNT", 25000),
         help="Read operations per client process.",
     )
     p.add_argument("--craq-read-node-id", type=int, default=env_int(dotenv, "CRAQ_READ_NODE_ID", -1))
@@ -915,6 +930,10 @@ def build_raw_row(cfg: ExperimentConfig,
         if case.op == "write"
         else summary_row.get("agg_read_resp_rps", "0")
     )
+    latency_kind = "ack" if case.op == "write" else "read"
+    latency_p50 = summary_row.get(f"weighted_p50_{latency_kind}_latency_ms", "0")
+    latency_p95 = summary_row.get(f"weighted_p95_{latency_kind}_latency_ms", "0")
+    latency_p99 = summary_row.get(f"weighted_p99_{latency_kind}_latency_ms", "0")
     ops_per_client = op_count_for_case(cfg, case)
     return {
         "experiment_id": case.experiment_id,
@@ -947,6 +966,15 @@ def build_raw_row(cfg: ExperimentConfig,
         "throughput_ops_per_sec": throughput,
         "weighted_avg_ack_latency_ms": summary_row.get("weighted_avg_ack_latency_ms", "0"),
         "weighted_avg_read_latency_ms": summary_row.get("weighted_avg_read_latency_ms", "0"),
+        "weighted_p50_ack_latency_ms": summary_row.get("weighted_p50_ack_latency_ms", "0"),
+        "weighted_p95_ack_latency_ms": summary_row.get("weighted_p95_ack_latency_ms", "0"),
+        "weighted_p99_ack_latency_ms": summary_row.get("weighted_p99_ack_latency_ms", "0"),
+        "weighted_p50_read_latency_ms": summary_row.get("weighted_p50_read_latency_ms", "0"),
+        "weighted_p95_read_latency_ms": summary_row.get("weighted_p95_read_latency_ms", "0"),
+        "weighted_p99_read_latency_ms": summary_row.get("weighted_p99_read_latency_ms", "0"),
+        "latency_p50_ms": latency_p50,
+        "latency_p95_ms": latency_p95,
+        "latency_p99_ms": latency_p99,
         "complete": summary_row.get("complete", "False"),
         "status": "ok",
         "error": "",
@@ -999,9 +1027,9 @@ def csv_int(row: dict[str, str], field: str) -> int:
 
 def raw_row_sort_key(row: dict[str, str]) -> tuple[int, int, int, int, int, int, int, str]:
     return (
-        csv_int(row, "chain_length"),
         csv_int(row, "client_count"),
         OP_SORT_ORDER.get(row.get("operation", ""), 99),
+        csv_int(row, "chain_length"),
         csv_int(row, "trial"),
         MODE_SORT_ORDER.get(row.get("mode", ""), 99),
         csv_int(row, "key_count"),
@@ -1012,9 +1040,9 @@ def raw_row_sort_key(row: dict[str, str]) -> tuple[int, int, int, int, int, int,
 
 def summary_row_sort_key(row: dict[str, str]) -> tuple[int, int, int, int, int, int, str]:
     return (
-        csv_int(row, "chain_length"),
         csv_int(row, "client_count"),
         OP_SORT_ORDER.get(row.get("operation", ""), 99),
+        csv_int(row, "chain_length"),
         MODE_SORT_ORDER.get(row.get("mode", ""), 99),
         csv_int(row, "key_count"),
         csv_int(row, "ops_per_client") or csv_int(row, "op_count"),
@@ -1071,9 +1099,9 @@ def summarize_rows(cfg: ExperimentConfig, raw_rows: Sequence[dict[str, str]]) ->
     for key, rows in sorted(
         grouped.items(),
         key=lambda item: (
-            int(item[0][0]),
             int(item[0][1]),
             OP_SORT_ORDER.get(item[0][2], 99),
+            int(item[0][0]),
             MODE_SORT_ORDER.get(item[0][3], 99),
             int(item[0][4]),
             int(item[0][5]),
@@ -1100,6 +1128,24 @@ def summarize_rows(cfg: ExperimentConfig, raw_rows: Sequence[dict[str, str]]) ->
             ]
             if value is not None
         ]
+        def latency_percentile_values(percentile: int) -> list[float]:
+            return [
+                value for row in complete_rows
+                for value in [
+                    to_float(
+                        row.get(
+                            f"weighted_p{percentile}_ack_latency_ms" if row.get("operation") == "write"
+                            else f"weighted_p{percentile}_read_latency_ms",
+                            "",
+                        )
+                    )
+                ]
+                if value is not None
+            ]
+
+        latency_p50_values = latency_percentile_values(50)
+        latency_p95_values = latency_percentile_values(95)
+        latency_p99_values = latency_percentile_values(99)
         read_failure_values = [
             value for row in complete_rows
             for value in [to_float(row.get("read_failures", ""))]
@@ -1131,6 +1177,12 @@ def summarize_rows(cfg: ExperimentConfig, raw_rows: Sequence[dict[str, str]]) ->
                 "throughput_stddev": f"{sample_stddev(throughput_values):.6f}",
                 "latency_mean_ms": f"{mean(latency_values):.6f}",
                 "latency_stddev_ms": f"{sample_stddev(latency_values):.6f}",
+                "latency_p50_mean_ms": f"{mean(latency_p50_values):.6f}",
+                "latency_p50_stddev_ms": f"{sample_stddev(latency_p50_values):.6f}",
+                "latency_p95_mean_ms": f"{mean(latency_p95_values):.6f}",
+                "latency_p95_stddev_ms": f"{sample_stddev(latency_p95_values):.6f}",
+                "latency_p99_mean_ms": f"{mean(latency_p99_values):.6f}",
+                "latency_p99_stddev_ms": f"{sample_stddev(latency_p99_values):.6f}",
                 "read_failures_mean": f"{mean(read_failure_values):.6f}",
                 "write_rpc_failures_mean": f"{mean(write_failure_values):.6f}",
                 "all_trials_complete": str(len(complete_rows) == cfg.trials),
@@ -1150,9 +1202,9 @@ def write_summary_csv(path: Path, rows: Sequence[dict[str, str]]) -> None:
 def build_cases(cfg: ExperimentConfig) -> List[ExperimentCase]:
     cases: List[ExperimentCase] = []
     index = 0
-    for chain_length in cfg.chain_lengths:
-        for client_count in cfg.client_counts:
-            for op in cfg.ops:
+    for client_count in cfg.client_counts:
+        for op in cfg.ops:
+            for chain_length in cfg.chain_lengths:
                 for trial in range(1, cfg.trials + 1):
                     for mode in cfg.modes:
                         index += 1
@@ -1257,7 +1309,7 @@ def print_plan(cfg: ExperimentConfig, cases: Sequence[ExperimentCase]) -> None:
     log(f"  client_counts={cfg.client_counts}")
     log(f"  ops={cfg.ops}")
     log(f"  trials={cfg.trials}")
-    log("  case_order=chain_length -> client_count -> operation -> trial -> mode")
+    log("  case_order=client_count -> operation -> chain_length -> trial -> mode")
     log(f"  planned_benchmark_runs={len(cases)}")
     log(f"  key_count={cfg.key_count}")
     log(f"  write_ops_per_client={cfg.write_op_count}")

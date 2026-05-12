@@ -173,16 +173,16 @@ metadata `host:port` (topology and replication mode come from there).
 ```bash
 # --- benchmark: write ---
 ./build/client <metadata_host:port> [ack_port] bench-write <ops_per_client> <key_count> <client_index> <num_clients> [key_prefix] [value_prefix] [hot=<0-100>]
-# e.g. 50k writes from this client, 64 keys, this is client 0 of 1
-./build/client sp26-cs525-1201.cs.illinois.edu:50050 bench-write 50000 64 0 1
+# e.g. 25k writes from this client, 64 keys, this is client 0 of 1
+./build/client sp26-cs525-1201.cs.illinois.edu:50050 bench-write 25000 64 0 1
 
 # --- benchmark: read ---
 ./build/client <metadata_host:port> [ack_port] bench-read <ops_per_client> <key_count> <client_index> <num_clients> [craq_node_id] [key_prefix] [hot=<0-100>]
-# e.g. 50k reads from this client, 64 keys, CRAQ read from any node (-1)
-./build/client sp26-cs525-1201.cs.illinois.edu:50050 bench-read 50000 64 0 1 -1
+# e.g. 25k reads from this client, 64 keys, CRAQ read from any node (-1)
+./build/client sp26-cs525-1201.cs.illinois.edu:50050 bench-read 25000 64 0 1 -1
 ```
 
-Notes: `client_index` in `[0, num_clients)`; `hot=N` (also accepts `crown_hot_head_pct=N` for write / `read_hot_key_pct=N` for read) skews load toward one head/key. The client must already be built on that VM (`cmake --build build --target client`).
+Notes: `client_index` in `[0, num_clients)`; `hot=N` (also accepts `crown_hot_head_pct=N` for write / `read_hot_key_pct=N` for read) skews load toward one head/key. In normal, non-skewed CROWN benchmark runs, the client precomputes a balanced keyset and request sequence so operations map evenly across the CROWN ring heads; the hot-key/head flags intentionally override that balance. The client must already be built on that VM (`cmake --build build --target client`).
 
 ---
 
@@ -196,7 +196,7 @@ python3 setup/run_throughput_experiments.py \
   --ssh-user ritwikg3 --remote-repo-dir /home/crown \
   --metadata sp26-cs525-1201.cs.illinois.edu:50050 \
   --modes crown --ops write read \
-  --write-op-count 50000 --read-op-count 50000 --key-count 64 \
+  --write-op-count 25000 --read-op-count 25000 --key-count 64 \
   --work-dir build/prod_throughput_multi_client
 
 # single-client (one VM)
@@ -211,21 +211,21 @@ python3 setup/run_throughput_experiments.py \
 # CHAIN / CRAQ / CROWN — restart metadata_server with the matching config first
 python3 setup/run_throughput_experiments.py --ssh-user ritwikg3 --remote-repo-dir /home/crown \
   --metadata sp26-cs525-1201.cs.illinois.edu:50050 --modes chain --ops write read \
-  --write-op-count 50000 --read-op-count 50000 --key-count 64 --work-dir build/prod_chain_only
+  --write-op-count 25000 --read-op-count 25000 --key-count 64 --work-dir build/prod_chain_only
 
 python3 setup/run_throughput_experiments.py --ssh-user ritwikg3 --remote-repo-dir /home/crown \
   --metadata sp26-cs525-1201.cs.illinois.edu:50050 --modes craq --ops write read \
-  --write-op-count 50000 --read-op-count 50000 --key-count 64 --craq-read-node-id -1 --work-dir build/prod_craq_only
+  --write-op-count 25000 --read-op-count 25000 --key-count 64 --craq-read-node-id -1 --work-dir build/prod_craq_only
 
 # CROWN hot-head write skew (60% of writes to one head)
 python3 setup/run_throughput_experiments.py --ssh-user ritwikg3 --remote-repo-dir /home/crown \
   --metadata sp26-cs525-1201.cs.illinois.edu:50050 --modes crown --ops write \
-  --write-op-count 50000 --key-count 64 --crown-hot-head-pct 60 --work-dir build/prod_crown_hot_60
+  --write-op-count 25000 --key-count 64 --crown-hot-head-pct 60 --work-dir build/prod_crown_hot_60
 
 # read hot-key skew (80% of reads to one key)
 python3 setup/run_throughput_experiments.py --ssh-user ritwikg3 --remote-repo-dir /home/crown \
   --metadata sp26-cs525-1201.cs.illinois.edu:50050 --modes crown --ops read \
-  --read-op-count 50000 --key-count 64 --read-hot-key-pct 80 --work-dir build/prod_read_hot_80
+  --read-op-count 25000 --key-count 64 --read-hot-key-pct 80 --work-dir build/prod_read_hot_80
 
 # preview the SSH/SCP plan without running it
 python3 setup/run_throughput_experiments.py ... --dry-run
@@ -260,21 +260,21 @@ Default experiment grid:
 - operations: `write read`
 - trials: `3`
 - unique keys per benchmark run: `64`
-- writes per client for each write benchmark run: `50000`
-- reads per client for each read benchmark run: `50000`
+- writes per client for each write benchmark run: `25000`
+- reads per client for each read benchmark run: `25000`
 
 That is `3 * 3 * 3 * 2 * 3 = 162` benchmark runs. Each benchmark
 run gets a full kill/start cycle before it runs. A benchmark run is one
 operation for one tuple, e.g. `n=5, mode=crown, clients=3, op=write, trial=2`.
-With the defaults, a 3-client write benchmark requests `3 * 50000 = 150000`
+With the defaults, a 3-client write benchmark requests `3 * 25000 = 75000`
 total writes across the clients.
 
-Run order is `chain_length -> client_count -> operation -> trial -> mode`, so
-the runner completes all trials for `write` before moving to `read`. Within
-each trial it executes `chain`, then `craq`, then `crown` for the same chain
-length/client count/operation.
-The generated CSVs use this same order, so spreadsheet views keep the write
-rows together and the read rows together.
+Run order is `client_count -> operation -> chain_length -> trial -> mode`, so
+the runner sweeps all configured chain lengths for `write` before moving to
+`read`. Within each trial it executes `chain`, then `craq`, then `crown` for
+the same chain length/client count/operation. The generated CSVs use this same
+order, so spreadsheet views keep write rows together across chain lengths, then
+read rows together across chain lengths.
 
 Quick smoke run:
 
@@ -319,8 +319,8 @@ Inputs from code defaults unless overridden:
 - `--ops write read`
 - `--trials 3`
 - `--key-count 64`
-- `--write-op-count 50000` per client
-- `--read-op-count 50000` per client
+- `--write-op-count 25000` per client
+- `--read-op-count 25000` per client
 - `--stabilization-seconds 3`
 - `--server-log false`
 - `--metadata-log false`
@@ -338,8 +338,8 @@ Outputs:
   `total_requested_ops`, server/client host lists, config path, and source log
   path. `op_count` is kept as an alias for `ops_per_client`.
 - `build/chain_length_throughput_runs/summary_by_chain_length.csv` — grouped
-  rows with `throughput_mean`, `throughput_stddev`, `latency_mean_ms`, and
-  `latency_stddev_ms` for graph error bars.
+  rows with `throughput_mean`, `throughput_stddev`, average latency, and p50,
+  p95, and p99 latency means/stddevs for graph error bars.
   For write rows, latency is weighted write-ack latency; for read rows, latency
   is weighted read RPC response latency.
 - Per-case logs under `build/chain_length_throughput_runs/cases/`.
@@ -361,6 +361,36 @@ the remote build on all server, client, and metadata hosts before the full run:
 python3 setup/run_chain_length_experiments.py --dry-run
 python3 setup/run_chain_length_experiments.py
 ```
+
+Plot the chain-length summaries:
+
+```bash
+# one-time local dependency, if matplotlib is not already installed
+python3 -m pip install matplotlib
+
+# writes PNG plots into build/chain_length_throughput_runs/plots/
+python3 setup/plot_chain_length_results.py
+
+# only make throughput plots for one-client experiments
+python3 setup/plot_chain_length_results.py \
+  --metrics throughput \
+  --client-counts 1
+
+# plot average plus percentile latencies
+python3 setup/plot_chain_length_results.py \
+  --metrics latency latency_p50 latency_p95 latency_p99
+
+# emit both PNG and PDF, skipping incomplete trial groups
+python3 setup/plot_chain_length_results.py \
+  --formats png pdf \
+  --only-complete
+```
+
+The plotting script uses fixed styles on every figure:
+
+- `CHAIN`: blue solid line with circle markers
+- `CRAQ`: orange dashed line with square markers
+- `CROWN`: green dash-dot line with diamond markers
 
 ---
 

@@ -164,13 +164,13 @@ def parse_args(root_dir: Path) -> argparse.Namespace:
     p.add_argument(
         "--write-op-count",
         type=int,
-        default=env_int("WRITE_OP_COUNT", 50000),
+        default=env_int("WRITE_OP_COUNT", 25000),
         help="Write operations per client process.",
     )
     p.add_argument(
         "--read-op-count",
         type=int,
-        default=env_int("READ_OP_COUNT", 50000),
+        default=env_int("READ_OP_COUNT", 25000),
         help="Read operations per client process.",
     )
     p.add_argument("--key-count", type=int, default=env_int("KEY_COUNT", 64))

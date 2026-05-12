@@ -31,6 +31,12 @@ class SummaryRecord:
     read_resp_rps: float
     avg_ack_latency_ms: float
     avg_read_latency_ms: float
+    p50_ack_latency_ms: float
+    p95_ack_latency_ms: float
+    p99_ack_latency_ms: float
+    p50_read_latency_ms: float
+    p95_read_latency_ms: float
+    p99_read_latency_ms: float
     source_file: str
 
 
@@ -79,6 +85,12 @@ def parse_summary_line(line: str, source_file: str) -> SummaryRecord | None:
         read_resp_rps=float_field("read_resp_rps"),
         avg_ack_latency_ms=float_field("avg_ack_latency_ms"),
         avg_read_latency_ms=float_field("avg_read_latency_ms"),
+        p50_ack_latency_ms=float_field("p50_ack_latency_ms"),
+        p95_ack_latency_ms=float_field("p95_ack_latency_ms"),
+        p99_ack_latency_ms=float_field("p99_ack_latency_ms"),
+        p50_read_latency_ms=float_field("p50_read_latency_ms"),
+        p95_read_latency_ms=float_field("p95_read_latency_ms"),
+        p99_read_latency_ms=float_field("p99_read_latency_ms"),
         source_file=source_file,
     )
 
@@ -117,6 +129,14 @@ def write_aggregate_csv(records: list[SummaryRecord], output: Path) -> None:
         agg_read_req_rps = sum(r.read_req_rps for r in recs)
         agg_read_resp_rps = sum(r.read_resp_rps for r in recs)
 
+        def weighted_latency(field_name: str, weight_name: str, total_weight: int) -> float:
+            if total_weight <= 0:
+                return 0.0
+            return sum(
+                getattr(r, field_name) * getattr(r, weight_name)
+                for r in recs
+            ) / total_weight
+
         if acks_received > 0:
             weighted_ack_latency_ms = (
                 sum(r.avg_ack_latency_ms * r.acks_received for r in recs) / acks_received
@@ -129,6 +149,12 @@ def write_aggregate_csv(records: list[SummaryRecord], output: Path) -> None:
             )
         else:
             weighted_read_latency_ms = 0.0
+        weighted_p50_ack_latency_ms = weighted_latency("p50_ack_latency_ms", "acks_received", acks_received)
+        weighted_p95_ack_latency_ms = weighted_latency("p95_ack_latency_ms", "acks_received", acks_received)
+        weighted_p99_ack_latency_ms = weighted_latency("p99_ack_latency_ms", "acks_received", acks_received)
+        weighted_p50_read_latency_ms = weighted_latency("p50_read_latency_ms", "reads_ok", reads_ok)
+        weighted_p95_read_latency_ms = weighted_latency("p95_read_latency_ms", "reads_ok", reads_ok)
+        weighted_p99_read_latency_ms = weighted_latency("p99_read_latency_ms", "reads_ok", reads_ok)
 
         complete = clients_reported == num_clients
 
@@ -151,6 +177,12 @@ def write_aggregate_csv(records: list[SummaryRecord], output: Path) -> None:
                 "agg_read_resp_rps": agg_read_resp_rps,
                 "weighted_avg_ack_latency_ms": weighted_ack_latency_ms,
                 "weighted_avg_read_latency_ms": weighted_read_latency_ms,
+                "weighted_p50_ack_latency_ms": weighted_p50_ack_latency_ms,
+                "weighted_p95_ack_latency_ms": weighted_p95_ack_latency_ms,
+                "weighted_p99_ack_latency_ms": weighted_p99_ack_latency_ms,
+                "weighted_p50_read_latency_ms": weighted_p50_read_latency_ms,
+                "weighted_p95_read_latency_ms": weighted_p95_read_latency_ms,
+                "weighted_p99_read_latency_ms": weighted_p99_read_latency_ms,
             }
         )
 
@@ -175,6 +207,12 @@ def write_aggregate_csv(records: list[SummaryRecord], output: Path) -> None:
         "agg_read_resp_rps",
         "weighted_avg_ack_latency_ms",
         "weighted_avg_read_latency_ms",
+        "weighted_p50_ack_latency_ms",
+        "weighted_p95_ack_latency_ms",
+        "weighted_p99_ack_latency_ms",
+        "weighted_p50_read_latency_ms",
+        "weighted_p95_read_latency_ms",
+        "weighted_p99_read_latency_ms",
     ]
 
     with output.open("w", encoding="utf-8", newline="") as f:

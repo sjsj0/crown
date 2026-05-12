@@ -2,6 +2,7 @@
 *.d
 *.env
 cs525_cheatsheet.txt
+.venv/
 
 # Compiled Object files
 *.slo

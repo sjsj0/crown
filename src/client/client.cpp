@@ -38,6 +38,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <algorithm>
 
 #include <unistd.h>
 #include <netdb.h>
@@ -120,6 +121,12 @@ struct ThroughputMetricsSummary {
     double read_responses_per_sec = 0.0;
     double avg_ack_latency_ms = 0.0;
     double avg_read_latency_ms = 0.0;
+    double p50_ack_latency_ms = 0.0;
+    double p95_ack_latency_ms = 0.0;
+    double p99_ack_latency_ms = 0.0;
+    double p50_read_latency_ms = 0.0;
+    double p95_read_latency_ms = 0.0;
+    double p99_read_latency_ms = 0.0;
 };
 
 struct ThroughputMetricsState {
@@ -137,6 +144,11 @@ struct ThroughputMetricsState {
     atomic<uint64_t> ack_latency_total_us{0};
     atomic<uint64_t> read_latency_samples{0};
     atomic<uint64_t> read_latency_total_us{0};
+
+    mutable mutex ack_latency_values_mtx;
+    vector<uint64_t> ack_latency_values_us;
+    mutable mutex read_latency_values_mtx;
+    vector<uint64_t> read_latency_values_us;
 
     mutex pending_write_times_mtx;
     unordered_map<uint64_t, SteadyClock::time_point> pending_write_times;
@@ -179,6 +191,14 @@ static shared_ptr<ThroughputMetricsState> benchmark_current_metrics_state() {
     {
         lock_guard<mutex> lk(state.pending_write_times_mtx);
         state.pending_write_times.clear();
+    }
+    {
+        lock_guard<mutex> lk(state.ack_latency_values_mtx);
+        state.ack_latency_values_us.clear();
+    }
+    {
+        lock_guard<mutex> lk(state.read_latency_values_mtx);
+        state.read_latency_values_us.clear();
     }
 
     state.enabled.store(true, memory_order_release);
@@ -239,8 +259,13 @@ static void benchmark_note_write_ack(uint64_t request_id) {
     if (!found) return;
 
     const auto latency_us = chrono::duration_cast<chrono::microseconds>(SteadyClock::now() - issued_at).count();
-    state->ack_latency_total_us.fetch_add(static_cast<uint64_t>(max<int64_t>(0, latency_us)), memory_order_relaxed);
+    const uint64_t bounded_latency_us = static_cast<uint64_t>(max<int64_t>(0, latency_us));
+    state->ack_latency_total_us.fetch_add(bounded_latency_us, memory_order_relaxed);
     state->ack_latency_samples.fetch_add(1, memory_order_relaxed);
+    {
+        lock_guard<mutex> lk(state->ack_latency_values_mtx);
+        state->ack_latency_values_us.push_back(bounded_latency_us);
+    }
 }
 
 [[maybe_unused]] static void benchmark_note_write_rpc_failure() {
@@ -262,14 +287,30 @@ static void benchmark_note_read_success(SteadyClock::time_point issued_at) {
     state->reads_ok.fetch_add(1, memory_order_relaxed);
 
     const auto latency_us = chrono::duration_cast<chrono::microseconds>(SteadyClock::now() - issued_at).count();
-    state->read_latency_total_us.fetch_add(static_cast<uint64_t>(max<int64_t>(0, latency_us)), memory_order_relaxed);
+    const uint64_t bounded_latency_us = static_cast<uint64_t>(max<int64_t>(0, latency_us));
+    state->read_latency_total_us.fetch_add(bounded_latency_us, memory_order_relaxed);
     state->read_latency_samples.fetch_add(1, memory_order_relaxed);
+    {
+        lock_guard<mutex> lk(state->read_latency_values_mtx);
+        state->read_latency_values_us.push_back(bounded_latency_us);
+    }
 }
 
 static void benchmark_note_read_failure() {
     auto state = benchmark_current_metrics_state();
     if (!state || !state->enabled.load(memory_order_relaxed)) return;
     state->read_failures.fetch_add(1, memory_order_relaxed);
+}
+
+static double benchmark_latency_percentile_ms(vector<uint64_t> samples_us, uint64_t percentile) {
+    if (samples_us.empty()) return 0.0;
+    sort(samples_us.begin(), samples_us.end());
+    const uint64_t rank = max<uint64_t>(
+        1ULL,
+        (percentile * static_cast<uint64_t>(samples_us.size()) + 99ULL) / 100ULL);
+    const size_t index = static_cast<size_t>(
+        min<uint64_t>(static_cast<uint64_t>(samples_us.size() - 1), rank - 1ULL));
+    return static_cast<double>(samples_us[index]) / 1000.0;
 }
 
 [[maybe_unused]] static ThroughputMetricsSummary benchmark_build_summary(
@@ -291,6 +332,16 @@ static void benchmark_note_read_failure() {
     const uint64_t ack_latency_total_us = state.ack_latency_total_us.load(memory_order_relaxed);
     const uint64_t read_latency_samples = state.read_latency_samples.load(memory_order_relaxed);
     const uint64_t read_latency_total_us = state.read_latency_total_us.load(memory_order_relaxed);
+    vector<uint64_t> ack_latency_values_us;
+    vector<uint64_t> read_latency_values_us;
+    {
+        lock_guard<mutex> lk(state.ack_latency_values_mtx);
+        ack_latency_values_us = state.ack_latency_values_us;
+    }
+    {
+        lock_guard<mutex> lk(state.read_latency_values_mtx);
+        read_latency_values_us = state.read_latency_values_us;
+    }
 
     summary.ack_writes_per_sec = static_cast<double>(summary.acks_received) / summary.duration_sec;
     summary.read_requests_per_sec = static_cast<double>(summary.reads_sent) / summary.duration_sec;
@@ -304,6 +355,12 @@ static void benchmark_note_read_failure() {
         summary.avg_read_latency_ms =
             (static_cast<double>(read_latency_total_us) / static_cast<double>(read_latency_samples)) / 1000.0;
     }
+    summary.p50_ack_latency_ms = benchmark_latency_percentile_ms(ack_latency_values_us, 50);
+    summary.p95_ack_latency_ms = benchmark_latency_percentile_ms(ack_latency_values_us, 95);
+    summary.p99_ack_latency_ms = benchmark_latency_percentile_ms(ack_latency_values_us, 99);
+    summary.p50_read_latency_ms = benchmark_latency_percentile_ms(read_latency_values_us, 50);
+    summary.p95_read_latency_ms = benchmark_latency_percentile_ms(read_latency_values_us, 95);
+    summary.p99_read_latency_ms = benchmark_latency_percentile_ms(read_latency_values_us, 99);
     return summary;
 }
 
@@ -324,7 +381,13 @@ static void benchmark_note_read_failure() {
         << " read_req_rps=" << summary.read_requests_per_sec
         << " read_resp_rps=" << summary.read_responses_per_sec
         << " avg_ack_latency_ms=" << summary.avg_ack_latency_ms
-        << " avg_read_latency_ms=" << summary.avg_read_latency_ms;
+        << " avg_read_latency_ms=" << summary.avg_read_latency_ms
+        << " p50_ack_latency_ms=" << summary.p50_ack_latency_ms
+        << " p95_ack_latency_ms=" << summary.p95_ack_latency_ms
+        << " p99_ack_latency_ms=" << summary.p99_ack_latency_ms
+        << " p50_read_latency_ms=" << summary.p50_read_latency_ms
+        << " p95_read_latency_ms=" << summary.p95_read_latency_ms
+        << " p99_read_latency_ms=" << summary.p99_read_latency_ms;
     return out.str();
 }
 
@@ -736,6 +799,104 @@ struct Topology {
     }
 };
 
+struct BenchmarkTopologyKeyset {
+    vector<string> keys;
+
+    // CROWN only. These point into `keys` and let the benchmark issue requests
+    // evenly across ring heads even when key_count is not divisible by ring size.
+    vector<vector<size_t>> crown_key_indices_by_head;
+    vector<size_t> active_crown_head_indices;
+};
+
+static BenchmarkTopologyKeyset benchmark_build_topology_keyset(
+    const Topology& topo,
+    const string& prefix,
+    size_t key_count) {
+    BenchmarkTopologyKeyset keyset;
+
+    if (topo.mode != chain::ReplicationMode::CROWN || topo.crown_nodes_by_index.empty()) {
+        keyset.keys = benchmark_build_keyset(prefix, key_count);
+        return keyset;
+    }
+
+    const size_t ring_size = topo.crown_nodes_by_index.size();
+    vector<size_t> desired_per_head(ring_size, key_count / ring_size);
+    for (size_t i = 0; i < key_count % ring_size; ++i) {
+        desired_per_head[i] += 1;
+    }
+
+    vector<vector<string>> keys_by_head(ring_size);
+    size_t selected = 0;
+    uint64_t candidate_index = 0;
+    const uint64_t max_candidates = max<uint64_t>(
+        1000000ULL,
+        static_cast<uint64_t>(max<size_t>(key_count, 1)) * static_cast<uint64_t>(ring_size) * 1000ULL);
+
+    while (selected < key_count) {
+        if (candidate_index > max_candidates) {
+            throw runtime_error("benchmark keyset generation failed: unable to balance CROWN keys");
+        }
+
+        string key = benchmark_key_for_index(prefix, candidate_index++);
+        const size_t head_index = static_cast<size_t>(Topology::hash_key(key) % ring_size);
+        if (keys_by_head[head_index].size() >= desired_per_head[head_index]) {
+            continue;
+        }
+
+        keys_by_head[head_index].push_back(std::move(key));
+        ++selected;
+    }
+
+    keyset.keys.reserve(key_count);
+    keyset.crown_key_indices_by_head.resize(ring_size);
+
+    for (size_t depth = 0; keyset.keys.size() < key_count; ++depth) {
+        bool added = false;
+        for (size_t head_index = 0; head_index < ring_size; ++head_index) {
+            if (depth >= keys_by_head[head_index].size()) continue;
+            const size_t key_index = keyset.keys.size();
+            keyset.keys.push_back(keys_by_head[head_index][depth]);
+            keyset.crown_key_indices_by_head[head_index].push_back(key_index);
+            added = true;
+            if (keyset.keys.size() == key_count) break;
+        }
+        if (!added) {
+            throw runtime_error("benchmark keyset generation failed: CROWN key buckets exhausted early");
+        }
+    }
+
+    for (size_t head_index = 0; head_index < ring_size; ++head_index) {
+        if (!keyset.crown_key_indices_by_head[head_index].empty()) {
+            keyset.active_crown_head_indices.push_back(head_index);
+        }
+    }
+
+    return keyset;
+}
+
+static const string& benchmark_select_crown_key_round_robin(
+    const BenchmarkTopologyKeyset& keyset,
+    uint64_t operation_index,
+    uint64_t client_offset) {
+    if (keyset.active_crown_head_indices.empty()) {
+        return benchmark_select_key_round_robin(keyset.keys, operation_index);
+    }
+
+    const size_t active_count = keyset.active_crown_head_indices.size();
+    const size_t active_pos =
+        static_cast<size_t>((operation_index + client_offset) % active_count);
+    const size_t head_index = keyset.active_crown_head_indices[active_pos];
+    const auto& key_indices = keyset.crown_key_indices_by_head[head_index];
+    if (key_indices.empty()) {
+        throw runtime_error("benchmark CROWN key distribution has an empty active bucket");
+    }
+
+    const uint64_t head_round = operation_index / static_cast<uint64_t>(active_count);
+    const size_t key_pos =
+        static_cast<size_t>((head_round + client_offset) % key_indices.size());
+    return keyset.keys[key_indices[key_pos]];
+}
+
 static NodeStub* resolve_read_target(Topology& topo,
                                      const string& key,
                                      int node_id,
@@ -750,7 +911,11 @@ struct PreparedBenchmarkWrite {
 static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
     Topology& topo,
     const BenchmarkRunConfig& cfg) {
-    const vector<string> keys = benchmark_build_keyset(cfg.key_prefix, static_cast<size_t>(cfg.key_count));
+    const BenchmarkTopologyKeyset keyset = benchmark_build_topology_keyset(
+        topo,
+        cfg.key_prefix,
+        static_cast<size_t>(cfg.key_count));
+    const vector<string>& keys = keyset.keys;
 
     const bool crown_hotspot_enabled =
         topo.mode == chain::ReplicationMode::CROWN && cfg.crown_hot_head_pct > 0;
@@ -814,6 +979,11 @@ static vector<PreparedBenchmarkWrite> benchmark_prepare_write_batch(
             }
 
             next.key = keys[key_idx];
+        } else if (topo.mode == chain::ReplicationMode::CROWN) {
+            next.key = benchmark_select_crown_key_round_robin(
+                keyset,
+                op_index,
+                static_cast<uint64_t>(cfg.client_index));
         } else {
             next.key = benchmark_select_key_round_robin(keys, op_index);
         }
@@ -878,7 +1048,11 @@ struct PreparedBenchmarkRead {
 static vector<PreparedBenchmarkRead> benchmark_prepare_read_batch(
     Topology& topo,
     const BenchmarkRunConfig& cfg) {
-    const vector<string> keys = benchmark_build_keyset(cfg.key_prefix, static_cast<size_t>(cfg.key_count));
+    const BenchmarkTopologyKeyset keyset = benchmark_build_topology_keyset(
+        topo,
+        cfg.key_prefix,
+        static_cast<size_t>(cfg.key_count));
+    const vector<string>& keys = keyset.keys;
 
     const bool read_hotspot_enabled = cfg.read_hot_key_pct > 0;
     const size_t hot_key_idx = 0;
@@ -912,6 +1086,11 @@ static vector<PreparedBenchmarkRead> benchmark_prepare_read_batch(
                 const size_t cold_key_idx = cold_key_indices[cold_cursor++ % cold_key_indices.size()];
                 next.key = keys[cold_key_idx];
             }
+        } else if (topo.mode == chain::ReplicationMode::CROWN) {
+            next.key = benchmark_select_crown_key_round_robin(
+                keyset,
+                op_index,
+                static_cast<uint64_t>(cfg.client_index));
         } else {
             next.key = benchmark_select_key_round_robin(keys, op_index);
         }
@@ -1369,7 +1548,11 @@ static ThroughputMetricsSummary run_bench_write(Topology& topo,
 static ThroughputMetricsSummary run_bench_read(Topology& topo,
                                                const string& client_addr,
                                                const BenchmarkRunConfig& cfg) {
-    const vector<string> keys = benchmark_build_keyset(cfg.key_prefix, static_cast<size_t>(cfg.key_count));
+    const BenchmarkTopologyKeyset keyset = benchmark_build_topology_keyset(
+        topo,
+        cfg.key_prefix,
+        static_cast<size_t>(cfg.key_count));
+    const vector<string>& keys = keyset.keys;
 
     // Seed keys before measuring so benchmark reads can hit previously written values.
     for (size_t i = 0; i < keys.size(); ++i) {
