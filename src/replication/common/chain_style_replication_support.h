@@ -123,6 +123,7 @@ private:
     void propagate_worker_loop();
     void schedule_propagate_retry(PropagateTask task, int backoff_seconds);
 
+    std::atomic<bool> workers_stopping_{false};
     std::mutex prop_queue_mtx_;
     std::condition_variable prop_queue_cv_;
     std::queue<PropagateTask> prop_queue_;

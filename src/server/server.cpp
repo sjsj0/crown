@@ -13,6 +13,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <unistd.h>
 
 #include <grpcpp/grpcpp.h>
 #include "chain.grpc.pb.h"
@@ -48,7 +49,7 @@ bool parse_bool_flag(const string& raw, bool* out) {
 void print_usage(const char* program_name) {
     cerr << "Usage: " << program_name
          << " [--host <host>] [--port <port>] [--server-log <true|false>]"
-         << " [--join <metadata_host:port>]\n";
+         << " [--join <metadata_host:port>] [--external-host <host>]\n";
 }
 
 } // namespace
@@ -78,6 +79,18 @@ public:
 
         node_.update_config(std::move(cfg));
         strategy_->on_config_change(node_);
+
+        // Apply any bootstrap data that arrived before strategy was ready
+        // (new node: BootstrapFromSource runs before first Configure)
+        {
+            std::lock_guard<std::mutex> lk(pending_dump_mtx_);
+            if (pending_dump_) {
+                strategy_->support()->load_from_dump(*pending_dump_);
+                cout << "[Server] Applied pending bootstrap dump ("
+                     << pending_dump_->entries_size() << " entries)\n";
+                pending_dump_.reset();
+            }
+        }
 
         // A Configure arriving during freeze means reconfig is complete —
         // resume accepting client writes.
@@ -294,6 +307,11 @@ public:
 
             if (strategy_) {
                 strategy_->support()->load_from_dump(dump);
+            } else {
+                // Strategy not yet configured (Configure arrives after BootstrapFromSource).
+                // Buffer the dump; Configure handler will apply it.
+                std::lock_guard<std::mutex> lk(pending_dump_mtx_);
+                pending_dump_ = std::make_unique<chain::DataDump>(std::move(dump));
             }
 
             // Tell metadata we're ready
@@ -374,6 +392,9 @@ private:
     // metadata address is set on first Freeze or via --join; raw atomic ptr
     // (intentional small-leak on overwrite — only changes during reconfig)
     std::atomic<string*>            metadata_addr_{nullptr};
+    // Bootstrap data buffered when BootstrapFromSource arrives before Configure
+    std::mutex                      pending_dump_mtx_;
+    std::unique_ptr<chain::DataDump> pending_dump_;
 
     static unique_ptr<ReplicationStrategy> make_strategy(ReplicationMode mode) {
         switch (mode) {
@@ -456,6 +477,7 @@ void send_join_to_metadata(const string& metadata_addr,
 int main(int argc, char** argv) {
     string host = "0.0.0.0";
     string port = "50051";
+    string external_host;
     bool server_log_enabled = false;
     string join_metadata_addr;
 
@@ -467,7 +489,7 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        if (arg == "--host" || arg == "--port" || arg == "--server-log" || arg == "--join") {
+        if (arg == "--host" || arg == "--port" || arg == "--server-log" || arg == "--join" || arg == "--external-host") {
             if (i + 1 >= argc) {
                 cerr << "[Server] Missing value for " << arg << "\n";
                 print_usage(argv[0]);
@@ -481,6 +503,8 @@ int main(int argc, char** argv) {
                 port = value;
             } else if (arg == "--join") {
                 join_metadata_addr = value;
+            } else if (arg == "--external-host") {
+                external_host = value;
             } else {
                 if (!parse_bool_flag(value, &server_log_enabled)) {
                     cerr << "[Server] Invalid value for --server-log: " << value << "\n";
@@ -494,6 +518,21 @@ int main(int argc, char** argv) {
         cerr << "[Server] Unknown argument: " << arg << "\n";
         print_usage(argv[0]);
         return 1;
+    }
+
+    // Determine the externally-reachable hostname for Join registration.
+    // If --external-host not set and bind host is 0.0.0.0, fall back to system hostname.
+    if (external_host.empty()) {
+        if (host == "0.0.0.0" || host.empty()) {
+            char buf[256] = {};
+            if (gethostname(buf, sizeof(buf)) == 0) {
+                external_host = buf;
+            } else {
+                external_host = "127.0.0.1";
+            }
+        } else {
+            external_host = host;
+        }
     }
 
     const string addr = host + ":" + port;
@@ -520,12 +559,12 @@ int main(int argc, char** argv) {
     if (!join_metadata_addr.empty()) {
         service.set_metadata_addr(join_metadata_addr);
         // Run in background so the gRPC server keeps serving
-        std::thread([&service, join_metadata_addr, host, port]() {
+        std::thread([&service, join_metadata_addr, external_host, port]() {
             // Tiny delay so our server is fully listening
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             int port_num = 0;
             try { port_num = std::stoi(port); } catch (...) { port_num = 0; }
-            send_join_to_metadata(join_metadata_addr, host, port_num);
+            send_join_to_metadata(join_metadata_addr, external_host, port_num);
         }).detach();
     }
 

@@ -258,6 +258,7 @@ void ChainStyleReplicationSupport::send_client_ack(const chain::AckRequest& req)
 
     google::protobuf::Empty ignored;
     grpc::ClientContext ctx;
+    ctx.set_deadline(chrono::system_clock::now() + chrono::seconds(5));
     grpc::Status status = stub->Ack(&ctx, req, &ignored);
     if (!status.ok()) {
         cerr << "[ChainStyleReplicationSupport] Client ACK failed to " << req.client_addr()
@@ -307,20 +308,17 @@ void ChainStyleReplicationSupport::start_ack_workers() {
 }
 
 void ChainStyleReplicationSupport::stop_ack_workers() {
+    // Signal all workers to stop (must stay true until all are joined)
+    workers_stopping_.store(true, memory_order_release);
+
     // Stop propagate workers
-    {
-        lock_guard<mutex> lk(prop_queue_mtx_);
-    }
     prop_queue_cv_.notify_all();
     for (auto& worker : prop_workers_) {
         if (worker.joinable()) worker.join();
     }
     prop_workers_.clear();
 
-    // Stop retry scheduler
-    {
-        lock_guard<mutex> lk(retry_queue_mtx_);
-    }
+    // Stop retry scheduler (uses workers_stopping_ in its wait predicate)
     retry_queue_cv_.notify_one();
     if (retry_scheduler_thread_ && retry_scheduler_thread_->joinable()) {
         retry_scheduler_thread_->join();
@@ -334,6 +332,9 @@ void ChainStyleReplicationSupport::stop_ack_workers() {
         pred_ack_worker_thread_->join();
     }
     pred_ack_worker_thread_.reset();
+
+    // Reset after all workers have exited
+    workers_stopping_.store(false, memory_order_release);
 }
 
 void ChainStyleReplicationSupport::enqueue_propagate(
@@ -369,8 +370,10 @@ void ChainStyleReplicationSupport::propagate_worker_loop() {
         PropagateTask task;
         {
             unique_lock<mutex> lk(prop_queue_mtx_);
-            prop_queue_cv_.wait(lk, [this] { return !prop_queue_.empty(); });
-            if (prop_queue_.empty()) break;
+            prop_queue_cv_.wait(lk, [this] {
+                return !prop_queue_.empty() || workers_stopping_.load(memory_order_acquire);
+            });
+            if (prop_queue_.empty()) break;  // empty + stopping (or spurious), exit
             task = std::move(prop_queue_.front());
             prop_queue_.pop();
         }
@@ -405,7 +408,9 @@ void ChainStyleReplicationSupport::retry_scheduler_loop() {
 
             // Wait until we have retries or shutdown
             if (retry_queue_.empty()) {
-                retry_queue_cv_.wait(lk, [this] { return !retry_queue_.empty(); });
+                retry_queue_cv_.wait(lk, [this] {
+                    return !retry_queue_.empty() || workers_stopping_.load(memory_order_acquire);
+                });
                 if (retry_queue_.empty()) break;
             }
 
@@ -508,8 +513,7 @@ void ChainStyleReplicationSupport::send_inflight_check(uint64_t reconfig_id, int
 }
 
 void ChainStyleReplicationSupport::predecessor_ack_worker_loop() {
-    static constexpr int kMaxAttempts = 3;
-    static constexpr int kBackoffsMs[] = {20, 100};
+    static constexpr int kBackoffs[] = {1, 2, 5, 10};
 
     while (pred_ack_worker_running_.load(memory_order_acquire)) {
         chain::AckRequest req;
@@ -526,40 +530,43 @@ void ChainStyleReplicationSupport::predecessor_ack_worker_loop() {
             pred_ack_queue_.pop_front();
         }
 
-        auto pred = predecessor_stub();
-        if (!pred) {
-            cerr << "[Support] Predecessor ACK skipped: no predecessor stub"
-                 << " key='" << req.key() << "' version=" << req.version()
-                 << " request_id=" << req.request_id() << "\n";
-            continue;
-        }
+        int attempt = 0;
+        while (pred_ack_worker_running_.load(memory_order_acquire)) {
+            auto pred = predecessor_stub();
+            if (!pred) {
+                cerr << "[Support] Pred ACK waiting: no predecessor stub"
+                     << " key='" << req.key() << "' version=" << req.version()
+                     << " request_id=" << req.request_id() << "\n";
+            } else {
+                google::protobuf::Empty resp;
+                grpc::ClientContext ctx;
+                ctx.set_deadline(chrono::system_clock::now() + chrono::seconds(5));
+                grpc::Status st = pred->Ack(&ctx, req, &resp);
+                if (st.ok()) {
+                    cout << "[Support] Pred ACK delivered"
+                         << " key='" << req.key() << "' version=" << req.version()
+                         << " request_id=" << req.request_id() << "\n";
+                    break;
+                }
 
-        bool delivered = false;
-        for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-            google::protobuf::Empty ignored;
-            grpc::ClientContext ctx;
-            grpc::Status status = pred->Ack(&ctx, req, &ignored);
-            if (status.ok()) {
-                delivered = true;
-                break;
+                cerr << "[Support] Pred ACK attempt " << (attempt + 1)
+                     << " failed key='" << req.key() << "' version=" << req.version()
+                     << " request_id=" << req.request_id()
+                     << ": " << st.error_message() << "\n";
             }
 
-            cerr << "[Support] Predecessor ACK attempt " << (attempt + 1)
-                 << " failed key='" << req.key()
-                 << "' version=" << req.version()
-                 << " request_id=" << req.request_id()
-                 << ": " << status.error_message() << "\n";
+            const int backoff = kBackoffs[min(
+                attempt,
+                static_cast<int>(sizeof(kBackoffs) / sizeof(kBackoffs[0])) - 1)];
+            ++attempt;
 
-            if (attempt + 1 < kMaxAttempts) {
-                this_thread::sleep_for(chrono::milliseconds(kBackoffsMs[attempt]));
-            }
-        }
-
-        if (!delivered) {
-            cerr << "[Support] Predecessor ACK dropped after " << kMaxAttempts
-                 << " attempts key='" << req.key()
-                 << "' version=" << req.version()
-                 << " request_id=" << req.request_id() << "\n";
+            unique_lock<mutex> pred_lk(pred_ack_queue_mtx_);
+            pred_ack_queue_cv_.wait_for(
+                pred_lk,
+                chrono::seconds(backoff),
+                [this] {
+                    return !pred_ack_worker_running_.load(memory_order_acquire);
+                });
         }
     }
 }

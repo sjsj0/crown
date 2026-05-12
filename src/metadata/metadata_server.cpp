@@ -46,7 +46,7 @@ namespace {
 struct Options {
     string config_path       = "config.json";
     string bind_host         = "0.0.0.0";
-    string external_host     = "172.22.154.121";     // address that nodes use to reach this server
+    string external_host     = "";     // address that nodes use to reach this server (empty = auto-detect)
     int    bind_port         = 50050;
     int    ping_interval_ms  = 1000;
     int    ping_timeout_ms   = 1000;
@@ -509,11 +509,24 @@ private:
             survivors.push_back(n);
         }
 
+        // Populate pending_acks_ BEFORE sending Freeze. Otherwise nodes
+        // can send InflightAck (after receiving Freeze + traversing the
+        // ring in just a few ms) before we have anything in pending_acks_
+        // to erase, and the acks get lost.
+        const auto mode = state_->mode();
         {
             std::lock_guard<std::mutex> lk(ack_mtx_);
             current_id_ = ctx->id;
             pending_acks_.clear();
             data_ready_ = false;
+            if (mode == chain::ReplicationMode::CROWN) {
+                for (const auto& n : survivors) pending_acks_.insert(n.node_id);
+            } else {
+                // CHAIN/CRAQ: only tail terminates the inflight token
+                for (const auto& n : survivors) {
+                    if (n.is_tail) pending_acks_.insert(n.node_id);
+                }
+            }
         }
 
         const int freeze_failures = freeze_all(survivors, ctx->id);
@@ -525,18 +538,6 @@ private:
 
         // ----- Phase 2: Inflight check -----
         ctx->phase_start = std::chrono::steady_clock::now();
-        const auto mode = state_->mode();
-        {
-            std::lock_guard<std::mutex> lk(ack_mtx_);
-            if (mode == chain::ReplicationMode::CROWN) {
-                for (const auto& n : survivors) pending_acks_.insert(n.node_id);
-            } else {
-                // CHAIN/CRAQ: only tail terminates the inflight token
-                for (const auto& n : survivors) {
-                    if (n.is_tail) pending_acks_.insert(n.node_id);
-                }
-            }
-        }
 
         // Wait up to 30s for all InflightAcks
         bool inflight_ok;
@@ -779,7 +780,9 @@ private:
                 auto stub = chain::ChainNode::NewStub(channel);
                 google::protobuf::Empty resp;
                 grpc::ClientContext ctx;
-                ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+                // Generous deadline: on_config_change rebuilds stubs and
+                // may rewire pending propagate tasks, which can take a moment.
+                ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(15));
                 grpc::Status st = stub->Configure(&ctx, cfg, &resp);
                 if (!st.ok()) {
                     cerr << "[Reconfig] Configure failed for node " << n.node_id
@@ -1024,6 +1027,8 @@ int main(int argc, char** argv) {
     MetadataStoreServiceImpl service(state, orchestrator);
     const string bind_addr = opt.bind_host + ":" + to_string(opt.bind_port);
     grpc::ServerBuilder builder;
+    // Try to bind to IPv4; disable SO_REUSEPORT to avoid IPv6 binding issues
+    builder.AddChannelArgument("grpc.so_reuseport", 0);
     builder.AddListeningPort(bind_addr, grpc::InsecureServerCredentials());
     builder.RegisterService(&service);
     unique_ptr<grpc::Server> server = builder.BuildAndStart();
