@@ -513,28 +513,33 @@ private:
             survivors.push_back(n);
         }
 
+        // Any failure scenario breaks the chain/ring at the dead node, so
+        // the inflight token cannot traverse. Skip the token traversal and
+        // have each survivor ACK directly upon receiving Freeze. For Add we
+        // still do the normal traversal because the cluster is intact.
+        const auto mode = state_->mode();
+        const bool direct_inflight_ack = !is_add;
+
         // Populate pending_acks_ BEFORE sending Freeze. Otherwise nodes
         // can send InflightAck (after receiving Freeze + traversing the
         // ring in just a few ms) before we have anything in pending_acks_
         // to erase, and the acks get lost.
-        const auto mode = state_->mode();
         {
             std::lock_guard<std::mutex> lk(ack_mtx_);
             current_id_ = ctx->id;
             pending_acks_.clear();
             data_ready_ = false;
-            if (mode == chain::ReplicationMode::CROWN) {
+            if (direct_inflight_ack || mode == chain::ReplicationMode::CROWN) {
+                // Every survivor will ACK directly (failure) or via its own
+                // ring-token (CROWN add).
                 for (const auto& n : survivors) pending_acks_.insert(n.node_id);
             } else {
-                // CHAIN/CRAQ: only tail terminates the inflight token
+                // CHAIN/CRAQ add: only tail terminates the single inflight token
                 for (const auto& n : survivors) {
                     if (n.is_tail) pending_acks_.insert(n.node_id);
                 }
             }
         }
-
-        const bool direct_inflight_ack =
-            (mode == chain::ReplicationMode::CROWN && !is_add);
         const int freeze_failures = freeze_all(survivors, ctx->id, direct_inflight_ack);
         const auto freeze_ms = ms_since(ctx->phase_start);
         cout << "[Reconfig " << ctx->id << "] Freeze sent to " << survivors.size()
