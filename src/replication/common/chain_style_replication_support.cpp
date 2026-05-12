@@ -201,7 +201,10 @@ void ChainStyleReplicationSupport::on_config_change(const Node& node) {
 
     // Refresh successor stubs for any queued propagate tasks (handles
     // failure-case where the old successor is dead and pending writes must
-    // be redirected to the new successor).
+    // be redirected to the new successor). We also drain retry_queue_ back
+    // into prop_queue_ with refreshed stubs and reset their attempt counter
+    // so the just-arrived topology change cancels any pending backoff and
+    // gives every queued write a clean chance against the new successor.
     if (new_successor_stub) {
         lock_guard<mutex> qlk(prop_queue_mtx_);
         std::queue<PropagateTask> refreshed;
@@ -209,8 +212,21 @@ void ChainStyleReplicationSupport::on_config_change(const Node& node) {
             PropagateTask task = std::move(prop_queue_.front());
             prop_queue_.pop();
             task.successor = new_successor_stub;
+            task.attempt = 0;
             refreshed.push(std::move(task));
         }
+
+        {
+            lock_guard<mutex> rlk(retry_queue_mtx_);
+            while (!retry_queue_.empty()) {
+                PropagateTask task = retry_queue_.top().task;
+                retry_queue_.pop();
+                task.successor = new_successor_stub;
+                task.attempt = 0;
+                refreshed.push(std::move(task));
+            }
+        }
+
         prop_queue_ = std::move(refreshed);
         if (!prop_queue_.empty()) {
             prop_queue_cv_.notify_all();
