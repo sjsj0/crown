@@ -92,6 +92,8 @@ python3 setup/generate_mode_configs.py 3 --base-port 50051 --env prod --output-d
 METADATA_CONFIG=build/prod_configs/config.crown.json ./setup/vm_setup.bash start
 ```
 
+`vm_setup.bash` runs host-scoped actions in parallel by default (`setup`, `build`, `start`, `rerun`, `kill`). Set `VM_SETUP_PARALLELISM=N` to cap fan-out, e.g. `VM_SETUP_PARALLELISM=3 ./setup/vm_setup.bash build`. Metadata startup remains a single step after the server hosts are started.
+
 Action scopes:
 - **`setup`** → install build deps on `prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST`.
 - **`build`** (and `deploy`) → `git clone`/`pull` + `cmake build` on `prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST`. **Nothing is started** — it just produces `build/server`, `build/metadata_server`, `build/client` on every VM.
@@ -417,6 +419,7 @@ REMOTE_BASE_DIR=/home          # remote repo lives at $REMOTE_BASE_DIR/$REPO_NAM
 PROJECT_SUBDIR=.               # repo root (CMakeLists.txt is at the top level)
 PROJECT_MODE=crown             # or craq
 NODE_PORT=50051
+VM_SETUP_PARALLELISM=0         # 0/unset = all hosts in parallel for setup/build/start/rerun/kill
 TMUX_SOCKET=/tmp/crown-shared/tmux.sock
 RUN_SCOPE=shared
 METADATA_HOST=sp26-cs525-1201.cs.illinois.edu

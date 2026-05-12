@@ -1,10 +1,8 @@
 # One host per line; a trailing comma is allowed. Lines starting with '#' and
 # blank lines are ignored. The deployment automation builds the repo on the
 # UNION of prod_hosts.csv (server nodes) and this file.
-sp26-cs525-1213.cs.illinois.edu,
-sp26-cs525-1214.cs.illinois.edu,
-sp26-cs525-1215.cs.illinois.edu,
-sp26-cs525-1216.cs.illinois.edu,
-sp26-cs525-1217.cs.illinois.edu,
-sp26-cs525-1219.cs.illinois.edu,
-sp26-cs525-1204.cs.illinois.edu
+sp26-cs525-1213.cs.illinois.edu
+sp26-cs525-1214.cs.illinois.edu
+sp26-cs525-1215.cs.illinois.edu
+sp26-cs525-1216.cs.illinois.edu
+sp26-cs525-1217.cs.illinois.edu

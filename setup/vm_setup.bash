@@ -15,6 +15,14 @@ set +a
 SSH_USER="${SSH_USER:?Missing SSH_USER in .env}"
 echo "Using SSH_USER: $SSH_USER"
 
+# Number of remote hosts to process at once for setup/build/start/kill actions.
+# 0 or unset means "all target hosts in parallel".
+VM_SETUP_PARALLELISM="${VM_SETUP_PARALLELISM:-0}"
+if ! [[ "$VM_SETUP_PARALLELISM" =~ ^[0-9]+$ ]]; then
+  echo "Error: VM_SETUP_PARALLELISM must be a non-negative integer, got: $VM_SETUP_PARALLELISM"
+  exit 1
+fi
+
 # Repo settings for remote setup/build. These are intentionally configurable from .env.
 : "${REPO_URL:?Missing REPO_URL in .env}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
@@ -87,11 +95,76 @@ deploy_to_host() {
   echo "==> $server  ($label)"
 
   echo "   -> copying $script_name"
-  scp "${SSH_OPTS[@]}" "$local_script" "$server:$remote_script"
+  scp "${SSH_OPTS[@]}" "$local_script" "$server:$remote_script" || return 1
 
   echo "   -> running $remote_script"
-  ssh -t "${SSH_OPTS[@]}" "$server" \
+  ssh -T "${SSH_OPTS[@]}" "$server" \
     "export SSH_USER='$SSH_USER' REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' REMOTE_BASE_DIR='$REMOTE_BASE_DIR' REPO_NAME='$REPO_NAME' PROJECT_SUBDIR='$PROJECT_SUBDIR' PROJECT_MODE='${PROJECT_MODE:-crown}' BUILD_TYPE='${BUILD_TYPE:-Release}' NODE_HOST='${NODE_HOST:-0.0.0.0}' NODE_PORT='${NODE_PORT:-50051}' SERVER_LOG='${SERVER_LOG:-true}' TMUX_SESSION_NAME='${TMUX_SESSION_NAME:-}' TMUX_SOCKET='${TMUX_SOCKET:-/tmp/crown-shared/tmux.sock}' RUN_SCOPE='${RUN_SCOPE:-shared}' METADATA_HOST='${METADATA_HOST:-}' METADATA_PORT='${METADATA_PORT:-50050}' METADATA_CONFIG='${METADATA_CONFIG:-config.json}' BUILD_ONLY='${BUILD_ONLY:-false}' START_ONLY='${START_ONLY:-false}'; tr -d '\r' < '$remote_script' | bash -s --"
+}
+
+wait_parallel_batch() {
+  local -n batch_pids_ref="$1"
+  local -n batch_hosts_ref="$2"
+  local -n failures_ref="$3"
+  local i pid host
+
+  for i in "${!batch_pids_ref[@]}"; do
+    pid="${batch_pids_ref[$i]}"
+    host="${batch_hosts_ref[$i]}"
+    if wait "$pid"; then
+      echo "[ok] $host completed"
+    else
+      echo "[failed] $host failed"
+      failures_ref=$((failures_ref + 1))
+    fi
+  done
+
+  batch_pids_ref=()
+  batch_hosts_ref=()
+}
+
+run_hosts_parallel() {
+  local label="$1" fn="$2"
+  shift 2
+  local hosts=("$@")
+  local total="${#hosts[@]}"
+  local max_parallel="$VM_SETUP_PARALLELISM"
+  local failures=0
+  local -a batch_pids=()
+  local -a batch_hosts=()
+  local host
+
+  [[ "$total" -gt 0 ]] || return 0
+  if [[ "$max_parallel" -le 0 || "$max_parallel" -gt "$total" ]]; then
+    max_parallel="$total"
+  fi
+
+  echo "-- $label on $total host(s), parallelism=$max_parallel --"
+  for host in "${hosts[@]}"; do
+    (
+      echo "---- [$host] $label started ----"
+      "$fn" "$host"
+      rc=$?
+      if [[ "$rc" -eq 0 ]]; then
+        echo "---- [$host] $label finished ----"
+      else
+        echo "---- [$host] $label failed rc=$rc ----"
+      fi
+      exit "$rc"
+    ) &
+    batch_pids+=("$!")
+    batch_hosts+=("$host")
+
+    if [[ "${#batch_pids[@]}" -ge "$max_parallel" ]]; then
+      wait_parallel_batch batch_pids batch_hosts failures
+    fi
+  done
+
+  wait_parallel_batch batch_pids batch_hosts failures
+  if [[ "$failures" -ne 0 ]]; then
+    echo "ERROR: $label failed on $failures/$total host(s)."
+    return 1
+  fi
 }
 
 # Clone + build the repo on a host without starting anything.
@@ -122,16 +195,17 @@ ACTION="$1"
 case "$ACTION" in
   setup)
     [[ ${#all_hosts_meta[@]} -gt 0 ]] || { echo "No target hosts (check prod_hosts.csv / client_hosts.csv / METADATA_HOST)."; exit 1; }
-    for host in "${all_hosts_meta[@]}"; do deploy_to_host "$SCRIPT_DIR/setup.bash" "$host" "$ACTION"; done
+    setup_on_host() { deploy_to_host "$SCRIPT_DIR/setup.bash" "$1" "$ACTION"; }
+    run_hosts_parallel "$ACTION" setup_on_host "${all_hosts_meta[@]}" || exit 1
     ;;
   build|deploy)
     # clone + build only -- no node server / metadata_server started here.
     [[ ${#all_hosts_meta[@]} -gt 0 ]] || { echo "No target hosts (check prod_hosts.csv / client_hosts.csv / METADATA_HOST)."; exit 1; }
-    for host in "${all_hosts_meta[@]}"; do build_on_host "$host"; done
+    run_hosts_parallel "build" build_on_host "${all_hosts_meta[@]}" || exit 1
     ;;
   start|start-servers)
     [[ ${#prod_hosts[@]} -gt 0 ]] || { echo "No server hosts (check prod_hosts.csv)."; exit 1; }
-    for host in "${prod_hosts[@]}"; do start_server_on_host "$host"; done
+    run_hosts_parallel "start servers" start_server_on_host "${prod_hosts[@]}" || exit 1
     # `start` also (re)starts the metadata_server so the cluster is fully
     # configured in one shot; `start-servers` stops after the node servers.
     if [[ "$ACTION" == "start" ]]; then
@@ -145,14 +219,16 @@ case "$ACTION" in
   rerun)
     # "kill, then start again" -- stop everything, then bring the servers + metadata back up.
     [[ ${#all_hosts_meta[@]} -gt 0 ]] || { echo "No target hosts (check prod_hosts.csv / client_hosts.csv / METADATA_HOST)."; exit 1; }
-    for host in "${all_hosts_meta[@]}"; do deploy_to_host "$SCRIPT_DIR/kill.bash" "$host" "rerun (kill)"; done
+    kill_for_rerun_on_host() { deploy_to_host "$SCRIPT_DIR/kill.bash" "$1" "rerun (kill)"; }
+    run_hosts_parallel "rerun kill" kill_for_rerun_on_host "${all_hosts_meta[@]}" || exit 1
     [[ ${#prod_hosts[@]} -gt 0 ]] || { echo "No server hosts (check prod_hosts.csv)."; exit 1; }
-    for host in "${prod_hosts[@]}"; do start_server_on_host "$host"; done
+    run_hosts_parallel "rerun start servers" start_server_on_host "${prod_hosts[@]}" || exit 1
     start_metadata_server
     ;;
   kill)
     [[ ${#all_hosts_meta[@]} -gt 0 ]] || { echo "No target hosts (check prod_hosts.csv / client_hosts.csv / METADATA_HOST)."; exit 1; }
-    for host in "${all_hosts_meta[@]}"; do deploy_to_host "$SCRIPT_DIR/kill.bash" "$host" "$ACTION"; done
+    kill_on_host() { deploy_to_host "$SCRIPT_DIR/kill.bash" "$1" "$ACTION"; }
+    run_hosts_parallel "$ACTION" kill_on_host "${all_hosts_meta[@]}" || exit 1
     ;;
   *)
     echo "Invalid action: $ACTION"

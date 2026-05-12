@@ -35,6 +35,11 @@ on `$METADATA_HOST`.
 ./vm_setup.bash kill             # stop servers + metadata on prod_hosts.csv ∪ client_hosts.csv ∪ $METADATA_HOST
 ```
 
+Host-scoped actions run in parallel by default. To limit concurrency, prefix the
+command with `VM_SETUP_PARALLELISM=N`, for example:
+`VM_SETUP_PARALLELISM=3 ./vm_setup.bash build`. Metadata startup is still a
+single ordered step after server fan-out.
+
 Typical bring-up order: `setup` → `build` → `start`. `build` clones + builds the
 repo on every VM (incl. `$METADATA_HOST`) and starts nothing. `start` then (re)starts
 a server node on every `prod_hosts.csv` VM from the already-built `build/server`
@@ -321,6 +326,7 @@ cd crown/setup
 | PROJECT_SUBDIR | . | . | Subdir within repo to build (repo root) |
 | PROJECT_MODE | crown | craq | crown or craq (affects binary name) |
 | BUILD_TYPE | Release | Debug | CMake build type |
+| VM_SETUP_PARALLELISM | 0 | 3 | max concurrent VM actions; 0 means all target hosts |
 | NODE_HOST | 0.0.0.0 | 127.0.0.1 | Bind address |
 | NODE_PORT | 5001 | 5002 | Server port |
 | TMUX_SESSION_NAME | crown_node_${NODE_PORT} | crown_node_5001 | Shared tmux session name |
